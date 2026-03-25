@@ -76,8 +76,10 @@ async function fetchAllMarkets(onProgress) {
 
 // ─── PRELIMINARY SCORING (no AI) ─────────────────────────────────────────────
 function preliminaryScore(m, prevSnapshot) {
-  const yesP = parseFloat(m.outcomePrices?.[0] ?? 0.5);
-  const noP = parseFloat(m.outcomePrices?.[1] ?? 0.5);
+  let p = [0.5, 0.5];
+  try { p = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || [0.5, 0.5]); } catch(e){}
+  const yesP = parseFloat(p[0]);
+  const noP = parseFloat(p[1]);
   const vol = parseFloat(m.volume || 0);
   const vol24 = parseFloat(m.volumeNum || m.volume24hr || 0);
   const liq = parseFloat(m.liquidityNum || m.liquidity || 0);
@@ -648,8 +650,8 @@ export default function PolyBotV2() {
                     {/* Prices */}
                     <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
                       {[
-                        ["YES actual", fmtPct(parseFloat(m.outcomePrices?.[0] ?? 0.5)), S.green],
-                        ["NO actual", fmtPct(parseFloat(m.outcomePrices?.[1] ?? 0.5)), S.red],
+                        ["YES actual", fmtPct(parseFloat((typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices)?.[0] ?? 0.5)), S.green],
+                        ["NO actual", fmtPct(parseFloat((typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices)?.[1] ?? 0.5)), S.red],
                         ["Valor justo YES", a.fair_value_yes ? fmtPct(a.fair_value_yes) : "—", S.cyan],
                         ["Edge", a.edge_pct ? `${a.edge_pct.toFixed(1)}%` : "—", S.amber],
                         ["Vol total", fmtMoney(prelim?.vol || 0), S.text],
