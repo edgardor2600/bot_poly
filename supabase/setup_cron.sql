@@ -21,13 +21,16 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 -- Tip: puedes hacer do $$ begin ... end $$ para definirla 1 sola vez:
 DO $$
 DECLARE
-  anon_key TEXT := '<TU_ANON_KEY>';  -- ← PON TU ANON KEY AQUÍ
+  anon_key TEXT := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind4Z3h6a2xxYmFycWZxcHR6YXRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQzODI0MjEsImV4cCI6MjA4OTk1ODQyMX0.uivkzz-ObcVrNsy2iw-mE8Zul_K_yJoRd8T7gAq1I2w';  -- ← PON TU ANON KEY AQUÍ
   fn_url   TEXT := 'https://wxgxzklqbarqfqptzatq.supabase.co/functions/v1/bot-cron';
 BEGIN
 
   -- ─── CRON 1: Rollover diario (cada 1 minuto) ───
   -- Detecta cambio de día y resetea el PNL diario + meta
-  PERFORM cron.unschedule('polybot-rollover');
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'polybot-rollover') THEN
+    PERFORM cron.unschedule('polybot-rollover');
+  END IF;
+  
   PERFORM cron.schedule(
     'polybot-rollover',
     '* * * * *',
@@ -45,7 +48,10 @@ BEGIN
 
   -- ─── CRON 2: Fast Sync (cada 3 minutos) ───
   -- Monitorea precios en vivo y cierra posiciones por SL/TP
-  PERFORM cron.unschedule('polybot-sync');
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'polybot-sync') THEN
+    PERFORM cron.unschedule('polybot-sync');
+  END IF;
+
   PERFORM cron.schedule(
     'polybot-sync',
     '*/3 * * * *',
@@ -63,7 +69,10 @@ BEGIN
 
   -- ─── CRON 3: Escaneo completo (cada 30 minutos) ───
   -- Analiza todos los mercados de Polymarket con IA + Tavily
-  PERFORM cron.unschedule('polybot-scan');
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'polybot-scan') THEN
+    PERFORM cron.unschedule('polybot-scan');
+  END IF;
+
   PERFORM cron.schedule(
     'polybot-scan',
     '*/30 * * * *',
