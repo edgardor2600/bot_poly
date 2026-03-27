@@ -12,9 +12,11 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
     "@supabase/supabase-js": "^2.100.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
+    "ethers": "^5.8.0",
     "express": "^5.2.1"
   }
 }
