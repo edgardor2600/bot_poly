@@ -1,4 +1,16 @@
 .env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 node_modules/
 dist/
 .DS_Store
+.secrets/
+*.pem
+*.key
+*.log
+out.txt
+out2.txt
+bot-backend/out*.txt

@@ -5,7 +5,13 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "preflight": "node preflight.js",
+    "db:audit": "node dbMaintenance.js audit-schema",
+    "db:cleanup-simulated": "node dbMaintenance.js cleanup-simulated-active",
+    "db:cleanup-simulated:apply": "node dbMaintenance.js cleanup-simulated-active --apply",
+    "db:backfill-trades": "node dbMaintenance.js backfill-trade-integrity",
+    "db:backfill-trades:apply": "node dbMaintenance.js backfill-trade-integrity --apply"
   },
   "keywords": [],
   "author": "",

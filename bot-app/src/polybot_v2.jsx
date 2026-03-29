@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 // ─── CONSTANTS Y CONFIG NUBE ──────────────────────────────────────────────────
-const INIT_CAPITAL = 100; // Simulación de $100 reales
+const DEFAULT_BASE_CAPITAL = 15;
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:4000";
 
 const CATEGORIES = {
@@ -48,6 +48,30 @@ function uid() { return `${Date.now().toString(36)}${Math.random().toString(36).
 function fmtDlr(n) {
   const v = parseFloat(n || 0);
   return v >= 0 ? `+$${v.toFixed(2)}` : `-$${Math.abs(v).toFixed(2)}`;
+}
+
+function shortHash(v = "") {
+  if (!v || typeof v !== "string") return "—";
+  return v.length > 14 ? `${v.slice(0, 8)}...${v.slice(-6)}` : v;
+}
+
+function parseTxHashes(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(Boolean);
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+      } catch {
+        return [];
+      }
+    }
+    if (trimmed.startsWith("0x")) return [trimmed];
+  }
+  return [];
 }
 
 // ─── POLYMARKET API ───────────────────────────────────────────────────────────
@@ -288,13 +312,24 @@ const logC = { SYSTEM: S.cyan, AI: S.purple, OPPORTUNITY: S.amber, TRADE: S.gree
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 export default function PolyBotV2() {
   const [tab, setTab] = useState("scan");
-  const [capital, setCapital] = useState(INIT_CAPITAL);
+  const [baseCapital, setBaseCapital] = useState(DEFAULT_BASE_CAPITAL);
+  const [capital, setCapital] = useState(DEFAULT_BASE_CAPITAL);
   const [trades, setTrades] = useState([]);
   const [signals, setSignals] = useState([]);
   const [allMarkets, setAllMarkets] = useState([]);
   const [marketSnapshots, setMarketSnapshots] = useState({});
   const [logEntries, setLogEntries] = useState([]);
   const [scanStatus, setScanStatus] = useState({ running: false, phase: "", progress: 0, total: 0, lastScan: null });
+  const [realTradingEnabled, setRealTradingEnabled] = useState(false);
+  const [tradingClientReady, setTradingClientReady] = useState(false);
+  const [autoTradeReady, setAutoTradeReady] = useState(false);
+  const [dbReadiness, setDbReadiness] = useState(null);
+  const [walletSnapshot, setWalletSnapshot] = useState(null);
+  const [withdrawnTotal, setWithdrawnTotal] = useState(0);
+  const [lastWithdrawalAt, setLastWithdrawalAt] = useState(null);
+  const [walletActivity, setWalletActivity] = useState([]);
+  const [withdrawalPolicy, setWithdrawalPolicy] = useState(null);
+  const [backendConfig, setBackendConfig] = useState(null);
   const [autoScan, setAutoScan] = useState(true);
   const [autoInterval, setAutoInterval] = useState(30); // 30 min = equilibrio óptimo tokens/velocidad
   const [catFilter, setCatFilter] = useState("ALL");
@@ -350,8 +385,19 @@ export default function PolyBotV2() {
         const res = await fetch(`${BACKEND_URL}/api/status`);
         if (!res.ok) return;
         const data = await res.json();
+        if (Number.isFinite(Number(data.baseCapital))) setBaseCapital(Number(data.baseCapital));
         setCapital(data.capital);
         setTrades(data.trades);
+        setRealTradingEnabled(!!data.realTradingEnabled);
+        setTradingClientReady(!!data.tradingClientReady);
+        setAutoTradeReady(!!data.autoTradeReady);
+        setDbReadiness(data.dbReadiness || null);
+        setWalletSnapshot(data.walletSnapshot || null);
+        setWithdrawnTotal(Number(data.withdrawnTotal || 0));
+        setLastWithdrawalAt(data.lastWithdrawalAt || null);
+        setWalletActivity(Array.isArray(data.walletActivity) ? data.walletActivity : []);
+        setWithdrawalPolicy(data.withdrawalPolicy || null);
+        setBackendConfig(data.config || null);
         setDailyPnl(data.dailyPnl);
         setGoalReached(data.goalReached);
         setSignals(data.signals);
@@ -374,12 +420,19 @@ export default function PolyBotV2() {
   function executeTrade(sig) { alert('El Backend en la nube auto-ejecuta compras.'); }
   function closeTrade(id, closePrice) { alert('El Backend se encarga del Stop Loss y Take Profit.'); }
   // ── Derived stats ──
-  const openTrades = trades.filter(t => t.status === "OPEN");
-  const closedTrades = trades.filter(t => t.status === "CLOSED");
+  const ACTIVE_REAL_STATUSES = new Set(["OPEN", "PARTIAL", "PENDING_BUY", "PENDING_SELL"]);
+  const realTrades = trades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL");
+  const openTrades = realTrades.filter(t => ACTIVE_REAL_STATUSES.has(String(t.status || "").toUpperCase()));
+  const closedTrades = realTrades.filter(t => t.status === "CLOSED");
   const invested = openTrades.reduce((s, t) => s + t.cost, 0);
-  const totalValue = capital + invested;
-  const totalPnl = parseFloat((totalValue - INIT_CAPITAL).toFixed(2));
-  const totalPnlPct = parseFloat(((totalPnl / INIT_CAPITAL) * 100).toFixed(2));
+  const walletUsdc = Number(walletSnapshot?.usdcBalance);
+  const walletPol = Number(walletSnapshot?.polBalance);
+  const availableUsd = Number.isFinite(walletUsdc) ? walletUsdc : capital;
+  const openMarkedValue = openTrades.reduce((s, t) => s + ((t.currentPrice || t.entryPrice || 0) * (t.shares || 0)), 0);
+  const unrealizedPnl = parseFloat((openMarkedValue - invested).toFixed(2));
+  const totalValue = parseFloat((availableUsd + openMarkedValue).toFixed(2));
+  const totalPnl = parseFloat((totalValue - baseCapital).toFixed(2));
+  const totalPnlPct = baseCapital > 0 ? parseFloat(((totalPnl / baseCapital) * 100).toFixed(2)) : 0;
   const realizedPnl = parseFloat(closedTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2));
   const wins = closedTrades.filter(t => t.pnl > 0).length;
   const winRate = closedTrades.length > 0 ? (wins / closedTrades.length * 100).toFixed(1) : "—";
@@ -409,6 +462,7 @@ export default function PolyBotV2() {
     { id: "portfolio", label: "💼 CARTERA", badge: openTrades.length },
     { id: "analytics", label: "📈 ANALÍTICA" },
     { id: "log", label: "📋 LOG" },
+    { id: "wallet", label: "👛 WALLET", badge: walletActivity.filter(e => e.eventType === "AUTO_WITHDRAWAL").length },
     { id: "config", label: "⚙ CONFIG" },
   ];
 
@@ -433,13 +487,65 @@ export default function PolyBotV2() {
 
         <div style={{ width: "1px", height: "40px", background: S.border2, margin: "0 4px" }} />
 
-        <StatCard label="Dólares Disponibles" value={`$${capital.toFixed(2)}`} color={S.cyan} sub={`Márgen Libre`} />
+        <StatCard
+          label="Dólares Disponibles"
+          value={`$${availableUsd.toFixed(2)}`}
+          color={S.cyan}
+          sub={realTradingEnabled ? "USDC en MetaMask" : "Márgen Libre"}
+        />
         <StatCard label="Capital Invertido" value={`$${invested.toFixed(2)}`} color={S.text} sub={`En ${openTrades.length} trades vivos`} />
         <StatCard label="Valor Total (Equidad)" value={`$${totalValue.toFixed(2)}`} color={S.white} />
         <StatCard label="P&L Hoy" value={fmtDlr(dailyPnl)} color={dailyPnl >= 0 ? S.green : S.red} sub={`Ganancia Neta Diaria`} />
         <StatCard label="Win Rate" value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? S.green : parseFloat(winRate) > 0 ? S.amber : S.muted2} sub={`${wins}W / ${closedTrades.length - wins}L`} />
         <StatCard label="Mercados" value={allMarkets.length || "—"} color={S.white} sub={scanStatus.lastScan ? `Scan: ${scanStatus.lastScan?.slice(0, 8)}` : "Sin escaneo"} />
         <StatCard label="Señales" value={activeSignals.length} color={activeSignals.length > 0 ? S.amber : S.muted2} />
+        <StatCard
+          label="Modo Ejecución"
+          value={realTradingEnabled ? "REAL" : "SIM"}
+          color={realTradingEnabled ? S.green : S.amber}
+          sub={realTradingEnabled ? (tradingClientReady ? "Cliente listo" : "Conectando cliente") : "Simulación"}
+        />
+        {realTradingEnabled && (
+          <StatCard
+            label="Gas (POL)"
+            value={Number.isFinite(walletPol) ? walletPol.toFixed(4) : "—"}
+            color={S.amber}
+            sub="Saldo de red"
+          />
+        )}
+        {realTradingEnabled && walletSnapshot?.address && (
+          <StatCard
+            label="Wallet"
+            value={`${walletSnapshot.address.slice(0, 6)}...${walletSnapshot.address.slice(-4)}`}
+            color={S.text}
+            sub={walletSnapshot?.updatedAt ? `Sync: ${new Date(walletSnapshot.updatedAt).toLocaleTimeString("es-CO")}` : "Sin sync"}
+          />
+        )}
+        {realTradingEnabled && (
+          <div className="glass-panel" style={{
+            width: "100%",
+            padding: "12px 16px",
+            border: `1px solid ${autoTradeReady ? S.green : S.red}33`,
+            background: autoTradeReady ? `${S.green}10` : `${S.red}10`,
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px"
+          }}>
+            <div style={{ color: autoTradeReady ? S.green : S.red, fontSize: "10px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>
+              {autoTradeReady ? "Auto-Trading Real Listo" : "Auto-Trading Real Bloqueado"}
+            </div>
+            <div style={{ color: S.text, fontSize: "10px", lineHeight: 1.6 }}>
+              {autoTradeReady
+                ? "La infraestructura critica del backend esta lista para permitir nuevas entradas automaticas."
+                : "El backend sigue monitoreando wallet y posiciones reales, pero no abrira nuevas compras automaticas hasta completar la base remota."}
+            </div>
+            {!autoTradeReady && Array.isArray(dbReadiness?.blockers) && dbReadiness.blockers.length > 0 && (
+              <div style={{ color: S.muted2, fontSize: "9px", lineHeight: 1.7 }}>
+                {dbReadiness.blockers.join(" | ")}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* ── OBJETIVO DIARIO $1.50 ── */}
         <div className="glass-panel" style={{ padding: "12px 16px", minWidth: "160px", display: "flex", flexDirection: "column", gap: "6px" }}>
@@ -886,7 +992,7 @@ export default function PolyBotV2() {
                 ["P&L Total", `${totalPnl >= 0 ? "+" : ""}$${totalPnl}`, `${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}%`, totalPnl >= 0 ? S.green : S.red],
                 ["P&L Realizado", `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`, `${closedTrades.length} trades cerrados`, realizedPnl >= 0 ? S.green : S.red],
                 ["Win Rate", `${winRate}%`, `${wins}W / ${closedTrades.length - wins}L`, parseFloat(winRate) >= 50 ? S.green : S.amber],
-                ["P&L Diario", `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}`, `Límite: -$${(INIT_CAPITAL * config.dailyLossLimit / 100).toFixed(0)}`, dailyPnl >= 0 ? S.green : S.red],
+                ["P&L Diario", `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}`, `Límite: -$${(baseCapital * config.dailyLossLimit / 100).toFixed(2)}`, dailyPnl >= 0 ? S.green : S.red],
               ].map(([l, v, sub, c]) => (
                 <div key={l} style={{ background: S.panel, border: `1px solid ${S.border2}`, padding: "12px 16px", borderRadius: "6px" }}>
                   <div style={{ color: S.muted2, fontSize: "8px", letterSpacing: "1px", marginBottom: "4px" }}>{l}</div>
@@ -914,8 +1020,15 @@ export default function PolyBotV2() {
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
                     <div style={{ flex: 1, marginRight: "10px" }}>
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "4px" }}>
-                        <Tag txt={t.id} color={S.muted2} />
-                        <Tag txt={`${CATEGORIES[t.category]?.icon} ${CATEGORIES[t.category]?.label}`} color={S.blue} />
+                        {(() => {
+                          const tradeCategory = t.category || detectCategory(t.question || "");
+                          return (
+                            <>
+                              <Tag txt={t.id} color={S.muted2} />
+                              <Tag txt={`${CATEGORIES[tradeCategory]?.icon || CATEGORIES.OTHER.icon} ${CATEGORIES[tradeCategory]?.label || CATEGORIES.OTHER.label}`} color={S.blue} />
+                            </>
+                          );
+                        })()}
                         <Tag txt={`${t.side}`} color={t.side === "YES" ? S.green : S.red} />
                         {(t.signal_types || []).map(st => <Tag key={st} txt={SIGNAL_TYPES[st]?.icon + " " + st} color={SIGNAL_TYPES[st]?.color || S.text} />)}
                       </div>
@@ -1035,7 +1148,7 @@ export default function PolyBotV2() {
 
         {tab === "analytics" && (() => {
           const now = Date.now();
-          const closed = trades.filter(t => t.status === "CLOSED");
+          const closed = closedTrades;
           const last24h = closed.filter(t => t.closedAt && (now - new Date(t.closedAt).getTime() < 86400000));
           
           const won = closed.filter(t => t.pnl > 0);
@@ -1058,7 +1171,7 @@ export default function PolyBotV2() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
                  <StatCard label="P&L REALIZADO HISTÓRICO" value={`${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`} color={realizedPnl >= 0 ? S.green : S.red} sub={`Basado en ${closed.length} operaciones`} />
                  <StatCard label="TASA DE ACIERTO (WIN RATE)" value={winRate + "%"} color={winRate > 50 ? S.green : S.amber} sub={`${won.length} Ganadas · ${lost.length} Perdidas`} />
-                 <StatCard label="BALANCE LÍQUIDO" value={`$${capital.toFixed(2)}`} color={capital >= INIT_CAPITAL ? S.green : S.amber} sub={`Excluye margen bloqueado ($${invested.toFixed(2)})`} />
+                 <StatCard label="BALANCE LÍQUIDO" value={`$${availableUsd.toFixed(2)}`} color={availableUsd >= baseCapital ? S.green : S.amber} sub={`Excluye margen bloqueado ($${invested.toFixed(2)})`} />
               </div>
 
               <div className="glass-panel" style={{ padding: "20px", marginTop: "16px", background: `linear-gradient(135deg, ${S.panel} 0%, rgba(0, 50, 80, 0.1) 100%)` }}>
@@ -1140,11 +1253,132 @@ export default function PolyBotV2() {
           </div>
         )}
 
+        {/* ══════════ WALLET TAB ══════════ */}
+        {tab === "wallet" && (() => {
+          const withdrawalEvents = walletActivity.filter(e => e.eventType === "AUTO_WITHDRAWAL");
+          const withdrawalErrors = walletActivity.filter(e => e.eventType === "AUTO_WITHDRAWAL_ERROR");
+          const tradeTxRows = realTrades.flatMap(t => {
+            const buyTxs = parseTxHashes(t.buyTxHashes).map(tx => ({
+              tradeId: t.id,
+              ts: t.ts,
+              txHash: tx,
+              type: "BUY",
+              side: t.side,
+              question: t.question,
+            }));
+            const sellTxs = parseTxHashes(t.sellTxHashes).map(tx => ({
+              tradeId: t.id,
+              ts: t.closedAt || t.ts,
+              txHash: tx,
+              type: "SELL",
+              side: t.side,
+              question: t.question,
+            }));
+            return [...buyTxs, ...sellTxs];
+          }).sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+
+          const policyEnabled = !!withdrawalPolicy?.enabled;
+          const policyConfigured = !!withdrawalPolicy?.configured;
+
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px" }}>
+                <StatCard label="Wallet MetaMask" value={walletSnapshot?.address ? `${walletSnapshot.address.slice(0, 6)}...${walletSnapshot.address.slice(-4)}` : "—"} color={S.white} sub={walletSnapshot?.updatedAt ? `Sync: ${new Date(walletSnapshot.updatedAt).toLocaleString("es-CO")}` : "Sin sync"} />
+                <StatCard label="USDC Wallet" value={Number.isFinite(walletUsdc) ? `$${walletUsdc.toFixed(2)}` : "—"} color={S.cyan} sub="Saldo on-chain" />
+                <StatCard label="POL Wallet" value={Number.isFinite(walletPol) ? walletPol.toFixed(4) : "—"} color={S.amber} sub="Gas disponible" />
+                <StatCard label="Retirado Total" value={`$${Number(withdrawnTotal || 0).toFixed(2)}`} color={S.green} sub={lastWithdrawalAt ? `Último: ${new Date(lastWithdrawalAt).toLocaleString("es-CO")}` : "Sin retiros aún"} />
+              </div>
+
+              <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "14px" }}>
+                <div style={{ color: S.cyan, fontSize: "11px", letterSpacing: "1px", marginBottom: "10px" }}>POLÍTICA DE RETIRO AUTOMÁTICO</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px" }}>
+                  {[
+                    ["Estado", policyEnabled ? "ACTIVO" : "INACTIVO", policyEnabled ? S.green : S.red],
+                    ["Configurado", policyConfigured ? "SÍ" : "NO", policyConfigured ? S.green : S.red],
+                    ["Wallet Destino", withdrawalPolicy?.targetAddress ? `${withdrawalPolicy.targetAddress.slice(0, 6)}...${withdrawalPolicy.targetAddress.slice(-4)}` : "—", S.text],
+                    ["Piso Operativo", withdrawalPolicy ? `$${Number(withdrawalPolicy.operatingCapitalUsdc || 0).toFixed(2)}` : "—", S.text],
+                    ["Exceso Mínimo", withdrawalPolicy ? `$${Number(withdrawalPolicy.minExcessUsdc || 0).toFixed(2)}` : "—", S.text],
+                    ["% Retiro", withdrawalPolicy ? `${((Number(withdrawalPolicy.excessRatio || 0)) * 100).toFixed(0)}%` : "—", S.text],
+                    ["Cooldown", withdrawalPolicy ? `${Number(withdrawalPolicy.cooldownHours || 0)}h` : "—", S.text],
+                    ["Mín. POL", withdrawalPolicy ? Number(withdrawalPolicy.minPolBalance || 0).toFixed(2) : "—", S.text],
+                    ["TP Bot", backendConfig ? `${Number(backendConfig.takeProfit || 0).toFixed(2)}%` : "—", S.text],
+                    ["SL Bot", backendConfig ? `${Number(backendConfig.stopLoss || 0).toFixed(2)}%` : "—", S.text],
+                    ["Break-even", backendConfig ? `${Number(backendConfig.breakEvenTriggerPct || 0).toFixed(2)}%` : "—", S.text],
+                    ["Max Hold", backendConfig ? `${Number(backendConfig.maxHoldHours || 0).toFixed(0)}h` : "—", S.text],
+                  ].map(([label, value, color]) => (
+                    <div key={label} style={{ background: S.panelB, border: `1px solid ${S.border}`, borderRadius: "4px", padding: "8px 10px" }}>
+                      <div style={{ color: S.muted2, fontSize: "8px", letterSpacing: "1px", marginBottom: "3px" }}>{label}</div>
+                      <div style={{ color, fontSize: "10px", fontWeight: 700 }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", overflow: "hidden" }}>
+                <div style={{ padding: "8px 14px", borderBottom: `1px solid ${S.border2}`, color: S.muted2, fontSize: "9px", letterSpacing: "1px" }}>
+                  TRANSFERENCIAS DE RETIRO ({withdrawalEvents.length}) · ERRORES ({withdrawalErrors.length})
+                </div>
+                <div style={{ maxHeight: "260px", overflowY: "auto" }}>
+                  {walletActivity.length === 0 ? (
+                    <div style={{ padding: "20px", color: S.muted, textAlign: "center" }}>No hay actividad de retiro todavía.</div>
+                  ) : (
+                    walletActivity.map(ev => (
+                      <div key={ev.id} style={{ padding: "8px 12px", borderBottom: `1px solid ${S.border}33`, display: "flex", gap: "10px", alignItems: "center" }}>
+                        <Tag txt={ev.eventType === "AUTO_WITHDRAWAL" ? "RETIRO" : "ERROR"} color={ev.eventType === "AUTO_WITHDRAWAL" ? S.green : S.red} />
+                        <span style={{ color: S.muted2, fontSize: "8px", minWidth: "140px" }}>{ev.ts ? new Date(ev.ts).toLocaleString("es-CO") : "—"}</span>
+                        <span style={{ color: ev.eventType === "AUTO_WITHDRAWAL" ? S.green : S.red, fontSize: "10px", fontWeight: 700, minWidth: "70px" }}>
+                          {ev.eventType === "AUTO_WITHDRAWAL" ? `$${Number(ev.amountUsdc || 0).toFixed(2)}` : "—"}
+                        </span>
+                        <span style={{ color: S.text, fontSize: "9px", flex: 1, wordBreak: "break-word" }}>
+                          {ev.error || `${ev.trigger || "SYNC"} → ${ev.to ? `${ev.to.slice(0, 6)}...${ev.to.slice(-4)}` : "destino"}`}
+                        </span>
+                        {ev.txHash ? (
+                          <a href={`https://polygonscan.com/tx/${ev.txHash}`} target="_blank" rel="noreferrer" style={{ color: S.cyan, fontSize: "9px", textDecoration: "none" }}>
+                            {shortHash(ev.txHash)}
+                          </a>
+                        ) : (
+                          <span style={{ color: S.muted, fontSize: "9px" }}>—</span>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", overflow: "hidden" }}>
+                <div style={{ padding: "8px 14px", borderBottom: `1px solid ${S.border2}`, color: S.muted2, fontSize: "9px", letterSpacing: "1px" }}>
+                  TRANSACCIONES REALES (BUY/SELL) · {tradeTxRows.length}
+                </div>
+                <div style={{ maxHeight: "300px", overflowY: "auto" }}>
+                  {tradeTxRows.length === 0 ? (
+                    <div style={{ padding: "20px", color: S.muted, textAlign: "center" }}>Sin tx hashes reales todavía.</div>
+                  ) : (
+                    tradeTxRows.map((tx, idx) => (
+                      <div key={`${tx.txHash}-${idx}`} style={{ padding: "8px 12px", borderBottom: `1px solid ${S.border}33`, display: "flex", gap: "10px", alignItems: "center" }}>
+                        <Tag txt={tx.type} color={tx.type === "BUY" ? S.green : S.red} />
+                        <Tag txt={tx.side} color={tx.side === "YES" ? S.green : S.red} />
+                        <span style={{ color: S.muted2, fontSize: "8px", minWidth: "140px" }}>{tx.ts ? new Date(tx.ts).toLocaleString("es-CO") : "—"}</span>
+                        <span style={{ color: S.text, fontSize: "9px", flex: 1, wordBreak: "break-word" }}>{tx.tradeId} · {tx.question?.slice(0, 70)}</span>
+                        <a href={`https://polygonscan.com/tx/${tx.txHash}`} target="_blank" rel="noreferrer" style={{ color: S.cyan, fontSize: "9px", textDecoration: "none" }}>
+                          {shortHash(tx.txHash)}
+                        </a>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* ══════════ CONFIG TAB ══════════ */}
         {tab === "config" && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "14px" }}>
             <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "16px" }}>
               <div style={{ color: S.cyan, fontFamily: heading, fontSize: "13px", letterSpacing: "2px", marginBottom: "16px" }}>🛡 RIESGO & FILTROS</div>
+              <div style={{ background: `${S.amber}12`, border: `1px solid ${S.amber}33`, color: S.text, borderRadius: "6px", padding: "10px 12px", fontSize: "10px", lineHeight: 1.6, marginBottom: "14px" }}>
+                Panel en modo lectura. La ejecución real, los montos y los bloqueos de wallet se controlan desde el backend; estos sliders todavía no escriben configuración productiva.
+              </div>
               {[
                 { k: "maxTradePct", l: "Máx por Trade", u: "%", min: 0.5, max: 10, step: 0.5 },
                 { k: "stopLoss", l: "Stop Loss", u: "%", min: 1, max: 30, step: 1 },
@@ -1159,12 +1393,14 @@ export default function PolyBotV2() {
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
                     <span style={{ color: S.text, fontSize: "10px" }}>{f.l}</span>
                     <span style={{ color: S.amber, fontWeight: 700 }}>
-                      {f.u === "$" ? `$${config[f.k].toLocaleString()}` : `${config[f.k]}${f.u}`}
+                      {backendConfig && backendConfig[f.k] !== undefined
+                        ? (f.u === "$" ? `$${Number(backendConfig[f.k]).toLocaleString()}` : `${backendConfig[f.k]}${f.u}`)
+                        : (f.u === "$" ? `$${config[f.k].toLocaleString()}` : `${config[f.k]}${f.u}`)}
                     </span>
                   </div>
                   <input type="range" min={f.min} max={f.max} step={f.step} value={config[f.k]}
                     onChange={e => setConfig(c => ({ ...c, [f.k]: parseFloat(e.target.value) }))}
-                    style={{ width: "100%", accentColor: S.cyan }} />
+                    style={{ width: "100%", accentColor: S.cyan, opacity: 0.45, cursor: "not-allowed" }} disabled />
                 </div>
               ))}
 
@@ -1176,7 +1412,7 @@ export default function PolyBotV2() {
                 </div>
                 <input type="range" min={0} max={23} step={1} value={closeHour}
                   onChange={e => setCloseHour(parseInt(e.target.value))}
-                  style={{ width: "100%", accentColor: S.amber }} />
+                  style={{ width: "100%", accentColor: S.amber, opacity: 0.45, cursor: "not-allowed" }} disabled />
                 <div style={{ color: S.muted2, fontSize: "9px", marginTop: "4px" }}>
                   A esta hora se detienen las inversiones nuevas del día. Las posiciones abiertas siguen su rumbo sin forzar venta.
                   {goalReached && <span style={{ color: S.green, marginLeft: "8px" }}>✅ META HOY ALCANZADA · Sin nuevas inversiones</span>}
@@ -1187,11 +1423,7 @@ export default function PolyBotV2() {
               {goalReached && (
                 <div style={{ background: `${S.green}11`, border: `1px solid ${S.green}33`, borderRadius: "6px", padding: "10px 14px", marginTop: "4px" }}>
                   <div style={{ color: S.green, fontSize: "10px", fontWeight: 700, marginBottom: "6px" }}>🏆 META DIARIA ALCANZADA — Autopilot Pausado</div>
-                  <div style={{ color: S.muted2, fontSize: "9px", marginBottom: "8px" }}>El bot no ejecutará nuevas inversiones hoy. Se reactivará automáticamente mañana.</div>
-                  <button onClick={() => { setGoalReached(false); addLog("🔓 Meta desbloqueada manualmente por el usuario.", "SYSTEM"); }}
-                    style={{ background: `${S.amber}22`, border: `1px solid ${S.amber}`, color: S.amber, padding: "5px 14px", borderRadius: "4px", fontFamily: mono, fontSize: "10px", cursor: "pointer", fontWeight: 700, letterSpacing: "1px" }}>
-                    DESBLOQUEAR MANUALMENTE
-                  </button>
+                  <div style={{ color: S.muted2, fontSize: "9px", marginBottom: "8px" }}>El desbloqueo manual todavía no está conectado al backend real. La meta se liberará automáticamente en el siguiente rollover diario.</div>
                 </div>
               )}
             </div>
@@ -1201,7 +1433,7 @@ export default function PolyBotV2() {
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "16px" }}>
                 <div style={{ color: S.cyan, fontFamily: heading, fontSize: "13px", letterSpacing: "2px", marginBottom: "14px" }}>📊 ESTADÍSTICAS</div>
                 {[
-                  ["Capital Inicial", `$${INIT_CAPITAL.toLocaleString()}`, S.muted2],
+                  ["Capital Inicial", `$${baseCapital.toFixed(2)}`, S.muted2],
                   ["Capital Libre", `$${capital.toFixed(2)}`, S.cyan],
                   ["Capital Invertido", `$${invested.toFixed(2)}`, S.text],
                   ["Valor Total", `$${totalValue.toFixed(2)}`, S.white],
@@ -1228,21 +1460,9 @@ export default function PolyBotV2() {
               <div style={{ background: S.panel, border: `1px solid ${S.redD}44`, borderRadius: "6px", padding: "14px" }}>
                 <div style={{ color: S.red, fontWeight: 700, marginBottom: "8px", fontSize: "10px", letterSpacing: "1px" }}>⚠ ZONA DE RESET</div>
                 <div style={{ color: S.muted2, fontSize: "9px", marginBottom: "12px", lineHeight: 1.6 }}>
-                  Borra todos los trades, señales, noticias y log. Restaura el capital a ${INIT_CAPITAL.toFixed(2)} (base inicial).
+                  Borra todos los trades, señales, noticias y log. Restaura el capital a ${baseCapital.toFixed(2)} (base inicial).
                 </div>
-                <Btn label="RESETEAR TODO" color={S.red} onClick={() => {
-                  if (!window.confirm("¿Resetear completamente? Todos los datos se perderán.")) return;
-                  setCapitalP(INIT_CAPITAL);
-                  setTradesP([]);
-                  setSignalsP([]);
-                  setAllMarkets([]);
-                  setMarketSnapshots({});
-                  setNewsCache({});
-                  setLogEntries([]);
-                  setDailyPnl(0);
-                  ["pb2_log","pb2_dpnl","pb2_markets","pb2_snap","pb2_news","pb2_daily_date"].forEach(k => { try { localStorage.removeItem(k) } catch {} });
-                  addLog(`🔄 SISTEMA RESETEADO COMPLETAMENTE · Capital: $${INIT_CAPITAL.toFixed(2)} · Fecha: ${new Date().toLocaleDateString("es-CO")}`, "SYSTEM");
-                }} />
+                <Btn label="RESETEAR TODO" color={S.red} disabled onClick={() => {}} />
               </div>
             </div>
           </div>

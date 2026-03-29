@@ -21,7 +21,7 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 -- Tip: puedes hacer do $$ begin ... end $$ para definirla 1 sola vez:
 DO $$
 DECLARE
-  anon_key TEXT := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind4Z3h6a2xxYmFycWZxcHR6YXRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQzODI0MjEsImV4cCI6MjA4OTk1ODQyMX0.uivkzz-ObcVrNsy2iw-mE8Zul_K_yJoRd8T7gAq1I2w';  -- ← PON TU ANON KEY AQUÍ
+  anon_key TEXT := '<TU_ANON_KEY>';  -- <- PON TU ANON KEY AQUI
   fn_url   TEXT := 'https://wxgxzklqbarqfqptzatq.supabase.co/functions/v1/bot-cron';
 BEGIN
 
