@@ -1,7 +1,7 @@
 ﻿import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getTokenSellPrice, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
 import { createRuntimeOwner, withRuntimeLock } from './runtimeLocks.js';
@@ -43,6 +43,20 @@ const WITHDRAWAL_EXCESS_RATIO = Math.max(
 const WALLET_ACTIVITY_MAX = 200;
 
 function getWithdrawalPolicySnapshot() {
+  const tradingWalletAddress = getTradingWalletAddress();
+  const sameAddressBlocked = isSameAddress(tradingWalletAddress, WITHDRAWAL_TARGET_ADDRESS);
+  const blockers = [];
+
+  if (!AUTO_WITHDRAW_ENABLED) {
+    blockers.push("AUTO_WITHDRAW_ENABLED=false");
+  }
+  if (!WITHDRAWAL_TARGET_ADDRESS) {
+    blockers.push("Falta WITHDRAWAL_TARGET_ADDRESS");
+  }
+  if (sameAddressBlocked) {
+    blockers.push("La wallet destino no puede ser la misma wallet operativa");
+  }
+
   return {
     enabled: AUTO_WITHDRAW_ENABLED,
     configured: !!WITHDRAWAL_TARGET_ADDRESS,
@@ -53,6 +67,10 @@ function getWithdrawalPolicySnapshot() {
     cooldownHours: WITHDRAWAL_COOLDOWN_HOURS,
     minPolBalance: WITHDRAWAL_MIN_POL_BALANCE,
     minTransferUsdc: WITHDRAWAL_MIN_TRANSFER_USDC,
+    tradingWalletAddress: tradingWalletAddress || null,
+    sameAddressBlocked,
+    ready: blockers.length === 0,
+    blockers,
   };
 }
 
@@ -208,8 +226,9 @@ export async function refreshDbReadiness(force = false) {
   }
 
   const warnings = [];
-  if (botState.withdrawalPolicy?.enabled && isSameAddress(botState.walletSnapshot?.address, WITHDRAWAL_TARGET_ADDRESS)) {
-    warnings.push("El retiro automático apunta a la misma wallet operativa.");
+  botState.withdrawalPolicy = getWithdrawalPolicySnapshot();
+  if (Array.isArray(botState.withdrawalPolicy?.blockers) && botState.withdrawalPolicy.blockers.length > 0) {
+    warnings.push(...botState.withdrawalPolicy.blockers.map(reason => `Retiro automático: ${reason}`));
   }
 
   botState.dbReadiness = {
@@ -233,6 +252,7 @@ async function refreshWalletSnapshot(force = false) {
   botState.walletSnapshot = snapshot
     ? { ...snapshot, openExposure: sumOpenExposure(getOpenTrades()) }
     : null;
+  botState.withdrawalPolicy = getWithdrawalPolicySnapshot();
   if (snapshot) {
     botState.capital = roundMoney(snapshot.usdcBalance);
   }

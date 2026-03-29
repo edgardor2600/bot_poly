@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 // ─── CONSTANTS Y CONFIG NUBE ──────────────────────────────────────────────────
 const DEFAULT_BASE_CAPITAL = 15;
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:4000";
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "https://polybot-backend-f3gt.onrender.com";
 
 const CATEGORIES = {
   ALL: { label: "Todos", icon: "◈" },
@@ -1279,6 +1279,8 @@ export default function PolyBotV2() {
 
           const policyEnabled = !!withdrawalPolicy?.enabled;
           const policyConfigured = !!withdrawalPolicy?.configured;
+          const policyReady = !!withdrawalPolicy?.ready;
+          const withdrawalBlockers = Array.isArray(withdrawalPolicy?.blockers) ? withdrawalPolicy.blockers : [];
 
           return (
             <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
@@ -1291,11 +1293,29 @@ export default function PolyBotV2() {
 
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "14px" }}>
                 <div style={{ color: S.cyan, fontSize: "11px", letterSpacing: "1px", marginBottom: "10px" }}>POLÍTICA DE RETIRO AUTOMÁTICO</div>
+                <div style={{
+                  marginBottom: "12px",
+                  padding: "10px 12px",
+                  borderRadius: "6px",
+                  border: `1px solid ${policyReady ? S.green : S.red}33`,
+                  background: policyReady ? `${S.green}10` : `${S.red}10`,
+                }}>
+                  <div style={{ color: policyReady ? S.green : S.red, fontSize: "10px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>
+                    {policyReady ? "Retiro Automático Listo" : "Retiro Automático Bloqueado"}
+                  </div>
+                  <div style={{ color: S.text, fontSize: "10px", marginTop: "4px" }}>
+                    {policyReady
+                      ? "La política tiene destino válido y ya puede operar cuando se active."
+                      : (withdrawalBlockers[0] || "Falta configuración para habilitar retiros automáticos.")}
+                  </div>
+                </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px" }}>
                   {[
                     ["Estado", policyEnabled ? "ACTIVO" : "INACTIVO", policyEnabled ? S.green : S.red],
                     ["Configurado", policyConfigured ? "SÍ" : "NO", policyConfigured ? S.green : S.red],
+                    ["Listo", policyReady ? "SÍ" : "NO", policyReady ? S.green : S.red],
                     ["Wallet Destino", withdrawalPolicy?.targetAddress ? `${withdrawalPolicy.targetAddress.slice(0, 6)}...${withdrawalPolicy.targetAddress.slice(-4)}` : "—", S.text],
+                    ["Wallet Operativa", withdrawalPolicy?.tradingWalletAddress ? `${withdrawalPolicy.tradingWalletAddress.slice(0, 6)}...${withdrawalPolicy.tradingWalletAddress.slice(-4)}` : "—", S.text],
                     ["Piso Operativo", withdrawalPolicy ? `$${Number(withdrawalPolicy.operatingCapitalUsdc || 0).toFixed(2)}` : "—", S.text],
                     ["Exceso Mínimo", withdrawalPolicy ? `$${Number(withdrawalPolicy.minExcessUsdc || 0).toFixed(2)}` : "—", S.text],
                     ["% Retiro", withdrawalPolicy ? `${((Number(withdrawalPolicy.excessRatio || 0)) * 100).toFixed(0)}%` : "—", S.text],
@@ -1312,6 +1332,11 @@ export default function PolyBotV2() {
                     </div>
                   ))}
                 </div>
+                {!policyReady && withdrawalBlockers.length > 0 && (
+                  <div style={{ marginTop: "10px", color: S.red, fontSize: "9px", lineHeight: 1.5 }}>
+                    {withdrawalBlockers.join(" | ")}
+                  </div>
+                )}
               </div>
 
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", overflow: "hidden" }}>
