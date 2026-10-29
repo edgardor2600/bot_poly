@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
 import { createRuntimeOwner, withRuntimeLock } from './runtimeLocks.js';
@@ -1243,9 +1243,11 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     const eventKey = pre.eventSlug || m.id;
     if (eventKey && seenEvents.has(eventKey)) continue;
 
-    const [yesBook, noBook] = await Promise.all([
+    const condId = m.conditionId || m.condition_id || null;
+    const [yesBook, noBook, tradeFlow] = await Promise.all([
       pre.yesTokenId ? getOrderBookSnapshot(pre.yesTokenId) : Promise.resolve({ isValid: false, reason: 'NO_YES_TOKEN' }),
       pre.noTokenId ? getOrderBookSnapshot(pre.noTokenId) : Promise.resolve({ isValid: false, reason: 'NO_NO_TOKEN' }),
+      condId ? getMarketTradeFlow(condId) : Promise.resolve(null),
     ]);
 
     const yesTradable = isSideMicrostructureTradable(yesBook);
@@ -1258,6 +1260,7 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     pre.yesBook = yesBook;
     pre.noBook = noBook;
     pre.clob = { yes: yesBook, no: noBook };
+    pre.tradeFlow = tradeFlow;
     pre.yesTradable = yesTradable;
     pre.noTradable = noTradable;
 
@@ -1277,11 +1280,169 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
       }
     }
 
+    if (tradeFlow && (tradeFlow.whaleYesCount > 0 || tradeFlow.whaleNoCount > 0)) {
+      if (!pre.signals.includes("WHALE_ACTIVITY")) {
+        pre.signals.push("WHALE_ACTIVITY");
+        pre.score += 10;
+      }
+    }
+
     if (eventKey) seenEvents.add(eventKey);
     verified.push({ m, pre });
   }
 
   return verified;
+}
+
+// ── ORÁCULO CRIPTO GRATUITO EN TIEMPO REAL + MODELO DE BARRERA BROWNIANA (Parkinson Vol) ──
+let cryptoTickerCache = { ts: 0, data: null };
+
+function normCdf(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989423 * Math.exp((-x * x) / 2);
+  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return x > 0 ? 1 - p : p;
+}
+
+async function getCryptoSpotContext(question, daysLeft) {
+  const q = String(question || "");
+  let assetKey = null;
+  let assetName = null;
+
+  if (/\b(bitcoin|btc)\b/i.test(q)) { assetKey = "XXBTZUSD"; assetName = "BTC"; }
+  else if (/\b(ethereum|eth)\b/i.test(q)) { assetKey = "XETHZUSD"; assetName = "ETH"; }
+  else if (/\b(solana|sol)\b/i.test(q)) { assetKey = "SOLUSD"; assetName = "SOL"; }
+  else if (/\b(xrp|ripple)\b/i.test(q)) { assetKey = "XXRPZUSD"; assetName = "XRP"; }
+  else if (/\b(dogecoin|doge)\b/i.test(q)) { assetKey = "XDGUSD"; assetName = "DOGE"; }
+
+  if (!assetKey) return null;
+
+  try {
+    if (!cryptoTickerCache.data || (Date.now() - cryptoTickerCache.ts) > 60000) {
+      const res = await fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD,ETHUSD,SOLUSD,XRPUSD,DOGEUSD", {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json?.result) {
+          cryptoTickerCache = { ts: Date.now(), data: json.result };
+        }
+      }
+    }
+
+    const ticker = cryptoTickerCache.data?.[assetKey];
+    if (!ticker) return null;
+
+    const spot = parseFloat(ticker?.c?.[0]);
+    const high24h = parseFloat(ticker?.h?.[1] || ticker?.h?.[0]);
+    const low24h = parseFloat(ticker?.l?.[1] || ticker?.l?.[0]);
+    if (!Number.isFinite(spot) || spot <= 0) return null;
+
+    // Estimador de Volatilidad Diaria de Parkinson usando el rango High/Low de 24h
+    const rawParkinson = (Number.isFinite(high24h) && Number.isFinite(low24h) && high24h > low24h && low24h > 0)
+      ? Math.log(high24h / low24h) / (2 * Math.sqrt(Math.LN2))
+      : 0.032;
+    const dailyVol = Math.max(0.018, Math.min(0.12, rawParkinson));
+
+    // Detectar precio objetivo ($78,000 o $85k) en la pregunta
+    const priceMatch = q.match(/\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)\s*(k)?/i);
+    let targetPrice = null;
+    if (priceMatch) {
+      const baseNum = parseFloat(priceMatch[1].replace(/,/g, ""));
+      const isK = Boolean(priceMatch[2]);
+      if (Number.isFinite(baseNum) && baseNum > 0) {
+        targetPrice = isK ? baseNum * 1000 : baseNum;
+      }
+    }
+
+    let mathYesProb = null;
+    let modelType = "SPOT_ONLY";
+    const tDays = Math.max(0.15, Number.isFinite(daysLeft) ? daysLeft : 3);
+    const periodStd = dailyVol * Math.sqrt(tDays);
+
+    if (targetPrice && targetPrice > spot * 0.2 && targetPrice < spot * 3.0) {
+      const isDipTouch = /\b(dip|drop|fall|low|touch|reach|hit)\b/i.test(q) && targetPrice < spot;
+      const isRallyTouch = /\b(reach|hit|touch|high|surge|pump)\b/i.test(q) && targetPrice > spot;
+      const isBelowTerminal = /\b(below|under|less than)\b/i.test(q);
+      const isAboveTerminal = /\b(above|over|greater than|higher than)\b/i.test(q);
+
+      const logDist = Math.abs(Math.log(targetPrice / spot));
+      const z = logDist / periodStd;
+
+      if (isDipTouch || isRallyTouch) {
+        modelType = "BARRIER_TOUCH";
+        // Principio de reflexión para movimiento browniano sin deriva
+        mathYesProb = Math.max(0.02, Math.min(0.96, 2 * normCdf(-z)));
+      } else if (isAboveTerminal) {
+        modelType = "TERMINAL_ABOVE";
+        const zSigned = Math.log(spot / targetPrice) / periodStd;
+        mathYesProb = Math.max(0.02, Math.min(0.96, normCdf(zSigned)));
+      } else if (isBelowTerminal) {
+        modelType = "TERMINAL_BELOW";
+        const zSigned = Math.log(targetPrice / spot) / periodStd;
+        mathYesProb = Math.max(0.02, Math.min(0.96, normCdf(zSigned)));
+      }
+    }
+
+    const distPct = targetPrice ? (((targetPrice - spot) / spot) * 100).toFixed(2) : null;
+    const summary = targetPrice
+      ? `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | ParkinsonDailyVol=${(dailyVol * 100).toFixed(2)}% | Target=$${targetPrice.toLocaleString("en-US")} (${distPct}% from spot) | Math_${modelType}_YES_Prob=${mathYesProb !== null ? (mathYesProb * 100).toFixed(1) + "%" : "N/A"}`
+      : `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | ParkinsonDailyVol=${(dailyVol * 100).toFixed(2)}%`;
+
+    return {
+      assetName,
+      spot,
+      high24h,
+      low24h,
+      dailyVol,
+      targetPrice,
+      modelType,
+      mathYesProb,
+      summary,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function callGroqResilient(body) {
+  // Intento 1: Modelo primario con json_object y 2048 tokens (para que el razonamiento nunca se trunque con 400)
+  const primaryBody = { ...body, max_tokens: 2048 };
+  let r = await fetch(API_GROQ, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+    body: JSON.stringify(primaryBody),
+  });
+
+  if (r.ok) {
+    return await r.json();
+  }
+
+  // Intento 2: Si Groq devuelve 400 (json_validate_failed por reasoning), reintentar sin response_format estricto
+  if (r.status === 400) {
+    const fallbackBody = { ...primaryBody };
+    delete fallbackBody.response_format;
+    r = await fetch(API_GROQ, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify(fallbackBody),
+    });
+    if (r.ok) {
+      return await r.json();
+    }
+  }
+
+  // Intento 3: Modelo rápido de respaldo (openai/gpt-oss-20b)
+  const backupBody = { ...primaryBody, model: "openai/gpt-oss-20b" };
+  delete backupBody.response_format;
+  r = await fetch(API_GROQ, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
+    body: JSON.stringify(backupBody),
+  });
+  if (!r.ok) throw new Error(`Groq error: ${r.status}`);
+  return await r.json();
 }
 
 // ── MOTOR GRATUITO E ILIMITADO DE NOTICIAS EN TIEMPO REAL (Google News RSS) ──
@@ -1350,7 +1511,6 @@ function computeQuantPositionSize(maxAllowedAmount, analysis, sideBook) {
   const maxUsdc = Math.max(minUsdc, Math.min(asNumber(maxAllowedAmount, minUsdc), asNumber(botState.config.maxTradeUsdc, 2)));
   if (maxUsdc <= minUsdc) return roundMoney(maxUsdc);
 
-  const fairProb = asNumber(analysis?.fair_prob, 0.5);
   const ask = asNumber(sideBook?.bestAsk ?? analysis?.executable_ask, 0.5);
   const conf = asNumber(analysis?.confidence, 68);
   const obi = asNumber(sideBook?.obi, 0);
@@ -1368,9 +1528,9 @@ function computeQuantPositionSize(maxAllowedAmount, analysis, sideBook) {
   return roundMoney(Math.max(minUsdc, Math.min(maxUsdc, sized)));
 }
 
-// ── IA PROFUNDA CUANTITATIVA (Groq + Google News RSS Gratis + Tavily + CLOB Flow) ──
+// ── IA PROFUNDA CUANTITATIVA (Groq + Google News RSS + Tavily + CLOB Flow + Crypto Spot Oracle + Bayesian Calibration) ──
 async function deepAnalyze(m, prelim) {
-  const { yesP, noP, vol, vol24, liq, daysLeft, change1h, change24h, change7d, yesBook, noBook, yesTradable, noTradable } = prelim;
+  const { yesP, noP, vol, vol24, liq, daysLeft, change1h, change24h, change7d, yesBook, noBook, tradeFlow, yesTradable, noTradable } = prelim;
   const marketId = m.id || m.conditionId;
   const SIX_HOURS = 6 * 60 * 60 * 1000;
 
@@ -1378,12 +1538,18 @@ async function deepAnalyze(m, prelim) {
   let topSource = "none";
   let topSnippet = "none";
   let usedCache = false;
+  let hasFreshNews = false;
 
-  const cachedNews = botState.newsCache[marketId];
+  const [cryptoQuant, cachedNews] = await Promise.all([
+    getCryptoSpotContext(m.question, daysLeft),
+    Promise.resolve(botState.newsCache[marketId]),
+  ]);
+
   if (cachedNews && (Date.now() - cachedNews.ts) < SIX_HOURS) {
     newsContext = cachedNews.context;
     topSource = cachedNews.source;
     topSnippet = cachedNews.snippet;
+    hasFreshNews = Boolean(cachedNews.hasFreshNews);
     usedCache = true;
   } else {
     const combinedLines = [];
@@ -1391,6 +1557,8 @@ async function deepAnalyze(m, prelim) {
     // 1. Fuente Primaria Gratuita e Ilimitada: Google News RSS (con antigüedad exacta en horas)
     const rssArticles = await fetchGoogleNewsRss(m.question);
     for (const art of rssArticles) {
+      const ageNum = parseFloat(art.ageHours);
+      if (Number.isFinite(ageNum) && ageNum <= 12) hasFreshNews = true;
       combinedLines.push(`[RSS ${art.ageHours}h ago | ${art.source}] ${art.title}`);
       if (topSource === "none" && art.url) topSource = art.url;
       if (topSnippet === "none") topSnippet = `[${art.source}] ${art.title.slice(0, 140)}`;
@@ -1414,6 +1582,7 @@ async function deepAnalyze(m, prelim) {
         if (tRes.ok) {
           const tData = await tRes.json();
           if (tData.results && tData.results.length > 0) {
+            hasFreshNews = true;
             for (const r of tData.results) {
               combinedLines.push(`[WEB ${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 240)}`);
             }
@@ -1433,6 +1602,7 @@ async function deepAnalyze(m, prelim) {
         context: newsContext,
         source: topSource,
         snippet: topSnippet,
+        hasFreshNews,
         news: newsContext,
       };
     }
@@ -1450,19 +1620,24 @@ async function deepAnalyze(m, prelim) {
     ? `Bid=${(noBook.bestBid * 100).toFixed(1)}c Ask=${(noBook.bestAsk * 100).toFixed(1)}c MicroPrice=${((noBook.microPrice ?? noBook.midPrice) * 100).toFixed(1)}c Spread=${noBook.spreadPct.toFixed(2)}% BidDepth=$${noBook.bidDepthUsd.toFixed(0)} AskDepth=$${noBook.askDepthUsd.toFixed(0)} OBI=${noBook.obi >= 0 ? "+" : ""}${noBook.obi.toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
+  const tapeFlowStr = tradeFlow
+    ? `Last_${tradeFlow.sampleCount}_Trades: BullishYES=$${tradeFlow.yesBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleYesCount}) | BullishNO=$${tradeFlow.noBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleNoCount}) | TapeImbalance=${tradeFlow.tapeImbalance >= 0 ? "+" : ""}${tradeFlow.tapeImbalance.toFixed(2)}`
+    : "UNAVAILABLE";
+
+  const cryptoLine = cryptoQuant ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary}` : "";
+
   const body = {
     model: GROQ_MODEL,
     messages: [
       {
         role: "system",
         content: `You are a senior quantitative prediction-market trader managing real capital on Polymarket CLOB.
-Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, price action, order book imbalance (OBI), and the exact market resolution rules.
+Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, price action, order book imbalance (OBI), real trade tape flow, live crypto spot oracle (if present), and the exact market resolution rules.
 CRITICAL RULES:
-1. To buy YES, your estimated_yes_prob MUST exceed the live YES Ask price plus spread by at least 0.06 (6 percentage points).
-2. To buy NO, your estimated NO probability (1 - estimated_yes_prob) MUST exceed the live NO Ask price plus spread by at least 0.06 (6 percentage points).
-3. Never recommend a side marked Tradable=NO.
-4. Check PRICE_ACTION (1h/24h/7d) vs news age: if a market already moved >20% in 24h because of old news, that catalyst is ALREADY PRICED IN — return action="SKIP".
-5. Check OBI (Order Book Imbalance from -1 to +1): positive OBI means strong buyer support (BidDepth > AskDepth).
+1. Anchor your prior to the market's MicroPrice — only deviate significantly when supported by fresh verifiable news, mathematical barrier models (LIVE_CRYPTO_ORACLE), or strong orderflow (OBI & TapeImbalance).
+2. Never recommend a side marked Tradable=NO.
+3. Check PRICE_ACTION (1h/24h/7d) vs news age: if a market already moved >20% in 24h because of old news, that catalyst is ALREADY PRICED IN — return action="SKIP".
+4. Avoid the Longshot Bias: be extra skeptical of buying outcomes priced below 18c unless mathematical or hard-news evidence is overwhelming.
 Return ONLY raw valid JSON.`
       },
       {
@@ -1474,71 +1649,100 @@ GAMMA_MID: YES=${fmtPct(yesP)} NO=${fmtPct(noP)} | VOL_24H=$${Math.round(vol24)}
 PRICE_ACTION_YES: ${priceActionStr}
 CLOB_YES_BOOK: ${yesBookStr}
 CLOB_NO_BOOK: ${noBookStr}
+CLOB_TAPE_FLOW: ${tapeFlowStr}${cryptoLine}
 QUANT_SIGNALS: ${prelim.signals.join(",") || "none"}
 RECENT_NEWS ${usedCache ? "(cached)" : "(live RSS + Web)"}:
-${newsContext.slice(0, 1250)}
+${newsContext.slice(0, 1200)}
 
 Return JSON with this exact schema:
 {"action":"BUY_YES"|"BUY_NO"|"SKIP","estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing probability vs ask price, news age, and order book","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
       }
     ],
     temperature: 0.1,
-    max_tokens: 1024,
+    max_tokens: 2048,
     response_format: { type: "json_object" }
   };
 
-  const r = await fetch(API_GROQ, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`Groq error: ${r.status}`);
-  const data = await r.json();
+  const data = await callGroqResilient(body);
   const txt = data.choices[0]?.message?.content || "{}";
   const clean = txt.replace(/```[\w]*\n?|```/g, "").trim();
   const jsonMatch = clean.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
 
-  // ── VERIFICACIÓN MATEMÁTICA DURA POST-IA (Anti-Alucinación) ──
+  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA ──
   let estYesProb = parseFloat(result.estimated_yes_prob);
   if (Number.isFinite(estYesProb)) {
     if (estYesProb > 1 && estYesProb <= 100) estYesProb = estYesProb / 100;
   }
 
+  // Si es un mercado cripto con modelo matemático de barrera (Parkinson + Brownian Motion), anclar el estimado de la IA con la probabilidad matemática real
+  if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb) && Number.isFinite(estYesProb)) {
+    estYesProb = (0.55 * estYesProb) + (0.45 * cryptoQuant.mathYesProb);
+  }
+
   let selectedBook = null;
-  let fairProb = null;
+  let rawSideProb = null;
+  let isYesSide = false;
 
   if (result.action === "BUY_YES") {
+    isYesSide = true;
     if (!yesTradable || !yesBook?.isValid) {
       result.action = "SKIP";
       result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = yesBook;
-      fairProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+      rawSideProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
     }
   } else if (result.action === "BUY_NO") {
+    isYesSide = false;
     if (!noTradable || !noBook?.isValid) {
       result.action = "SKIP";
       result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = noBook;
-      fairProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+      rawSideProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
     }
   }
 
   if (selectedBook && (result.action === "BUY_YES" || result.action === "BUY_NO")) {
-    fairProb = Math.max(0.01, Math.min(0.99, fairProb));
+    rawSideProb = Math.max(0.01, Math.min(0.99, rawSideProb));
     const executableAsk = selectedBook.bestAsk;
-    const spreadCost = selectedBook.spreadAbs;
-    const rawEdgePct = (fairProb - executableAsk) * 100;
-    const netEdgePct = (fairProb - executableAsk - spreadCost) * 100;
+    const marketMicro = selectedBook.microPrice ?? selectedBook.midPrice ?? executableAsk;
 
-    result.fair_prob = Number(fairProb.toFixed(4));
+    // 1. Contracción Bayesiana (Bayesian Shrinkage) hacia el Micro-Precio eficiente del mercado
+    // Evita que la sobreconfianza del LLM invente edges irreales sin respaldo de noticias + flujo
+    let aiWeight = 0.56;
+    if (hasFreshNews) aiWeight += 0.08;
+    if (selectedBook.obi >= 0.15) aiWeight += 0.06;
+    else if (selectedBook.obi <= -0.15) aiWeight -= 0.08;
+
+    const sideTapeImbalance = tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0;
+    if (sideTapeImbalance >= 0.15) aiWeight += 0.06;
+    else if (sideTapeImbalance <= -0.20) aiWeight -= 0.08;
+
+    // En mercados ultra-líquidos (>$50k liq), el precio de mercado es más eficiente -> mayor peso al prior del mercado
+    if (liq > 50000) aiWeight -= 0.06;
+    aiWeight = Math.max(0.42, Math.min(0.75, aiWeight));
+
+    const calibratedFairProb = Math.max(0.01, Math.min(0.99, (aiWeight * rawSideProb) + ((1 - aiWeight) * marketMicro)));
+
+    // 2. Descuento de Spread + Comisión Taker (takerBaseFee) + Penalización Longshot Bias (<18c)
+    const spreadCost = selectedBook.spreadAbs;
+    const takerBaseFeeBps = asNumber(m.takerBaseFee, 0);
+    const feeCost = takerBaseFeeBps > 0 ? (executableAsk * (1 - executableAsk) * 0.015) : 0;
+    const longshotPenalty = executableAsk < 0.18 ? 0.015 : 0;
+
+    const rawEdgePct = (rawSideProb - executableAsk) * 100;
+    const netEdgePct = (calibratedFairProb - executableAsk - spreadCost - feeCost - longshotPenalty) * 100;
+
+    result.raw_fair_prob = Number(rawSideProb.toFixed(4));
+    result.fair_prob = Number(calibratedFairProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
-    result.micro_price = Number((selectedBook.microPrice ?? selectedBook.midPrice).toFixed(4));
+    result.micro_price = Number(marketMicro.toFixed(4));
     result.obi = Number((selectedBook.obi ?? 0).toFixed(3));
+    result.tape_imbalance = Number(sideTapeImbalance.toFixed(3));
     result.spread_pct = Number(selectedBook.spreadPct.toFixed(2));
     result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
     result.edge_pct = Number(netEdgePct.toFixed(2));
@@ -1548,7 +1752,7 @@ Return JSON with this exact schema:
 
     if (netEdgePct < MIN_NET_EDGE_PCT || conf < MIN_AI_CONFIDENCE || risk === "HIGH") {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CUANTITATIVO: Edge Neto ${netEdgePct.toFixed(1)}% (min ${MIN_NET_EDGE_PCT}%), Conf ${conf}% (min ${MIN_AI_CONFIDENCE}%), Risk ${risk}] ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO BAYESIANO: Edge Calibrado ${netEdgePct.toFixed(1)}% (min ${MIN_NET_EDGE_PCT}%), RawEdge ${rawEdgePct.toFixed(1)}%, Conf ${conf}%, Risk ${risk}] ${result.reasoning || ""}`;
     }
   } else {
     result.edge_pct = Number(parseFloat(result.edge_pct || 0).toFixed(2));

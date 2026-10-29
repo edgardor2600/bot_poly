@@ -397,6 +397,62 @@ export async function getOrderBookSnapshot(tokenId) {
   }
 }
 
+export async function getMarketTradeFlow(conditionId) {
+  if (!conditionId) return null;
+  try {
+    const url = `https://data-api.polymarket.com/trades?market=${encodeURIComponent(conditionId)}&limit=40`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const trades = await res.json();
+    if (!Array.isArray(trades) || trades.length === 0) return null;
+
+    let yesBullUsd = 0;
+    let noBullUsd = 0;
+    let whaleYesCount = 0;
+    let whaleNoCount = 0;
+
+    for (const t of trades) {
+      const side = String(t?.side || "").toUpperCase();
+      const outcome = String(t?.outcome || "").toUpperCase();
+      const size = asNumber(t?.size);
+      const price = asNumber(t?.price);
+      if (size <= 0 || price <= 0 || price >= 1) continue;
+      const usdVal = size * price;
+
+      // Buying YES or Selling NO = bullish on YES
+      const isYesBullish = (outcome === "YES" && side === "BUY") || (outcome === "NO" && side === "SELL");
+      const isNoBullish = (outcome === "NO" && side === "BUY") || (outcome === "YES" && side === "SELL");
+
+      if (isYesBullish) {
+        yesBullUsd += usdVal;
+        if (usdVal >= 100) whaleYesCount++;
+      } else if (isNoBullish) {
+        noBullUsd += usdVal;
+        if (usdVal >= 100) whaleNoCount++;
+      }
+    }
+
+    const totalFlowUsd = yesBullUsd + noBullUsd;
+    const tapeImbalance = totalFlowUsd > 0
+      ? roundAmount((yesBullUsd - noBullUsd) / totalFlowUsd, 3)
+      : 0;
+
+    return {
+      sampleCount: trades.length,
+      yesBullUsd: roundAmount(yesBullUsd, 2),
+      noBullUsd: roundAmount(noBullUsd, 2),
+      whaleYesCount,
+      whaleNoCount,
+      tapeImbalance,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function getTokenSellPrice(tokenId) {
   if (!tokenId) return null;
 
