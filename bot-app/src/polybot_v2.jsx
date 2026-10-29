@@ -421,7 +421,9 @@ export default function PolyBotV2() {
   function closeTrade(id, closePrice) { alert('El Backend se encarga del Stop Loss y Take Profit.'); }
   // ── Derived stats ──
   const ACTIVE_REAL_STATUSES = new Set(["OPEN", "PARTIAL", "PENDING_BUY", "PENDING_SELL"]);
-  const realTrades = trades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL");
+  const realTrades = realTradingEnabled
+    ? trades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL")
+    : trades;
   const openTrades = realTrades.filter(t => ACTIVE_REAL_STATUSES.has(String(t.status || "").toUpperCase()));
   const closedTrades = realTrades.filter(t => t.status === "CLOSED");
   const invested = openTrades.reduce((s, t) => s + t.cost, 0);
