@@ -361,15 +361,33 @@ export async function getOrderBookSnapshot(tokenId) {
         )
       : 0;
 
+    const totalDepthUsd = bidDepthUsd + askDepthUsd;
+    const obi = totalDepthUsd > 0
+      ? roundAmount((bidDepthUsd - askDepthUsd) / totalDepthUsd, 3)
+      : 0;
+    const microPrice = (bestBid !== null && bestAsk !== null && totalDepthUsd > 0)
+      ? roundAmount(((bestBid * askDepthUsd) + (bestAsk * bidDepthUsd)) / totalDepthUsd, 4)
+      : midPrice;
+    const isValid = (
+      bestBid !== null &&
+      bestAsk !== null &&
+      bestAsk >= bestBid &&
+      spreadAbs !== null &&
+      spreadPct !== null
+    );
+
     return {
+      isValid,
       tokenId: String(tokenId),
       bestBid,
       bestAsk,
       midPrice,
+      microPrice,
       spreadAbs,
       spreadPct,
       askDepthUsd,
       bidDepthUsd,
+      obi,
       tickSize: asNumber(book?.minimum_tick_size) || 0.01,
       minOrderSize: asNumber(book?.min_order_size) || 1,
       negRisk: Boolean(book?.neg_risk),

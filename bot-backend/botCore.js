@@ -1113,8 +1113,7 @@ function preliminaryScore(m, prevSnapshot) {
   }
 
   // 3. Validar tokens CLOB existentes
-  const yesTokenId = extractClobTokenId(m, 'BUY_YES');
-  const noTokenId = extractClobTokenId(m, 'BUY_NO');
+  const { yesTokenId, noTokenId } = parseTokenIds(m);
   if (!yesTokenId && !noTokenId) {
     return { score: 0, signals: [], skip: true };
   }
@@ -1178,19 +1177,45 @@ function preliminaryScore(m, prevSnapshot) {
   const turnover = liq > 0 ? (vol24 / liq) : 0;
   if (turnover >= 0.5) { signals.push("HIGH_TURNOVER"); score += 12; }
 
-  // 8. Momentum intradía / inter-escaneo
-  const priceChange1d = Math.abs(parseFloat(m.oneDayPriceChange || 0));
+  // 8. Acción de precio multi-temporal gratis (1h, 24h, 7d) desde Gamma
+  const change1h = parseFloat(m.oneHourPriceChange || 0);
+  const change24h = parseFloat(m.oneDayPriceChange || 0);
+  const change7d = parseFloat(m.oneWeekPriceChange || 0);
+  const priceChange1d = Math.abs(change24h);
+
   if (prevSnapshot) {
     const prevY = parseFloat(prevSnapshot.yesP ?? yesP);
     const delta = Math.abs(yesP - prevY);
     if (delta >= 0.04) { signals.push("MOMENTUM"); score += 20; }
     else if (delta >= 0.02) { signals.push("MOMENTUM"); score += 10; }
-  } else if (priceChange1d >= 0.05) {
+  } else if (priceChange1d >= 0.05 && priceChange1d <= 0.22) {
     signals.push("MOMENTUM_24H");
     score += 14;
+  } else if (priceChange1d > 0.30) {
+    // Alerta de posible movimiento ya descontado (FOMO / Priced-In)
+    signals.push("EXTENDED_MOVE_24H");
   }
 
-  return { score, signals, yesP, noP, vol, vol24, liq, sum, daysLeft, yesTokenId, noTokenId, skip: false };
+  const eventSlug = String(m.events?.[0]?.slug || m.groupItemTitle || m.slug || m.id || "");
+
+  return {
+    score,
+    signals,
+    yesP,
+    noP,
+    vol,
+    vol24,
+    liq,
+    sum,
+    daysLeft,
+    change1h,
+    change24h,
+    change7d,
+    eventSlug,
+    yesTokenId,
+    noTokenId,
+    skip: false,
+  };
 }
 
 function isSideMicrostructureTradable(book) {
@@ -1198,20 +1223,29 @@ function isSideMicrostructureTradable(book) {
   if (book.bestAsk < 0.07 || book.bestAsk > 0.92) return false;
   if (book.spreadPct > MAX_SPREAD_PCT || book.spreadAbs > MAX_SPREAD_CENTS) return false;
   if (book.askDepthUsd < MIN_BOOK_DEPTH_USD || book.bidDepthUsd < MIN_BOOK_DEPTH_USD) return false;
+  // Evitar comprar contra un muro institucional de venta (Order Book Imbalance < -0.65)
+  if (Number.isFinite(book.obi) && book.obi < -0.65) return false;
   return true;
 }
 
 async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
   const verified = [];
+  const seenEvents = new Set();
   const maxProbes = Math.min(scoredMarkets.length, Math.max(targetCount * 4, 24));
 
   for (let i = 0; i < maxProbes && verified.length < targetCount; i++) {
     const item = scoredMarkets[i];
-    const { market: m, prelim } = item;
+    const m = item.m || item.market;
+    const pre = item.pre || item.prelim;
+    if (!m || !pre) continue;
+
+    // Diversificación de eventos: máximo 1 candidato por evento raíz en el lote top de IA
+    const eventKey = pre.eventSlug || m.id;
+    if (eventKey && seenEvents.has(eventKey)) continue;
 
     const [yesBook, noBook] = await Promise.all([
-      prelim.yesTokenId ? getOrderBookSnapshot(prelim.yesTokenId) : Promise.resolve({ isValid: false, reason: 'NO_YES_TOKEN' }),
-      prelim.noTokenId ? getOrderBookSnapshot(prelim.noTokenId) : Promise.resolve({ isValid: false, reason: 'NO_NO_TOKEN' }),
+      pre.yesTokenId ? getOrderBookSnapshot(pre.yesTokenId) : Promise.resolve({ isValid: false, reason: 'NO_YES_TOKEN' }),
+      pre.noTokenId ? getOrderBookSnapshot(pre.noTokenId) : Promise.resolve({ isValid: false, reason: 'NO_NO_TOKEN' }),
     ]);
 
     const yesTradable = isSideMicrostructureTradable(yesBook);
@@ -1221,31 +1255,124 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
       continue;
     }
 
-    prelim.yesBook = yesBook;
-    prelim.noBook = noBook;
-    prelim.yesTradable = yesTradable;
-    prelim.noTradable = noTradable;
+    pre.yesBook = yesBook;
+    pre.noBook = noBook;
+    pre.clob = { yes: yesBook, no: noBook };
+    pre.yesTradable = yesTradable;
+    pre.noTradable = noTradable;
 
     const bestSpreadPct = Math.min(
       yesTradable ? yesBook.spreadPct : 999,
       noTradable ? noBook.spreadPct : 999
     );
-    if (bestSpreadPct <= 1.5 && !prelim.signals.includes("ULTRA_TIGHT_SPREAD")) {
-      prelim.signals.push("ULTRA_TIGHT_SPREAD");
-      prelim.score += 10;
+    if (bestSpreadPct <= 1.5 && !pre.signals.includes("ULTRA_TIGHT_SPREAD")) {
+      pre.signals.push("ULTRA_TIGHT_SPREAD");
+      pre.score += 10;
     }
 
-    verified.push(item);
+    if ((yesTradable && yesBook.obi >= 0.25) || (noTradable && noBook.obi >= 0.25)) {
+      if (!pre.signals.includes("BOOK_ACCUMULATION")) {
+        pre.signals.push("BOOK_ACCUMULATION");
+        pre.score += 8;
+      }
+    }
+
+    if (eventKey) seenEvents.add(eventKey);
+    verified.push({ m, pre });
   }
 
   return verified;
 }
 
-// ── IA PROFUNDA CUANTITATIVA (Groq + Tavily + CLOB Microstructure) ──
+// ── MOTOR GRATUITO E ILIMITADO DE NOTICIAS EN TIEMPO REAL (Google News RSS) ──
+async function fetchGoogleNewsRss(question) {
+  try {
+    const cleanQuery = String(question || "")
+      .replace(/[?"'’“”]/g, " ")
+      .replace(/\b(Will|the|be|in|on|at|by|before|after|of|to|a|an)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 90);
+    if (!cleanQuery) return [];
+
+    const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(cleanQuery + " when:7d")}&hl=en-US&gl=US&ceid=US:en`;
+    const res = await fetch(rssUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml",
+      },
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    const articles = [];
+    let match;
+
+    while ((match = itemRegex.exec(xml)) !== null && articles.length < 4) {
+      const block = match[1];
+      const titleMatch = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+      const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/i);
+      const pubDateMatch = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+      const sourceMatch = block.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
+
+      const rawTitle = (titleMatch?.[1] || "")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!rawTitle) continue;
+
+      const sourceName = (sourceMatch?.[1] || "News").trim();
+      const pubDate = pubDateMatch?.[1] ? new Date(pubDateMatch[1]) : null;
+      const ageHours = (pubDate && Number.isFinite(pubDate.getTime()))
+        ? Math.max(0.1, (Date.now() - pubDate.getTime()) / 3600000).toFixed(1)
+        : "?";
+
+      articles.push({
+        title: rawTitle,
+        source: sourceName,
+        url: (linkMatch?.[1] || "").trim(),
+        ageHours,
+      });
+    }
+    return articles;
+  } catch {
+    return [];
+  }
+}
+
+function computeQuantPositionSize(maxAllowedAmount, analysis, sideBook) {
+  const minUsdc = Math.max(1, asNumber(botState.config.minTradeUsdc, 1));
+  const maxUsdc = Math.max(minUsdc, Math.min(asNumber(maxAllowedAmount, minUsdc), asNumber(botState.config.maxTradeUsdc, 2)));
+  if (maxUsdc <= minUsdc) return roundMoney(maxUsdc);
+
+  const fairProb = asNumber(analysis?.fair_prob, 0.5);
+  const ask = asNumber(sideBook?.bestAsk ?? analysis?.executable_ask, 0.5);
+  const conf = asNumber(analysis?.confidence, 68);
+  const obi = asNumber(sideBook?.obi, 0);
+
+  // Quarter-Kelly fraction sobre el payoff binario (1 - ask)
+  const payoffOdds = Math.max(0.08, 1 - ask);
+  const netEdgeDec = Math.max(0, asNumber(analysis?.edge_pct, 0) / 100);
+  const kellyRaw = netEdgeDec / payoffOdds;
+  const confMultiplier = Math.max(0.5, Math.min(1.15, (conf - 50) / 40));
+  const obiBonus = obi >= 0.2 ? 1.1 : (obi < -0.2 ? 0.85 : 1.0);
+
+  // Escalar entre minUsdc y maxUsdc según la convicción matemática (Edge Neto de 6% -> cerca de minUsdc; Edge Neto >= 14% -> cerca de maxUsdc)
+  const convictionRatio = Math.max(0, Math.min(1, ((kellyRaw * 2.2) * confMultiplier * obiBonus)));
+  const sized = minUsdc + (maxUsdc - minUsdc) * convictionRatio;
+  return roundMoney(Math.max(minUsdc, Math.min(maxUsdc, sized)));
+}
+
+// ── IA PROFUNDA CUANTITATIVA (Groq + Google News RSS Gratis + Tavily + CLOB Flow) ──
 async function deepAnalyze(m, prelim) {
-  const { yesP, noP, vol, vol24, liq, daysLeft, yesBook, noBook, yesTradable, noTradable } = prelim;
+  const { yesP, noP, vol, vol24, liq, daysLeft, change1h, change24h, change7d, yesBook, noBook, yesTradable, noTradable } = prelim;
   const marketId = m.id || m.conditionId;
-  const TWO_HOURS = 2 * 60 * 60 * 1000;
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
 
   let newsContext = "Sin noticias recientes.";
   let topSource = "none";
@@ -1253,47 +1380,74 @@ async function deepAnalyze(m, prelim) {
   let usedCache = false;
 
   const cachedNews = botState.newsCache[marketId];
-  if (cachedNews && (Date.now() - cachedNews.ts) < TWO_HOURS) {
+  if (cachedNews && (Date.now() - cachedNews.ts) < SIX_HOURS) {
     newsContext = cachedNews.context;
     topSource = cachedNews.source;
     topSnippet = cachedNews.snippet;
     usedCache = true;
   } else {
-    try {
-      const tRes = await fetch(API_TAVILY, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          api_key: TAVILY_API_KEY,
-          query: `${m.question} latest news`,
-          search_depth: "basic",
-          days: 7,
-          include_answers: false,
-          max_results: 4,
-        })
-      });
-      if (tRes.ok) {
-        const tData = await tRes.json();
-        if (tData.results && tData.results.length > 0) {
-          newsContext = tData.results
-            .map((r, idx) => `${idx + 1}. [${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 260)}`)
-            .join("\n");
-          topSource = tData.results[0].url;
-          topSnippet = (tData.results[0].content || '').replace(/\s+/g, ' ').slice(0, 160) + "...";
-          botState.newsCache[marketId] = { ts: Date.now(), context: newsContext, source: topSource, snippet: topSnippet, news: newsContext };
+    const combinedLines = [];
+
+    // 1. Fuente Primaria Gratuita e Ilimitada: Google News RSS (con antigüedad exacta en horas)
+    const rssArticles = await fetchGoogleNewsRss(m.question);
+    for (const art of rssArticles) {
+      combinedLines.push(`[RSS ${art.ageHours}h ago | ${art.source}] ${art.title}`);
+      if (topSource === "none" && art.url) topSource = art.url;
+      if (topSnippet === "none") topSnippet = `[${art.source}] ${art.title.slice(0, 140)}`;
+    }
+
+    // 2. Fuente Secundaria Profunda: Tavily (con caché de 6h para proteger los 1,000 créditos/mes gratis)
+    if (TAVILY_API_KEY) {
+      try {
+        const tRes = await fetch(API_TAVILY, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            api_key: TAVILY_API_KEY,
+            query: `${m.question} latest news`,
+            search_depth: "basic",
+            days: 7,
+            include_answers: false,
+            max_results: 3,
+          })
+        });
+        if (tRes.ok) {
+          const tData = await tRes.json();
+          if (tData.results && tData.results.length > 0) {
+            for (const r of tData.results) {
+              combinedLines.push(`[WEB ${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 240)}`);
+            }
+            topSource = tData.results[0].url || topSource;
+            topSnippet = (tData.results[0].content || '').replace(/\s+/g, ' ').slice(0, 160) + "...";
+          }
         }
+      } catch (e) {
+        console.warn("Tavily fallido (usando respaldo RSS gratuito):", e.message);
       }
-    } catch (e) { console.warn("Tavily fallido:", e.message); }
+    }
+
+    if (combinedLines.length > 0) {
+      newsContext = combinedLines.slice(0, 7).join("\n");
+      botState.newsCache[marketId] = {
+        ts: Date.now(),
+        context: newsContext,
+        source: topSource,
+        snippet: topSnippet,
+        news: newsContext,
+      };
+    }
   }
 
   const daysLeftStr = Number.isFinite(daysLeft) ? daysLeft.toFixed(1) : "?";
   const resolutionRules = (m.description || "Estándar Polymarket").replace(/\s+/g, " ").slice(0, 420);
+  const fmtDelta = (v) => `${v >= 0 ? "+" : ""}${(asNumber(v, 0) * 100).toFixed(1)}%`;
+  const priceActionStr = `1h=${fmtDelta(change1h)} | 24h=${fmtDelta(change24h)} | 7d=${fmtDelta(change7d)}`;
 
   const yesBookStr = yesBook?.isValid
-    ? `Bid=${(yesBook.bestBid * 100).toFixed(1)}c Ask=${(yesBook.bestAsk * 100).toFixed(1)}c Spread=${yesBook.spreadPct.toFixed(2)}% DepthAsk=$${yesBook.askDepthUsd.toFixed(0)} Tradable=${yesTradable ? "YES" : "NO"}`
+    ? `Bid=${(yesBook.bestBid * 100).toFixed(1)}c Ask=${(yesBook.bestAsk * 100).toFixed(1)}c MicroPrice=${((yesBook.microPrice ?? yesBook.midPrice) * 100).toFixed(1)}c Spread=${yesBook.spreadPct.toFixed(2)}% BidDepth=$${yesBook.bidDepthUsd.toFixed(0)} AskDepth=$${yesBook.askDepthUsd.toFixed(0)} OBI=${yesBook.obi >= 0 ? "+" : ""}${yesBook.obi.toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
   const noBookStr = noBook?.isValid
-    ? `Bid=${(noBook.bestBid * 100).toFixed(1)}c Ask=${(noBook.bestAsk * 100).toFixed(1)}c Spread=${noBook.spreadPct.toFixed(2)}% DepthAsk=$${noBook.askDepthUsd.toFixed(0)} Tradable=${noTradable ? "YES" : "NO"}`
+    ? `Bid=${(noBook.bestBid * 100).toFixed(1)}c Ask=${(noBook.bestAsk * 100).toFixed(1)}c MicroPrice=${((noBook.microPrice ?? noBook.midPrice) * 100).toFixed(1)}c Spread=${noBook.spreadPct.toFixed(2)}% BidDepth=$${noBook.bidDepthUsd.toFixed(0)} AskDepth=$${noBook.askDepthUsd.toFixed(0)} OBI=${noBook.obi >= 0 ? "+" : ""}${noBook.obi.toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
   const body = {
@@ -1302,12 +1456,13 @@ async function deepAnalyze(m, prelim) {
       {
         role: "system",
         content: `You are a senior quantitative prediction-market trader managing real capital on Polymarket CLOB.
-Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, and the exact market resolution rules.
+Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, price action, order book imbalance (OBI), and the exact market resolution rules.
 CRITICAL RULES:
 1. To buy YES, your estimated_yes_prob MUST exceed the live YES Ask price plus spread by at least 0.06 (6 percentage points).
 2. To buy NO, your estimated NO probability (1 - estimated_yes_prob) MUST exceed the live NO Ask price plus spread by at least 0.06 (6 percentage points).
 3. Never recommend a side marked Tradable=NO.
-4. If news is ambiguous, stale, priced-in, or lacks a clear informational edge over the CLOB Ask price, return action="SKIP".
+4. Check PRICE_ACTION (1h/24h/7d) vs news age: if a market already moved >20% in 24h because of old news, that catalyst is ALREADY PRICED IN — return action="SKIP".
+5. Check OBI (Order Book Imbalance from -1 to +1): positive OBI means strong buyer support (BidDepth > AskDepth).
 Return ONLY raw valid JSON.`
       },
       {
@@ -1316,14 +1471,15 @@ Return ONLY raw valid JSON.`
 QUESTION: "${m.question}"
 RESOLUTION_RULES: "${resolutionRules}"
 GAMMA_MID: YES=${fmtPct(yesP)} NO=${fmtPct(noP)} | VOL_24H=$${Math.round(vol24)} | LIQ=$${Math.round(liq)}
+PRICE_ACTION_YES: ${priceActionStr}
 CLOB_YES_BOOK: ${yesBookStr}
 CLOB_NO_BOOK: ${noBookStr}
 QUANT_SIGNALS: ${prelim.signals.join(",") || "none"}
-RECENT_NEWS ${usedCache ? "(cached)" : "(live 7d)"}:
-${newsContext.slice(0, 1100)}
+RECENT_NEWS ${usedCache ? "(cached)" : "(live RSS + Web)"}:
+${newsContext.slice(0, 1250)}
 
 Return JSON with this exact schema:
-{"action":"BUY_YES"|"BUY_NO"|"SKIP","estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing probability vs ask price","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
+{"action":"BUY_YES"|"BUY_NO"|"SKIP","estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing probability vs ask price, news age, and order book","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
       }
     ],
     temperature: 0.1,
@@ -1356,7 +1512,7 @@ Return JSON with this exact schema:
   if (result.action === "BUY_YES") {
     if (!yesTradable || !yesBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez. ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = yesBook;
       fairProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -1364,7 +1520,7 @@ Return JSON with this exact schema:
   } else if (result.action === "BUY_NO") {
     if (!noTradable || !noBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez. ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = noBook;
       fairProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -1381,6 +1537,8 @@ Return JSON with this exact schema:
     result.fair_prob = Number(fairProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
+    result.micro_price = Number((selectedBook.microPrice ?? selectedBook.midPrice).toFixed(4));
+    result.obi = Number((selectedBook.obi ?? 0).toFixed(3));
     result.spread_pct = Number(selectedBook.spreadPct.toFixed(2));
     result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
     result.edge_pct = Number(netEdgePct.toFixed(2));
@@ -1552,8 +1710,8 @@ export async function runFullScan() {
               continue;
             }
 
-            const amt = tradePlan.amount;
             const sideBook = isYes ? pre.clob?.yes : pre.clob?.no;
+            const amt = computeQuantPositionSize(tradePlan.amount, analysis, sideBook);
             const entry = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
             const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, entry - 0.01).toFixed(4));
             const simulatedShares = parseFloat((amt / entry).toFixed(6));
