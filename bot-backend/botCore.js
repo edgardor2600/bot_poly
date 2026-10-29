@@ -1,4 +1,4 @@
-﻿import dotenv from 'dotenv';
+import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
 import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
@@ -1368,7 +1368,8 @@ export async function runFullScan() {
           await new Promise(res => setTimeout(res, 200));
         }
       } catch (err) {
-        addLog(`❌ Error Crítico Scanner Backend: ${err.message}`, "ERROR");
+        const causeMsg = err?.cause?.message ? ` (${err.cause.message})` : "";
+        addLog(`❌ Error Crítico Scanner Backend: ${err.message}${causeMsg}`, "ERROR");
       } finally {
         botState.scanStatus.running = false;
         botState.scanStatus.progress = 100;

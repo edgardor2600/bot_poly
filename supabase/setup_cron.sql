@@ -22,7 +22,7 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 DO $$
 DECLARE
   anon_key TEXT := '<TU_ANON_KEY>';  -- <- PON TU ANON KEY AQUI
-  fn_url   TEXT := 'https://wxgxzklqbarqfqptzatq.supabase.co/functions/v1/bot-cron';
+  fn_url   TEXT := 'https://udkadlaklmzsgaxevcvp.supabase.co/functions/v1/bot-cron';
 BEGIN
 
   -- ─── CRON 1: Rollover diario (cada 1 minuto) ───
