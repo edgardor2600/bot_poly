@@ -304,10 +304,109 @@ export async function getLiveWalletSnapshot({ force = false } = {}) {
   }
 }
 
+export async function getOrderBookSnapshot(tokenId) {
+  if (!tokenId) return null;
+  const host = getEnv("POLYMARKET_HOST", DEFAULT_HOST).replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`${host}/book?token_id=${encodeURIComponent(tokenId)}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const book = await res.json();
+
+    const rawBids = Array.isArray(book?.bids) ? book.bids : [];
+    const rawAsks = Array.isArray(book?.asks) ? book.asks : [];
+
+    const bids = rawBids
+      .map(b => ({ price: asNumber(b?.price), size: asNumber(b?.size) }))
+      .filter(b => b.price > 0 && b.price < 1 && b.size > 0)
+      .sort((a, b) => b.price - a.price);
+
+    const asks = rawAsks
+      .map(a => ({ price: asNumber(a?.price), size: asNumber(a?.size) }))
+      .filter(a => a.price > 0 && a.price < 1 && a.size > 0)
+      .sort((a, b) => a.price - b.price);
+
+    const bestBid = bids.length > 0 ? bids[0].price : null;
+    const bestAsk = asks.length > 0 ? asks[0].price : null;
+    const midPrice = (bestBid !== null && bestAsk !== null)
+      ? roundAmount((bestBid + bestAsk) / 2, 4)
+      : (bestAsk ?? bestBid ?? null);
+
+    const spreadAbs = (bestBid !== null && bestAsk !== null && bestAsk >= bestBid)
+      ? roundAmount(bestAsk - bestBid, 4)
+      : null;
+    const spreadPct = (spreadAbs !== null && bestAsk > 0)
+      ? roundAmount((spreadAbs / bestAsk) * 100, 2)
+      : null;
+
+    // Calculate executable USD liquidity within 2 cents of top-of-book
+    const askDepthUsd = bestAsk !== null
+      ? roundAmount(
+          asks
+            .filter(a => a.price <= bestAsk + 0.02)
+            .reduce((sum, a) => sum + (a.price * a.size), 0),
+          2
+        )
+      : 0;
+
+    const bidDepthUsd = bestBid !== null
+      ? roundAmount(
+          bids
+            .filter(b => b.price >= bestBid - 0.02)
+            .reduce((sum, b) => sum + (b.price * b.size), 0),
+          2
+        )
+      : 0;
+
+    return {
+      tokenId: String(tokenId),
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadAbs,
+      spreadPct,
+      askDepthUsd,
+      bidDepthUsd,
+      tickSize: asNumber(book?.minimum_tick_size) || 0.01,
+      minOrderSize: asNumber(book?.min_order_size) || 1,
+      negRisk: Boolean(book?.neg_risk),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function getTokenSellPrice(tokenId) {
   if (!tokenId) return null;
+
+  // 1. Primary source (works in BOTH simulation and real trading): real CLOB bestBid
+  const book = await getOrderBookSnapshot(tokenId);
+  if (book && Number.isFinite(book.bestBid) && book.bestBid > 0.001 && book.bestBid < 0.999) {
+    return book.bestBid;
+  }
+
+  // 2. Fallback to public CLOB price endpoint
+  const host = getEnv("POLYMARKET_HOST", DEFAULT_HOST).replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${host}/price?token_id=${encodeURIComponent(tokenId)}&side=sell`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const price = readProbabilityPrice(data);
+      if (price !== null) return price;
+    }
+  } catch {
+    // Fallback below.
+  }
+
+  // 3. Fallback to authenticated client if real trading is enabled
   const client = await initPolymarketClient();
-  if (!client) return null;
+  if (!client) return book?.midPrice ?? null;
 
   try {
     const raw = await client.getPrice(tokenId, "sell");

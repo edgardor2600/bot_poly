@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
 import { createRuntimeOwner, withRuntimeLock } from './runtimeLocks.js';
@@ -20,11 +20,17 @@ const API_TAVILY = "https://api.tavily.com/search";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 export const BASE_CAPITAL = getNumberEnv("BASE_CAPITAL", 15);
 const DAILY_GOAL = getNumberEnv("DAILY_GOAL_USDC", 1.50);
-const STOP_LOSS_PCT = getNumberEnv("STOP_LOSS_PCT", 4);
-const TAKE_PROFIT_PCT = getNumberEnv("TAKE_PROFIT_PCT", 8);
-const BREAK_EVEN_TRIGGER_PCT = getNumberEnv("BREAK_EVEN_TRIGGER_PCT", 3);
-const BREAK_EVEN_BUFFER_PCT = getNumberEnv("BREAK_EVEN_BUFFER_PCT", 0.25);
+const STOP_LOSS_PCT = getNumberEnv("STOP_LOSS_PCT", 6);
+const TAKE_PROFIT_PCT = getNumberEnv("TAKE_PROFIT_PCT", 10);
+const BREAK_EVEN_TRIGGER_PCT = getNumberEnv("BREAK_EVEN_TRIGGER_PCT", 4);
+const BREAK_EVEN_BUFFER_PCT = getNumberEnv("BREAK_EVEN_BUFFER_PCT", 0.5);
 const MAX_HOLD_HOURS = getNumberEnv("MAX_HOLD_HOURS", 24);
+const MAX_MARKET_DAYS = getNumberEnv("MAX_MARKET_DAYS", 30);
+const MAX_SPREAD_PCT = getNumberEnv("MAX_SPREAD_PCT", 4.0);
+const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
+const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
+const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 68);
+const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 6.0);
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
 
@@ -346,12 +352,24 @@ function hydrateCapitalFromLocalState() {
   };
 }
 
-function calcStopLoss(entryPrice) {
-  return parseFloat((entryPrice * (1 - botState.config.stopLoss / 100)).toFixed(4));
+function calcStopLoss(entryPrice, entryBid = null) {
+  const pctStop = entryPrice * (1 - botState.config.stopLoss / 100);
+  // Guarantee at least 2.5c below entryBid (or 3c below entryPrice) so normal 1c tick/spread noise never causes instant stop-outs
+  const tickFloor = (Number.isFinite(entryBid) && entryBid > 0)
+    ? (entryBid - 0.025)
+    : (entryPrice - 0.03);
+  const stop = Math.min(pctStop, tickFloor);
+  return parseFloat(Math.max(0.02, stop).toFixed(4));
 }
 
-function calcTakeProfit(entryPrice) {
-  return parseFloat((entryPrice * (1 + botState.config.takeProfit / 100)).toFixed(4));
+function calcTakeProfit(entryPrice, fairProb = null) {
+  const pctTarget = entryPrice * (1 + botState.config.takeProfit / 100);
+  // Guarantee at least 3.5c above entryPrice to comfortably beat spread and fees
+  let target = Math.max(pctTarget, entryPrice + 0.035);
+  if (Number.isFinite(fairProb) && fairProb > entryPrice + 0.04) {
+    target = Math.max(target, Math.min(fairProb - 0.01, entryPrice * 1.18));
+  }
+  return parseFloat(Math.min(0.97, target).toFixed(4));
 }
 
 function calcMaxHoldAt(openTs) {
@@ -650,10 +668,61 @@ export async function initializeStateFromDB() {
     scheduleTradePatchNormalization(patches);
 
     botState.trades = loadedTrades;
-    botState.capital = parseFloat((BASE_CAPITAL + totalPnl - botState.withdrawnTotal).toFixed(2));
+    const activeSimulatedCost = loadedTrades
+      .filter(t => isActiveTradeStatus(t.status) && t.executionMode !== "REAL")
+      .reduce((sum, t) => sum + asNumber(t.cost, 0), 0);
+    botState.capital = parseFloat((BASE_CAPITAL + totalPnl - activeSimulatedCost - botState.withdrawnTotal).toFixed(2));
     if (botState.capital < 0) botState.capital = 0;
     botState.dailyPnl = parseFloat(todayPnl.toFixed(2));
     botState.dailyDate = todayStr;
+
+    // Cargar últimas señales de IA desde Supabase para no perder visibilidad tras reinicios
+    try {
+      const { data: signalsDb } = await supabase
+        .from('ai_signals')
+        .select('*')
+        .order('detected_at', { ascending: false })
+        .limit(50);
+
+      if (Array.isArray(signalsDb) && signalsDb.length > 0 && botState.signals.length === 0) {
+        const executedSignalIds = new Set(loadedTrades.map(t => t.id));
+        const openMarketIds = new Set(loadedTrades.map(t => String(t.marketId || t.conditionId || "")));
+        botState.signals = signalsDb.map(s => ({
+          id: s.signal_id,
+          detectedAt: s.detected_at || new Date().toISOString(),
+          market: {
+            id: s.market_id,
+            conditionId: s.condition_id || s.market_id,
+            question: s.question,
+            _cat: detectCategory(s.question || ""),
+            _yesTokenId: s.yes_token_id || null,
+            _noTokenId: s.no_token_id || null,
+          },
+          tokenIds: { yes: s.yes_token_id || null, no: s.no_token_id || null },
+          prelim: {
+            yesP: asNumber(s.yes_price, 0.5),
+            noP: asNumber(s.no_price, 0.5),
+            sum: asNumber(s.yes_price, 0.5) + asNumber(s.no_price, 0.5),
+            score: asNumber(s.score, 0),
+            signals: [],
+          },
+          analysis: {
+            action: s.action || "SKIP",
+            score: asNumber(s.score, 0),
+            confidence: asNumber(s.confidence, 0),
+            edge_pct: asNumber(s.edge_pct, 0),
+            news_found: s.news_found || "",
+            reasoning: s.reasoning || "",
+            risk: "MEDIUM",
+            liquidity_ok: true,
+            signal_types: [],
+          },
+          executed: executedSignalIds.has(s.signal_id) || openMarketIds.has(String(s.market_id || s.condition_id || "")),
+        }));
+      }
+    } catch {
+      // Best-effort restore of historical AI signals
+    }
     
     if (botState.dailyPnl >= DAILY_GOAL) {
       botState.goalReached = true;
@@ -992,7 +1061,7 @@ export async function runWithdrawalAutopilot(trigger = "SYNC") {
   }
 }
 
-// â”€â”€ POLYMARKET API â”€â”€
+// ── POLYMARKET API ──
 async function fetchAllMarkets(onProgress) {
   const all = [];
   let offset = 0;
@@ -1000,10 +1069,11 @@ async function fetchAllMarkets(onProgress) {
   let page = 1;
 
   while (true) {
-    if(onProgress) onProgress(`Descargando pÃ¡gina ${page} (offset ${offset})â€¦`);
-    const r = await fetch(`${API_POLY}?limit=${limit}&offset=${offset}&active=true&closed=false`, {
+    if (onProgress) onProgress(`Descargando página ${page} (offset ${offset})…`);
+    const url = `${API_POLY}?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume24hr&ascending=false`;
+    const r = await fetch(url, {
       method: 'GET',
-      headers: { 
+      headers: {
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
       },
@@ -1015,64 +1085,167 @@ async function fetchAllMarkets(onProgress) {
     if (batch.length < limit) break;
     offset += limit;
     page++;
-    if (page > 20) break; // safety cap
-    await new Promise(res => setTimeout(res, 200)); // Rate limit respetado para la nube
+    if (page > 12) break; // Top 1,200 mercados ordenados por volumen 24h real
+    await new Promise(res => setTimeout(res, 180));
   }
   return all;
 }
 
-// â”€â”€ SCORING PRELIMINAR â”€â”€
+// ── SCORING PRELIMINAR CUANTITATIVO ──
 function preliminaryScore(m, prevSnapshot) {
+  // 1. Validar que el mercado tenga Order Book activo en CLOB
+  if (m.enableOrderBook === false || m.acceptingOrders === false) {
+    return { score: 0, signals: [], skip: true };
+  }
+
   let p = [0.5, 0.5];
-  try { p = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || [0.5, 0.5]); } catch(e){}
-  
+  try { p = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || [0.5, 0.5]); } catch (e) {}
+
   const yesP = parseFloat(p[0]);
   const noP = parseFloat(p[1]);
+  if (!Number.isFinite(yesP) || !Number.isFinite(noP)) {
+    return { score: 0, signals: [], skip: true };
+  }
+
+  // 2. Descartar precios extremos donde el payoff asimétrico o el costo de cruzar el spread destruye el EV
+  if (yesP < 0.07 || yesP > 0.93 || noP < 0.07 || noP > 0.93) {
+    return { score: 0, signals: [], skip: true };
+  }
+
+  // 3. Validar tokens CLOB existentes
+  const yesTokenId = extractClobTokenId(m, 'BUY_YES');
+  const noTokenId = extractClobTokenId(m, 'BUY_NO');
+  if (!yesTokenId && !noTokenId) {
+    return { score: 0, signals: [], skip: true };
+  }
+
   const vol = parseFloat(m.volume || 0);
-  const vol24 = parseFloat(m.volumeNum || m.volume24hr || 0);
+  const vol24 = parseFloat(m.volume24hr || m.volumeNum || 0);
   const liq = parseFloat(m.liquidityNum || m.liquidity || 0);
   const sum = yesP + noP;
   const signals = [];
   let score = 0;
 
-  const arbDev = Math.abs(sum - 1);
-  if (arbDev > 0.05) { signals.push("ARB"); score += 40; }
-  else if (arbDev > 0.03) { signals.push("ARB"); score += 20; }
-
   if (liq < botState.config.minLiq) return { score: 0, signals: [], skip: true };
+  if (vol24 < 500) return { score: 0, signals: [], skip: true }; // Evitar mercados muertos sin flujo diario
 
-  const edge = Math.max(yesP, noP);
-  if (edge > 0.15 && edge < 0.85) score += 15;
-  if (edge > 0.25 && edge < 0.75) score += 10;
-
-  if (vol > 500000) score += 20;
-  else if (vol > 50000) score += 12;
-  else if (vol > 5000) score += 6;
-
-  if (prevSnapshot) {
-    const prevY = parseFloat(prevSnapshot.yesP ?? 0.5);
-    const delta = Math.abs(yesP - prevY);
-    if (delta > 0.05) { signals.push("MOMENTUM"); score += 25; }
-    else if (delta > 0.02) { signals.push("MOMENTUM"); score += 10; }
-  }
-
+  // 4. Filtro estricto de horizonte temporal (Catalizador cercano <= 30 días)
+  let daysLeft = null;
   if (m.endDateIso || m.endDate) {
     const closes = new Date(m.endDateIso || m.endDate);
-    const daysLeft = (closes - Date.now()) / 86400000;
-    if (daysLeft < 0) return { score: 0, signals: [], skip: true };
-    if (daysLeft <= 1) { signals.push("CRITICO_HOY"); score += 35; }
-    else if (daysLeft > 1 && daysLeft <= 15) { signals.push("15_DIAS"); score += 25; }
-    else if (daysLeft > 15 && daysLeft < 30) score += 5;
+    daysLeft = (closes - Date.now()) / 86400000;
+    if (!Number.isFinite(daysLeft) || daysLeft <= 0.08) {
+      // Menos de ~2 horas o ya expirado: alto riesgo de latencia de oráculo
+      return { score: 0, signals: [], skip: true };
+    }
+    if (daysLeft > MAX_MARKET_DAYS) {
+      // Bloquear mercados a meses/años vista (ej. Senado Nov 2026) que atrapan capital y mueren por MAX_HOLD
+      return { score: 0, signals: [], skip: true };
+    }
+
+    if (daysLeft <= 2) { signals.push("CATALYST_48H"); score += 32; }
+    else if (daysLeft <= 7) { signals.push("CATALYST_7D"); score += 26; }
+    else if (daysLeft <= 15) { signals.push("CATALYST_15D"); score += 18; }
+    else { score += 8; }
+  } else {
+    // Si no tiene fecha de cierre clara, no podemos modelar rotación de capital
+    return { score: 0, signals: [], skip: true };
   }
 
-  return { score, signals, yesP, noP, vol, liq, sum, skip: false };
+  // 5. Penalizar libros rotos (cuando sum != 1 en Gamma suele ser spread gigante, NO arbitraje)
+  const sumDev = Math.abs(sum - 1);
+  const gammaSpread = parseFloat(m.spread ?? sumDev);
+  if (gammaSpread > 0.06 || sumDev > 0.06) {
+    return { score: 0, signals: [], skip: true };
+  }
+  if (gammaSpread <= 0.015) {
+    signals.push("TIGHT_BOOK");
+    score += 18;
+  } else if (gammaSpread <= 0.025) {
+    score += 10;
+  }
+
+  // 6. Zona de máxima sensibilidad informacional (20c - 80c)
+  if (yesP >= 0.20 && yesP <= 0.80) score += 16;
+  else if (yesP >= 0.12 && yesP <= 0.88) score += 8;
+
+  // 7. Flujo de dinero real (Volumen 24h y rotación Vol24h / Liquidez)
+  if (vol24 >= 100000) { signals.push("HIGH_FLOW"); score += 24; }
+  else if (vol24 >= 25000) { signals.push("ACTIVE_FLOW"); score += 18; }
+  else if (vol24 >= 5000) { score += 12; }
+  else { score += 5; }
+
+  const turnover = liq > 0 ? (vol24 / liq) : 0;
+  if (turnover >= 0.5) { signals.push("HIGH_TURNOVER"); score += 12; }
+
+  // 8. Momentum intradía / inter-escaneo
+  const priceChange1d = Math.abs(parseFloat(m.oneDayPriceChange || 0));
+  if (prevSnapshot) {
+    const prevY = parseFloat(prevSnapshot.yesP ?? yesP);
+    const delta = Math.abs(yesP - prevY);
+    if (delta >= 0.04) { signals.push("MOMENTUM"); score += 20; }
+    else if (delta >= 0.02) { signals.push("MOMENTUM"); score += 10; }
+  } else if (priceChange1d >= 0.05) {
+    signals.push("MOMENTUM_24H");
+    score += 14;
+  }
+
+  return { score, signals, yesP, noP, vol, vol24, liq, sum, daysLeft, yesTokenId, noTokenId, skip: false };
 }
 
-// â”€â”€ IA PROFUNDA (Groq + Tavily) â”€â”€
+function isSideMicrostructureTradable(book) {
+  if (!book || !book.isValid) return false;
+  if (book.bestAsk < 0.07 || book.bestAsk > 0.92) return false;
+  if (book.spreadPct > MAX_SPREAD_PCT || book.spreadAbs > MAX_SPREAD_CENTS) return false;
+  if (book.askDepthUsd < MIN_BOOK_DEPTH_USD || book.bidDepthUsd < MIN_BOOK_DEPTH_USD) return false;
+  return true;
+}
+
+async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
+  const verified = [];
+  const maxProbes = Math.min(scoredMarkets.length, Math.max(targetCount * 4, 24));
+
+  for (let i = 0; i < maxProbes && verified.length < targetCount; i++) {
+    const item = scoredMarkets[i];
+    const { market: m, prelim } = item;
+
+    const [yesBook, noBook] = await Promise.all([
+      prelim.yesTokenId ? getOrderBookSnapshot(prelim.yesTokenId) : Promise.resolve({ isValid: false, reason: 'NO_YES_TOKEN' }),
+      prelim.noTokenId ? getOrderBookSnapshot(prelim.noTokenId) : Promise.resolve({ isValid: false, reason: 'NO_NO_TOKEN' }),
+    ]);
+
+    const yesTradable = isSideMicrostructureTradable(yesBook);
+    const noTradable = isSideMicrostructureTradable(noBook);
+
+    if (!yesTradable && !noTradable) {
+      continue;
+    }
+
+    prelim.yesBook = yesBook;
+    prelim.noBook = noBook;
+    prelim.yesTradable = yesTradable;
+    prelim.noTradable = noTradable;
+
+    const bestSpreadPct = Math.min(
+      yesTradable ? yesBook.spreadPct : 999,
+      noTradable ? noBook.spreadPct : 999
+    );
+    if (bestSpreadPct <= 1.5 && !prelim.signals.includes("ULTRA_TIGHT_SPREAD")) {
+      prelim.signals.push("ULTRA_TIGHT_SPREAD");
+      prelim.score += 10;
+    }
+
+    verified.push(item);
+  }
+
+  return verified;
+}
+
+// ── IA PROFUNDA CUANTITATIVA (Groq + Tavily + CLOB Microstructure) ──
 async function deepAnalyze(m, prelim) {
-  const { yesP, noP, vol, liq, sum } = prelim;
+  const { yesP, noP, vol, vol24, liq, daysLeft, yesBook, noBook, yesTradable, noTradable } = prelim;
   const marketId = m.id || m.conditionId;
-  const SIX_HOURS = 6 * 60 * 60 * 1000;
+  const TWO_HOURS = 2 * 60 * 60 * 1000;
 
   let newsContext = "Sin noticias recientes.";
   let topSource = "none";
@@ -1080,7 +1253,7 @@ async function deepAnalyze(m, prelim) {
   let usedCache = false;
 
   const cachedNews = botState.newsCache[marketId];
-  if (cachedNews && (Date.now() - cachedNews.ts) < SIX_HOURS) {
+  if (cachedNews && (Date.now() - cachedNews.ts) < TWO_HOURS) {
     newsContext = cachedNews.context;
     topSource = cachedNews.source;
     topSnippet = cachedNews.snippet;
@@ -1092,46 +1265,68 @@ async function deepAnalyze(m, prelim) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           api_key: TAVILY_API_KEY,
-          query: m.question,
+          query: `${m.question} latest news`,
           search_depth: "basic",
+          days: 7,
           include_answers: false,
-          max_results: 2,
+          max_results: 4,
         })
       });
       if (tRes.ok) {
         const tData = await tRes.json();
         if (tData.results && tData.results.length > 0) {
-          newsContext = tData.results.map(r => `[${r.url}] ${r.content.slice(0, 200)}`).join("\n");
+          newsContext = tData.results
+            .map((r, idx) => `${idx + 1}. [${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 260)}`)
+            .join("\n");
           topSource = tData.results[0].url;
-          topSnippet = tData.results[0].content.slice(0, 150) + "...";
+          topSnippet = (tData.results[0].content || '').replace(/\s+/g, ' ').slice(0, 160) + "...";
           botState.newsCache[marketId] = { ts: Date.now(), context: newsContext, source: topSource, snippet: topSnippet, news: newsContext };
         }
       }
     } catch (e) { console.warn("Tavily fallido:", e.message); }
   }
 
-  const daysLeft = (m.endDateIso || m.endDate)
-    ? Math.max(0, (new Date(m.endDateIso || m.endDate) - Date.now()) / 86400000).toFixed(1) : "?";
+  const daysLeftStr = Number.isFinite(daysLeft) ? daysLeft.toFixed(1) : "?";
+  const resolutionRules = (m.description || "Estándar Polymarket").replace(/\s+/g, " ").slice(0, 420);
+
+  const yesBookStr = yesBook?.isValid
+    ? `Bid=${(yesBook.bestBid * 100).toFixed(1)}c Ask=${(yesBook.bestAsk * 100).toFixed(1)}c Spread=${yesBook.spreadPct.toFixed(2)}% DepthAsk=$${yesBook.askDepthUsd.toFixed(0)} Tradable=${yesTradable ? "YES" : "NO"}`
+    : "UNAVAILABLE";
+  const noBookStr = noBook?.isValid
+    ? `Bid=${(noBook.bestBid * 100).toFixed(1)}c Ask=${(noBook.bestAsk * 100).toFixed(1)}c Spread=${noBook.spreadPct.toFixed(2)}% DepthAsk=$${noBook.askDepthUsd.toFixed(0)} Tradable=${noTradable ? "YES" : "NO"}`
+    : "UNAVAILABLE";
 
   const body = {
     model: GROQ_MODEL,
     messages: [
       {
         role: "system",
-        content: `Polymarket quant analyst. Return ONLY raw JSON. Find real mispricing edges using news+math. Be concise.`
+        content: `You are a senior quantitative prediction-market trader managing real capital on Polymarket CLOB.
+Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, and the exact market resolution rules.
+CRITICAL RULES:
+1. To buy YES, your estimated_yes_prob MUST exceed the live YES Ask price plus spread by at least 0.06 (6 percentage points).
+2. To buy NO, your estimated NO probability (1 - estimated_yes_prob) MUST exceed the live NO Ask price plus spread by at least 0.06 (6 percentage points).
+3. Never recommend a side marked Tradable=NO.
+4. If news is ambiguous, stale, priced-in, or lacks a clear informational edge over the CLOB Ask price, return action="SKIP".
+Return ONLY raw valid JSON.`
       },
       {
         role: "user",
-        content: `DATE:${new Date().toISOString().slice(0,10)} CLOSES_IN:${daysLeft}d
-Q:"${m.question}"
-YES=${fmtPct(yesP)} NO=${fmtPct(noP)} SUM=${fmtPct(sum)}${Math.abs(sum-1)>0.03?" âš ARB":""} VOL=${vol} LIQ=${liq}
-SIGNALS:${prelim.signals.join(",")||"none"}
-NEWS${usedCache?"(cache)":""}:${newsContext.slice(0,500)}
+        content: `TODAY: ${new Date().toISOString().slice(0, 10)} | CLOSES_IN: ${daysLeftStr} days
+QUESTION: "${m.question}"
+RESOLUTION_RULES: "${resolutionRules}"
+GAMMA_MID: YES=${fmtPct(yesP)} NO=${fmtPct(noP)} | VOL_24H=$${Math.round(vol24)} | LIQ=$${Math.round(liq)}
+CLOB_YES_BOOK: ${yesBookStr}
+CLOB_NO_BOOK: ${noBookStr}
+QUANT_SIGNALS: ${prelim.signals.join(",") || "none"}
+RECENT_NEWS ${usedCache ? "(cached)" : "(live 7d)"}:
+${newsContext.slice(0, 1100)}
 
-JSON:{"action":"BUY_YES"|"BUY_NO"|"SKIP","confidence":0-100,"edge_pct":number,"signal_types":[],"news_found":"string","news_source":"url","reasoning":"brief","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
+Return JSON with this exact schema:
+{"action":"BUY_YES"|"BUY_NO"|"SKIP","estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing probability vs ask price","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
       }
     ],
-    temperature: 0.15,
+    temperature: 0.1,
     max_tokens: 1024,
     response_format: { type: "json_object" }
   };
@@ -1148,6 +1343,66 @@ JSON:{"action":"BUY_YES"|"BUY_NO"|"SKIP","confidence":0-100,"edge_pct":number,"s
   const jsonMatch = clean.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
+
+  // ── VERIFICACIÓN MATEMÁTICA DURA POST-IA (Anti-Alucinación) ──
+  let estYesProb = parseFloat(result.estimated_yes_prob);
+  if (Number.isFinite(estYesProb)) {
+    if (estYesProb > 1 && estYesProb <= 100) estYesProb = estYesProb / 100;
+  }
+
+  let selectedBook = null;
+  let fairProb = null;
+
+  if (result.action === "BUY_YES") {
+    if (!yesTradable || !yesBook?.isValid) {
+      result.action = "SKIP";
+      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez. ${result.reasoning || ""}`;
+    } else {
+      selectedBook = yesBook;
+      fairProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+    }
+  } else if (result.action === "BUY_NO") {
+    if (!noTradable || !noBook?.isValid) {
+      result.action = "SKIP";
+      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez. ${result.reasoning || ""}`;
+    } else {
+      selectedBook = noBook;
+      fairProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+    }
+  }
+
+  if (selectedBook && (result.action === "BUY_YES" || result.action === "BUY_NO")) {
+    fairProb = Math.max(0.01, Math.min(0.99, fairProb));
+    const executableAsk = selectedBook.bestAsk;
+    const spreadCost = selectedBook.spreadAbs;
+    const rawEdgePct = (fairProb - executableAsk) * 100;
+    const netEdgePct = (fairProb - executableAsk - spreadCost) * 100;
+
+    result.fair_prob = Number(fairProb.toFixed(4));
+    result.executable_ask = Number(executableAsk.toFixed(4));
+    result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
+    result.spread_pct = Number(selectedBook.spreadPct.toFixed(2));
+    result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
+    result.edge_pct = Number(netEdgePct.toFixed(2));
+
+    const conf = parseFloat(result.confidence || 0);
+    const risk = String(result.risk || "MEDIUM").toUpperCase();
+
+    if (netEdgePct < MIN_NET_EDGE_PCT || conf < MIN_AI_CONFIDENCE || risk === "HIGH") {
+      result.action = "SKIP";
+      result.reasoning = `[FILTRO CUANTITATIVO: Edge Neto ${netEdgePct.toFixed(1)}% (min ${MIN_NET_EDGE_PCT}%), Conf ${conf}% (min ${MIN_AI_CONFIDENCE}%), Risk ${risk}] ${result.reasoning || ""}`;
+    }
+  } else {
+    result.edge_pct = Number(parseFloat(result.edge_pct || 0).toFixed(2));
+  }
+
+  if (!result.news_source || result.news_source === "url" || result.news_source === "none") {
+    result.news_source = topSource;
+  }
+  if (!result.news_found && topSnippet !== "none") {
+    result.news_found = topSnippet;
+  }
+
   result._newsCached = usedCache;
   return result;
 }
@@ -1168,7 +1423,7 @@ export async function runFullScan() {
       botState.scanStatus.progress = 0;
 
       addLog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "SYSTEM");
-      addLog("[BACKEND] ESCANEO COMPLETO INICIADO", "SYSTEM");
+      addLog("[BACKEND] ESCANEO CUANTITATIVO INICIADO", "SYSTEM");
 
       try {
         const raw = await fetchAllMarkets(msg => {
@@ -1197,14 +1452,17 @@ export async function runFullScan() {
           if (!pre.skip && pre.score >= botState.config.minScore) {
             scored.push({ m, pre });
           }
-          newSnap[id] = { yesP: pre.yesP, noP: pre.noP, ts: Date.now() };
+          if (Number.isFinite(pre.yesP) && Number.isFinite(pre.noP)) {
+            newSnap[id] = { yesP: pre.yesP, noP: pre.noP, ts: Date.now() };
+          }
         }
         botState.marketSnapshots = newSnap;
 
-        const viable = scored
-          .sort((a, b) => b.pre.score - a.pre.score)
-          .slice(0, botState.config.aiTopN);
-        addLog(`✅ Filtros superados: ${viable.length} mercados a IA Profunda`, "FILTER");
+        scored.sort((a, b) => b.pre.score - a.pre.score);
+        botState.scanStatus.phase = `Verificando Order Books CLOB (${scored.length} candidatos)...`;
+        const targetAiCount = Math.max(3, botState.config.aiTopN || 3);
+        const viable = await selectOrderBookVerifiedCandidates(scored, targetAiCount);
+        addLog(`✅ Filtros + OrderBook CLOB superados: ${viable.length}/${scored.length} mercados pasan a IA Profunda`, "FILTER");
 
         for (let i = 0; i < viable.length; i++) {
           const { m, pre } = viable[i];
@@ -1215,6 +1473,7 @@ export async function runFullScan() {
             const analysis = await deepAnalyze(m, pre);
 
             if (analysis.action === "SKIP" || analysis.score < botState.config.minScore) {
+              addLog(`⏭️ [IA SKIP] ${m.question.slice(0, 55)}... | Edge: ${analysis.edge_pct ?? 0}% | Conf: ${analysis.confidence ?? 0}%`, "INFO");
               continue;
             }
 
@@ -1229,7 +1488,7 @@ export async function runFullScan() {
             };
             botState.signals.unshift(sig);
             if (botState.signals.length > 300) botState.signals.length = 300;
-            addLog(`✨ [SEÑAL IA] ${analysis.action} | Confianza: ${analysis.confidence}% | Edge: ${analysis.edge_pct}% | Merc: ${m.question.slice(0, 50)}`, "AI");
+            addLog(`✨ [SEÑAL IA] ${analysis.action} | Confianza: ${analysis.confidence}% | Edge Neto: ${analysis.edge_pct}% | Merc: ${m.question.slice(0, 50)}`, "AI");
 
             await insertAiSignalSafe(sig, m, pre, analysis);
 
@@ -1240,9 +1499,23 @@ export async function runFullScan() {
 
             if (!botState.config.autoTrade) continue;
 
+            // Strict Quantitative Gate before risking capital
+            const conf = asNumber(analysis.confidence, 0);
+            const netEdge = asNumber(analysis.edge_pct, 0);
+            const riskLevel = String(analysis.risk || "MEDIUM").toUpperCase();
+
+            if (conf < MIN_AI_CONFIDENCE || netEdge < MIN_NET_EDGE_PCT || riskLevel === "HIGH") {
+              addLog(
+                `🛡 [QUANT GATE] Señal filtrada (Conf=${conf}% vs min ${MIN_AI_CONFIDENCE}%, EdgeNeto=${netEdge}% vs min ${MIN_NET_EDGE_PCT}%, Risk=${riskLevel})`,
+                "FILTER"
+              );
+              continue;
+            }
+
             const marketId = String(m.id || m.conditionId || "");
             const conditionId = String(m.conditionId || m.condition_id || m.id || "");
-            const tokenId = analysis.action === "BUY_YES" ? m._yesTokenId : m._noTokenId;
+            const isYes = analysis.action === "BUY_YES";
+            const tokenId = isYes ? m._yesTokenId : m._noTokenId;
             if (!tokenId) {
               addLog(`⚠️ [TRADE BLOQUEADO] Sin tokenID para ${analysis.action}: ${m.question.slice(0, 70)}`, "WARN");
               continue;
@@ -1280,11 +1553,13 @@ export async function runFullScan() {
             }
 
             const amt = tradePlan.amount;
-            const isYes = analysis.action === "BUY_YES";
-            const entry = isYes ? pre.yesP : pre.noP;
+            const sideBook = isYes ? pre.clob?.yes : pre.clob?.no;
+            const entry = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
+            const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, entry - 0.01).toFixed(4));
             const simulatedShares = parseFloat((amt / entry).toFixed(6));
             let executedAmount = amt;
             let executedEntry = entry;
+            let initialMarkPrice = entryBid;
             let executedShares = simulatedShares;
             let buyOrderId = null;
             let buyOrderStatus = "SIMULATED";
@@ -1295,11 +1570,12 @@ export async function runFullScan() {
               const realOrder = await executeBuyOrder({
                 market: m,
                 analysis,
-                pre,
+                pre: { ...pre, yesP: pre.clob?.yes?.bestAsk ?? pre.yesP, noP: pre.clob?.no?.bestAsk ?? pre.noP },
                 amountUsdc: amt,
               });
               executedAmount = realOrder.amountUsdc;
               executedEntry = realOrder.entryPrice;
+              initialMarkPrice = entryBid > 0 ? entryBid : executedEntry;
               executedShares = realOrder.shares;
               buyOrderId = realOrder.orderId;
               buyOrderStatus = realOrder.orderStatus || "matched";
@@ -1319,7 +1595,7 @@ export async function runFullScan() {
               conditionId,
               tokenId,
               entryPrice: executedEntry,
-              currentPrice: executedEntry,
+              currentPrice: initialMarkPrice,
               shares: executedShares,
               cost: executedAmount,
               confidence: analysis.confidence,
@@ -1334,15 +1610,15 @@ export async function runFullScan() {
               buyOrderId,
               buyOrderStatus,
               buyTxHashes,
-              stopLoss: calcStopLoss(executedEntry),
-              takeProfit: calcTakeProfit(executedEntry),
+              stopLoss: calcStopLoss(executedEntry, entryBid),
+              takeProfit: calcTakeProfit(executedEntry, analysis.fair_prob),
               breakEvenArmed: false,
               maxHoldAt: calcMaxHoldAt(openedAt),
             };
 
             if (executionMode === "REAL") {
               await refreshWalletSnapshot(true);
-              addLog(`🚀 [BACKEND COMPRA REAL] ${trade.side} | $${executedAmount.toFixed(2)} | Entrada: ${fmtPct(executedEntry)} | OrderID: ${buyOrderId || "N/A"}`, "TRADE");
+              addLog(`🚀 [BACKEND COMPRA REAL] ${trade.side} | $${executedAmount.toFixed(2)} | Ask: ${fmtPct(executedEntry)} | Bid: ${fmtPct(entryBid)} | OrderID: ${buyOrderId || "N/A"}`, "TRADE");
               await recordOrderEventSafe(trade.id, "BUY_ORDER_CREATED", {
                 order_id: buyOrderId,
                 order_status: buyOrderStatus,
@@ -1355,7 +1631,7 @@ export async function runFullScan() {
             } else {
               botState.capital = roundMoney(botState.capital - executedAmount);
               hydrateCapitalFromLocalState();
-              addLog(`🚀 [BACKEND COMPRA SIM] ${trade.side} | Inversión: $${executedAmount.toFixed(2)} | Entrada: ${fmtPct(executedEntry)} | Merc: ${trade.question.slice(0, 50)}`, "TRADE");
+              addLog(`🚀 [BACKEND COMPRA SIM] ${trade.side} | Inversión: $${executedAmount.toFixed(2)} | Ask: ${fmtPct(executedEntry)} | Bid: ${fmtPct(entryBid)} | SL: ${fmtPct(trade.stopLoss)} | TP: ${fmtPct(trade.takeProfit)}`, "TRADE");
             }
 
             botState.trades.unshift(trade);
@@ -1405,7 +1681,8 @@ export async function fastSyncTrades() {
         for (const trade of openTrades) {
           let livePx = null;
 
-          if (isRealTradingEnabled() && trade.tokenId) {
+          // Fetch live CLOB bestBid in BOTH Simulation and Real mode
+          if (trade.tokenId) {
             livePx = await getTokenSellPrice(trade.tokenId);
           }
 
@@ -1419,21 +1696,44 @@ export async function fastSyncTrades() {
 
           const tradeIdx = botState.trades.findIndex(x => x.id === trade.id);
           if (tradeIdx < 0) continue;
+
+          const prevPx = asNumber(botState.trades[tradeIdx].currentPrice, 0);
           botState.trades[tradeIdx].currentPrice = livePx;
+
+          // Persist mark-to-market price updates when price moves by >= 0.3 cents
+          if (Math.abs(livePx - prevPx) >= 0.003) {
+            await updateTradeSafe(trade.id, { current_price: livePx });
+          }
 
           const openTrade = botState.trades[tradeIdx];
           const entryPrice = asNumber(openTrade.entryPrice, 0);
 
+          // 1. Break-even activation
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0) {
-            const triggerPrice = entryPrice * (1 + (botState.config.breakEvenTriggerPct / 100));
+            const triggerPrice = Math.max(
+              entryPrice * (1 + (botState.config.breakEvenTriggerPct / 100)),
+              entryPrice + 0.02
+            );
             if (livePx >= triggerPrice) {
-              const breakEvenStop = parseFloat((entryPrice * (1 + (botState.config.breakEvenBufferPct / 100))).toFixed(4));
+              const breakEvenStop = parseFloat(
+                Math.max(entryPrice * (1 + (botState.config.breakEvenBufferPct / 100)), entryPrice + 0.005).toFixed(4)
+              );
               if (breakEvenStop > asNumber(openTrade.stopLoss, 0)) {
                 openTrade.stopLoss = breakEvenStop;
                 openTrade.breakEvenArmed = true;
-                await updateTradeSafe(trade.id, { stop_loss: breakEvenStop, break_even_armed: true });
+                await updateTradeSafe(trade.id, { stop_loss: breakEvenStop, break_even_armed: true, current_price: livePx });
                 addLog(`🛡 [RISK] Break-even activado en ${trade.id}. Nuevo SL: ${fmtPct(breakEvenStop)}`, "RISK");
               }
+            }
+          }
+
+          // 2. Dynamic Trailing Stop once gain is >= 6% and >= +3c above entry
+          if (openTrade.breakEvenArmed && entryPrice > 0 && livePx >= Math.max(entryPrice * 1.06, entryPrice + 0.03)) {
+            const trailedStop = parseFloat((livePx - 0.022).toFixed(4));
+            if (trailedStop > asNumber(openTrade.stopLoss, 0) + 0.005) {
+              openTrade.stopLoss = trailedStop;
+              await updateTradeSafe(trade.id, { stop_loss: trailedStop, current_price: livePx });
+              addLog(`📈 [TRAILING SL] Stop Loss subido en ${trade.id} a ${fmtPct(trailedStop)} (Bid actual: ${fmtPct(livePx)})`, "RISK");
             }
           }
 

@@ -1,5 +1,5 @@
 import { AssetType, OrderType, Side } from "@polymarket/clob-client";
-import { initPolymarketClient, reconcileMarketOrder } from "./polymarketClient.js";
+import { getOrderBookSnapshot, initPolymarketClient, reconcileMarketOrder } from "./polymarketClient.js";
 
 const TOKEN_SCALE = 1_000_000;
 
@@ -169,11 +169,29 @@ export async function executeBuyOrder({ market, analysis, pre, amountUsdc }) {
     }
   }
 
-  const sharesRequested = parseFloat((amountUsdc / entryPrice).toFixed(6));
-  // Add 5% slippage tolerance so FAK orders can fill in thin order books.
-  // Capped at 0.97 to avoid paying near-certain prices.
-  const priceWithSlippage = parseFloat(Math.min(entryPrice * 1.05, 0.97).toFixed(4));
-  console.log(`[TRADE] BUY ${tokenId.slice(0, 10)}... price=${entryPrice} -> with_slippage=${priceWithSlippage} amount=$${amountUsdc}`);
+  // Verify live order book before firing real BUY order to prevent slippage traps
+  const liveBook = await getOrderBookSnapshot(tokenId);
+  const referenceAsk = (liveBook && Number.isFinite(liveBook.bestAsk) && liveBook.bestAsk > 0)
+    ? liveBook.bestAsk
+    : entryPrice;
+
+  if (referenceAsk > entryPrice * 1.04) {
+    throw new Error(
+      `Order book Ask moved unfavorably (${referenceAsk.toFixed(4)} vs signal ${entryPrice.toFixed(4)})`
+    );
+  }
+  if (liveBook && Number.isFinite(liveBook.spreadPct) && liveBook.spreadPct > 4.5) {
+    throw new Error(
+      `Order book spread too wide (${liveBook.spreadPct.toFixed(2)}% > 4.50%)`
+    );
+  }
+
+  const sharesRequested = parseFloat((amountUsdc / referenceAsk).toFixed(6));
+  // Strict slippage cap: at most +1 cent or +1.5% above bestAsk, capped at 0.95
+  const priceWithSlippage = parseFloat(
+    Math.min(referenceAsk + 0.01, referenceAsk * 1.015, 0.95).toFixed(4)
+  );
+  console.log(`[TRADE] BUY ${tokenId.slice(0, 10)}... ask=${referenceAsk} -> limit_cap=${priceWithSlippage} amount=$${amountUsdc}`);
   const marketOrderResponse = await client.createAndPostMarketOrder(
     {
       tokenID: tokenId,
