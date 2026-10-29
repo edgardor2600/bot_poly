@@ -14,7 +14,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const API_POLY = "https://gamma-api.polymarket.com/markets";
 const API_GROQ = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL = getEnv("GROQ_MODEL", "openai/gpt-oss-120b");
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const API_TAVILY = "https://api.tavily.com/search";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
@@ -1132,7 +1132,7 @@ JSON:{"action":"BUY_YES"|"BUY_NO"|"SKIP","confidence":0-100,"edge_pct":number,"s
       }
     ],
     temperature: 0.15,
-    max_tokens: 350,
+    max_tokens: 1024,
     response_format: { type: "json_object" }
   };
 
