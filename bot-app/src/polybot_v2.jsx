@@ -76,25 +76,29 @@ function computeSignalScore(prelimScore = 0, conf = 0, edgePct = 0, confluenceSc
 }
 
 function computeTradeEconomics(trade) {
-  const cost = Math.max(0, Number(trade.cost || 1));
-  const entryPrice = Math.max(0.001, Number(trade.entryPrice || 0.5));
-  const currentPrice = Math.max(0.001, Number(trade.currentPrice ?? trade.entryPrice ?? 0.5));
-  const shares = Math.max(0, Number(trade.shares || 0));
-  const isClosed = trade.status === "CLOSED";
+  const shares       = Math.max(0, Number(trade.shares || 0));
+  const entryPrice   = Math.max(0.001, Number(trade.entryPrice || 0.5));
+  const cost         = Math.max(0, Number(trade.cost || (shares * entryPrice) || 1));
+  const currentPrice = Math.max(0.001, Number(trade.currentPrice ?? trade.closePrice ?? trade.entryPrice ?? 0.5));
+  const isClosed     = trade.status === "CLOSED";
 
   const entryFeeUsd = Number(trade.entryFeeUsd || 0) > 0
     ? Number(trade.entryFeeUsd)
     : Number(((cost * 0.0035) + 0.004).toFixed(4));
-  const exitNotional = shares * currentPrice;
-  const exitSlippageRate = (trade.closeReason === "STOP_LOSS" || trade.closeReason === "TRAILING_STOP") ? 0.0055 : 0.0035;
+
+  const exitPx          = isClosed ? Number(trade.closePrice ?? trade.currentPrice ?? currentPrice) : currentPrice;
+  const exitNotional    = shares * exitPx;
+  const isEmergencyStop = trade.closeReason === "STOP_LOSS";
+  const exitFeeRate     = isEmergencyStop ? 0.0050 : 0.0035;
+
   const exitFeeUsd = isClosed
-    ? (Number(trade.exitFeeUsd || 0) > 0 ? Number(trade.exitFeeUsd) : Number(((exitNotional * exitSlippageRate) + 0.004).toFixed(4)))
+    ? (Number(trade.exitFeeUsd || 0) > 0 ? Number(trade.exitFeeUsd) : Number(((exitNotional * exitFeeRate) + 0.004).toFixed(4)))
     : Number(((exitNotional * 0.0035) + 0.004).toFixed(4));
 
   const totalFrictionUsd = Number((entryFeeUsd + (isClosed ? exitFeeUsd : 0)).toFixed(3));
-  const rawPricePnl = parseFloat(((currentPrice - entryPrice) * shares).toFixed(2));
-  const recordedPnl = isClosed ? Number(trade.pnl ?? rawPricePnl) : rawPricePnl;
-  const netPnlAfterFriction = trade.frictionDeducted
+  const rawPricePnl = parseFloat(((exitPx - entryPrice) * shares).toFixed(2));
+  const recordedPnl = isClosed ? Number(trade.pnl ?? (rawPricePnl - totalFrictionUsd)) : rawPricePnl;
+  const netPnlAfterFriction = (isClosed && trade.frictionDeducted !== false)
     ? parseFloat(recordedPnl.toFixed(2))
     : parseFloat((recordedPnl - totalFrictionUsd).toFixed(2));
 
@@ -102,6 +106,7 @@ function computeTradeEconomics(trade) {
     entryFeeUsd: Number(entryFeeUsd.toFixed(3)),
     exitFeeUsd: Number(exitFeeUsd.toFixed(3)),
     frictionUsd: totalFrictionUsd,
+    totalFrictionUsd,
     grossPnl: rawPricePnl,
     netPnlAfterFriction,
   };
@@ -1435,11 +1440,13 @@ export default function PolyBotV2() {
                         {closedTrades.map((t, i) => {
                           const reasonBadge = t.closeReason === "TAKE_PROFIT"
                             ? { txt: "🎯 TAKE PROFIT", c: S.green }
-                            : (t.closeReason === "TRAILING_STOP" || t.pnl === 0)
-                              ? { txt: "🛡 TRAILING / BE", c: S.cyan }
-                              : t.closeReason === "MAX_HOLD"
-                                ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
-                                : { txt: "🛑 STOP LOSS", c: S.red };
+                            : t.closeReason === "TRAILING_STOP"
+                              ? { txt: "📈 TRAILING SL", c: S.green }
+                              : (t.closeReason === "BREAK_EVEN" || t.pnl === 0)
+                                ? { txt: "🛡 BREAK EVEN", c: S.cyan }
+                                : t.closeReason === "MAX_HOLD"
+                                  ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
+                                  : { txt: "🛑 STOP LOSS", c: S.red };
                           const netReal = t.netPnlAfterFriction ?? (t.pnl - (t.frictionUsd || 0.015));
                           return (
                             <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>
@@ -1537,7 +1544,7 @@ export default function PolyBotV2() {
             if (t.closeReason === "TAKE_PROFIT") {
               exitStats.TAKE_PROFIT.count++;
               exitStats.TAKE_PROFIT.pnl += p;
-            } else if (t.closeReason === "TRAILING_STOP" || t.breakEvenArmed || p >= 0) {
+            } else if (t.closeReason === "TRAILING_STOP" || t.closeReason === "BREAK_EVEN" || t.breakEvenArmed || p >= 0) {
               exitStats.TRAILING_PROTECTED.count++;
               exitStats.TRAILING_PROTECTED.pnl += p;
             } else if (t.closeReason === "MAX_HOLD") {

@@ -252,7 +252,7 @@ export async function executeBuyOrder({ market, analysis, pre, amountUsdc }) {
   };
 }
 
-export async function executeSellOrder({ tokenId, shares, expectedPrice }) {
+export async function executeSellOrder({ tokenId, shares, expectedPrice, minAcceptablePrice = null }) {
   const client = await initPolymarketClient();
   if (!client) {
     throw new Error("Real trading is disabled.");
@@ -299,9 +299,12 @@ export async function executeSellOrder({ tokenId, shares, expectedPrice }) {
     }
   }
 
-  const sellPrice = Number.isFinite(expectedPrice) && expectedPrice > 0
-    ? parseFloat(Math.max(expectedPrice * 0.98, 0.01).toFixed(4))
-    : expectedPrice;
+  // Garantiza al menos 2 ticks (2.0¢) o 4% de colchón en órdenes FAK para evitar rechazos KILLED cuando P_bid < 0.50
+  const sellPrice = Number.isFinite(minAcceptablePrice) && minAcceptablePrice > 0
+    ? parseFloat(Math.max(0.01, minAcceptablePrice).toFixed(4))
+    : (Number.isFinite(expectedPrice) && expectedPrice > 0
+      ? parseFloat(Math.max(0.01, Math.min(expectedPrice - 0.02, expectedPrice * 0.96)).toFixed(4))
+      : expectedPrice);
 
   const marketOrderResponse = await client.createAndPostMarketOrder(
     {

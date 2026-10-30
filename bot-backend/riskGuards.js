@@ -16,10 +16,10 @@ function isActiveTradeStatus(status) {
 }
 
 export const REAL_TRADING_RULES = {
-  minTradeUsdc: getNumberEnv("MIN_TRADE_USDC", 1),
-  maxTradeUsdc: getNumberEnv("MAX_TRADE_USDC", 1),
+  minTradeUsdc: getNumberEnv("MIN_TRADE_USDC", 1.50),
+  maxTradeUsdc: getNumberEnv("MAX_TRADE_USDC", 2.50),
   maxOpenTrades: Math.max(1, Math.floor(getNumberEnv("MAX_OPEN_TRADES", 3))),
-  maxExposurePct: Math.max(1, Math.min(100, getNumberEnv("MAX_EXPOSURE_PCT", 40))),
+  maxExposurePct: Math.max(1, Math.min(100, getNumberEnv("MAX_EXPOSURE_PCT", 50))),
   reserveUsdc: Math.max(0, getNumberEnv("TRADING_RESERVE_USDC", 0)),
   minPolBalance: Math.max(0, getNumberEnv("TRADING_MIN_POL_BALANCE", 0.5)),
   aiTopN: Math.max(1, Math.floor(getNumberEnv("AI_TOP_N", 1))),
