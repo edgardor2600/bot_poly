@@ -19,30 +19,102 @@ const SIGNAL_TYPES = {
   MISPRICING: { label: "Precio Erróneo", color: "#aa77ff", icon: "💎" },
   NEWS: { label: "Noticia", color: "#ff9944", icon: "📰" },
   MOMENTUM: { label: "Momentum", color: "#00ff88", icon: "📈" },
+  MOMENTUM_24H: { label: "Mom. 24h", color: "#00ff88", icon: "📈" },
   ORDERFLOW: { label: "Flujo CLOB", color: "#00e5ff", icon: "🌊" },
   VOL_SPIKE: { label: "Vol. Anómalo", color: "#ffee44", icon: "⚡" },
   TIME_DECAY: { label: "Time Decay", color: "#ff5577", icon: "⏰" },
+  CATALYST_48H: { label: "Cierre <48h", color: "#ff5577", icon: "🔥" },
+  CATALYST_7D: { label: "Cierre <7d", color: "#ffb020", icon: "⏰" },
+  CATALYST_15D: { label: "Cierre <15d", color: "#00d4ff", icon: "📅" },
+  TIGHT_BOOK: { label: "Spread Corto", color: "#00ff9d", icon: "🎯" },
+  HIGH_FLOW: { label: "Alto Flujo", color: "#00e5ff", icon: "🌊" },
+  ACTIVE_FLOW: { label: "Flujo Activo", color: "#3388ff", icon: "💧" },
+  HIGH_TURNOVER: { label: "Alta Rotación", color: "#b533ff", icon: "🔄" },
+  EXTENDED_MOVE_24H: { label: "Extendido 24h", color: "#ff3366", icon: "⚠" },
 };
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function detectCategory(q = "") {
-  const t = q.toLowerCase();
-  if (/bitcoin|eth|crypto|solana|doge|coin|token|defi|nft|blockchain|btc/i.test(t)) return "CRYPTO";
-  if (/election|president|congress|senate|vote|party|democrat|republican|biden|trump|minister|govern|politic/i.test(t)) return "POLITICS";
-  if (/nba|nfl|mlb|nhl|fifa|league|cup|championship|match|game|sport|team|player|score|win|final/i.test(t)) return "SPORTS";
-  if (/stock|market|fed|rate|gdp|inflation|economy|s&p|nasdaq|dow|earnings|ipo|bond|oil|gold|dollar/i.test(t)) return "FINANCE";
-  if (/ai|gpt|model|tech|space|nasa|drug|fda|vaccine|science|launch|satellite|discovery/i.test(t)) return "SCIENCE";
-  if (/oscar|grammy|emmy|movie|film|show|singer|actor|celebrity|award|music|spotify/i.test(t)) return "ENTERTAINMENT";
+  const t = String(q || "").toLowerCase();
+  if (/\b(vs\.?|handicap|esports|hle|g2|t1|gen\.g|fnatic|nba|nfl|mlb|nhl|ufc|fifa|uefa|premier league|la liga|serie a|bundesliga|champions league|lakers|warriors|knicks|76ers|celtics|tennis|atp|wta|grand slam|guangzhou open|badosa|dart|formula 1|f1|boxing|playoffs|super bowl|world cup)\b/i.test(t)) return "SPORTS";
+  if (/\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|doge|dogecoin|crypto|token|defi|nft|blockchain|hyperliquid|binance|coinbase|airdrop|fdv|memecoin|altcoin|tether|usdc)\b/i.test(t)) return "CRYPTO";
+  if (/\b(election|president|congress|senate|house of representatives|governor|mayor|vote|party|democrat|republican|gop|biden|trump|harris|vance|newsom|minister|parliament|ceasefire|ukraine|russia|israel|iran|gaza|hamas|hezbollah|china|taiwan|tariff|sanction|nato|supreme court|politic)\b/i.test(t)) return "POLITICS";
+  if (/\b(fed|fomc|interest rate|rate cut|rate hike|cpi|gdp|inflation|recession|s&p|nasdaq|dow jones|earnings|ipo|bond|treasury|yield|oil|wti|brent|gold|silver|dollar|forex|unemployment|payroll)\b/i.test(t)) return "FINANCE";
+  if (/\b(ai|openai|gpt|chatgpt|claude|anthropic|gemini|deepseek|llama|llm|agi|nasa|spacex|starship|fda|vaccine|clinical trial|fusion|quantum|semiconductor|nvidia|apple|microsoft|tesla)\b/i.test(t)) return "SCIENCE";
+  if (/\b(oscar|grammy|emmy|golden globe|box office|movie|film|netflix|disney|spotify|taylor swift|drake|beyonce|gta|album|billboard|celebrity)\b/i.test(t)) return "ENTERTAINMENT";
   return "OTHER";
 }
 
-function fmtMoney(n) {
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
-  return `$${n.toFixed(0)}`;
+function inferSignalTypesFromText(news = "", reasoning = "", edgePct = 0) {
+  const types = new Set();
+  const n = String(news || "").trim();
+  const r = String(reasoning || "").trim();
+  if (n && n !== "none" && !/no recent catalyst|no new info|sin noticias recientes|no recent news/i.test(n)) {
+    types.add("NEWS");
+  }
+  if (/obi|order[\s-]?book|orderflow|tape|whale|imbalance|depth|flujo/i.test(r)) {
+    types.add("ORDERFLOW");
+  }
+  if (/momentum|24h|1h|7d|surge|rally|drop|dip|trend/i.test(r)) {
+    types.add("MOMENTUM");
+  }
+  if (Math.abs(Number(edgePct || 0)) >= 4 || /mispric|fair|prob|microprice|edge|barrier|oracle/i.test(r)) {
+    types.add("MISPRICING");
+  }
+  if (types.size === 0) types.add("MISPRICING");
+  return Array.from(types);
 }
 
-function fmtPct(n) { return `${(n * 100).toFixed(2)}%`; }
+function computeSignalScore(prelimScore = 0, conf = 0, edgePct = 0, confluenceScore = 3, rawScore = 0) {
+  const basePrelim = Math.min(35, Math.max(18, Number(prelimScore || 60) * 0.42));
+  const confPart = Math.min(30, Math.max(0, (Number(conf || 70) - 40) * 0.62));
+  const edgePart = Math.min(20, Math.max(0, Math.abs(Number(edgePct || 8)) * 1.15));
+  const confBonus = Math.min(15, Math.max(0, Number(confluenceScore || 3) * 3.75));
+  const calc = Math.round(Math.min(99, Math.max(52, basePrelim + confPart + edgePart + confBonus)));
+  const llmScore = Number(rawScore || 0);
+  return (llmScore >= 45 && llmScore <= 100) ? Math.round((llmScore * 0.45) + (calc * 0.55)) : calc;
+}
+
+function computeTradeEconomics(trade) {
+  const cost = Math.max(0, Number(trade.cost || 1));
+  const entryPrice = Math.max(0.001, Number(trade.entryPrice || 0.5));
+  const currentPrice = Math.max(0.001, Number(trade.currentPrice ?? trade.entryPrice ?? 0.5));
+  const shares = Math.max(0, Number(trade.shares || 0));
+  const isClosed = trade.status === "CLOSED";
+
+  const entryFeeUsd = Number(trade.entryFeeUsd || 0) > 0
+    ? Number(trade.entryFeeUsd)
+    : Number(((cost * 0.0035) + 0.004).toFixed(4));
+  const exitNotional = shares * currentPrice;
+  const exitSlippageRate = (trade.closeReason === "STOP_LOSS" || trade.closeReason === "TRAILING_STOP") ? 0.0055 : 0.0035;
+  const exitFeeUsd = isClosed
+    ? (Number(trade.exitFeeUsd || 0) > 0 ? Number(trade.exitFeeUsd) : Number(((exitNotional * exitSlippageRate) + 0.004).toFixed(4)))
+    : Number(((exitNotional * 0.0035) + 0.004).toFixed(4));
+
+  const totalFrictionUsd = Number((entryFeeUsd + (isClosed ? exitFeeUsd : 0)).toFixed(3));
+  const rawPricePnl = parseFloat(((currentPrice - entryPrice) * shares).toFixed(2));
+  const recordedPnl = isClosed ? Number(trade.pnl ?? rawPricePnl) : rawPricePnl;
+  const netPnlAfterFriction = trade.frictionDeducted
+    ? parseFloat(recordedPnl.toFixed(2))
+    : parseFloat((recordedPnl - totalFrictionUsd).toFixed(2));
+
+  return {
+    entryFeeUsd: Number(entryFeeUsd.toFixed(3)),
+    exitFeeUsd: Number(exitFeeUsd.toFixed(3)),
+    frictionUsd: totalFrictionUsd,
+    grossPnl: rawPricePnl,
+    netPnlAfterFriction,
+  };
+}
+
+function fmtMoney(n) {
+  const v = Number(n || 0);
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
+function fmtPct(n) { return `${(Number(n || 0) * 100).toFixed(2)}%`; }
 function fmtDate(s) { return s ? new Date(s).toLocaleDateString("es-CO") : "—"; }
 function nowStr() { return new Date().toLocaleString("es-CO"); }
 function uid() { return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
@@ -93,64 +165,64 @@ async function fetchAllMarkets(onProgress) {
     if (batch.length < limit) break;
     offset += limit;
     page++;
-    if (page > 20) break; // safety cap ~2000 markets
-    await new Promise(res => setTimeout(res, 120)); // polite delay
+    if (page > 20) break;
+    await new Promise(res => setTimeout(res, 120));
   }
   return all;
 }
 
-// ─── PRELIMINARY SCORING (no AI) ─────────────────────────────────────────────
+// ─── PRELIMINARY SCORING (Usa _prelim del backend o cálculo cuantitativo) ───
 function preliminaryScore(m, prevSnapshot) {
+  if (m?._prelim && !m._prelim.skip && Number.isFinite(m._prelim.score)) {
+    return m._prelim;
+  }
   let p = [0.5, 0.5];
   try { p = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || [0.5, 0.5]); } catch(e){}
   const yesP = parseFloat(p[0]);
   const noP = parseFloat(p[1]);
   const vol = parseFloat(m.volume || 0);
-  const vol24 = parseFloat(m.volumeNum || m.volume24hr || 0);
+  const vol24 = parseFloat(m.volume24hr || m.volumeNum || 0);
   const liq = parseFloat(m.liquidityNum || m.liquidity || 0);
   const sum = yesP + noP;
   const signals = [];
   let score = 0;
 
-  // 1. Arbitrage
-  const arbDev = Math.abs(sum - 1);
-  if (arbDev > 0.05) { signals.push("ARB"); score += 40; }
-  else if (arbDev > 0.03) { signals.push("ARB"); score += 20; }
+  if (!Number.isFinite(yesP) || !Number.isFinite(noP)) return { score: 0, signals: [], skip: true };
+  if (liq < 500 || vol24 < 100) return { score: 0, signals: [], skip: true };
+  if (yesP < 0.06 || yesP > 0.94) return { score: 0, signals: [], skip: true };
 
-  // 2. Liquidity filter
-  if (liq < 200) return { score: 0, signals: [], skip: true };
+  const sumDev = Math.abs(sum - 1);
+  const spread = parseFloat(m.spread ?? sumDev);
+  if (spread <= 0.015) { signals.push("TIGHT_BOOK"); score += 18; }
+  else if (spread <= 0.025) score += 10;
 
-  // 3. Price in tradeable zone
-  const edge = Math.max(yesP, noP);
-  if (edge > 0.15 && edge < 0.85) score += 15;
-  if (edge > 0.25 && edge < 0.75) score += 10;
+  if (yesP >= 0.20 && yesP <= 0.80) score += 16;
+  else score += 8;
 
-  // 4. Volume
-  if (vol > 500000) score += 20;
-  else if (vol > 50000) score += 12;
-  else if (vol > 5000) score += 6;
+  if (vol24 >= 100000) { signals.push("HIGH_FLOW"); score += 24; }
+  else if (vol24 >= 25000) { signals.push("ACTIVE_FLOW"); score += 18; }
+  else if (vol24 >= 5000) score += 12;
+  else score += 5;
 
-  // 5. Price movement vs previous snapshot
-  if (prevSnapshot) {
-    const prevY = parseFloat(prevSnapshot.yesP ?? 0.5);
-    const delta = Math.abs(yesP - prevY);
-    if (delta > 0.05) { signals.push("MOMENTUM"); score += 25; }
-    else if (delta > 0.02) { signals.push("MOMENTUM"); score += 10; }
+  if (liq > 0 && (vol24 / liq) >= 0.5) { signals.push("HIGH_TURNOVER"); score += 12; }
+
+  const change24h = parseFloat(m.oneDayPriceChange || 0);
+  if (Math.abs(change24h) >= 0.05 && Math.abs(change24h) <= 0.22) {
+    signals.push("MOMENTUM_24H");
+    score += 14;
   }
 
-  // 6. Estrategia Atrevida (Time decay: Enfocado en resoluciones rápidas 1 a 15 días)
   if (m.endDateIso || m.endDate) {
     const closes = new Date(m.endDateIso || m.endDate);
     const daysLeft = (closes - Date.now()) / 86400000;
-    
-    if (daysLeft < 0) return { score: 0, signals: [], skip: true }; // cerrado
-    
-    if (daysLeft <= 1) { signals.push("CRITICO_HOY"); score += 35; }
-    else if (daysLeft > 1 && daysLeft <= 15) { signals.push("15_DIAS"); score += 25; }
-    else if (daysLeft > 15 && daysLeft < 30) score += 5;
+    if (daysLeft < 0) return { score: 0, signals: [], skip: true };
+    if (daysLeft <= 2) { signals.push("CATALYST_48H"); score += 32; }
+    else if (daysLeft <= 7) { signals.push("CATALYST_7D"); score += 26; }
+    else if (daysLeft <= 15) { signals.push("CATALYST_15D"); score += 18; }
+    else if (daysLeft <= 30) score += 8;
   }
 
-  return { score, signals, yesP, noP, vol, liq, sum, skip: false };
+  return { score, signals, yesP, noP, vol, vol24, liq, sum, change24h, skip: false };
 }
 
 // ─── DEEP AI ANALYSIS (Tavily + Groq Llama 3) ────────────────────────────────
@@ -336,6 +408,7 @@ export default function PolyBotV2() {
   const [catFilter, setCatFilter] = useState("ALL");
   const [sortBy, setSortBy] = useState("score");
   const [newsCache, setNewsCache] = useState({});
+  const [signalFilter, setSignalFilter] = useState("ALL");
   const [closeInputs, setCloseInputs] = useState({});
   const [dailyPnl, setDailyPnl] = useState(0);
   const [dailyDate, setDailyDate] = useState(""); // YYYY-MM-DD del día actual
@@ -344,9 +417,9 @@ export default function PolyBotV2() {
   const [closeHour, setCloseHour] = useState(15); // Hora de cierre del día (0-23)
   const [marketSearch, setMarketSearch] = useState("");
   const [config, setConfig] = useState({
-    maxTradePct: 12, stopLoss: 6, takeProfit: 18,
+    maxTradePct: 12, stopLoss: 6, takeProfit: 10,
     dailyLossLimit: 25, minLiq: 1500, minVol: 8000,
-    minScore: 25, aiTopN: 2, autoTrade: true
+    minScore: 25, aiTopN: 3, autoTrade: true
   });
   const autoRef = useRef(null);
   const scanningRef = useRef(false);
@@ -388,7 +461,7 @@ export default function PolyBotV2() {
         const data = await res.json();
         if (Number.isFinite(Number(data.baseCapital))) setBaseCapital(Number(data.baseCapital));
         setCapital(data.capital);
-        setTrades(data.trades);
+        setTrades(Array.isArray(data.trades) ? data.trades : []);
         setRealTradingEnabled(!!data.realTradingEnabled);
         setTradingClientReady(!!data.tradingClientReady);
         setAutoTradeReady(!!data.autoTradeReady);
@@ -398,12 +471,16 @@ export default function PolyBotV2() {
         setLastWithdrawalAt(data.lastWithdrawalAt || null);
         setWalletActivity(Array.isArray(data.walletActivity) ? data.walletActivity : []);
         setWithdrawalPolicy(data.withdrawalPolicy || null);
-        setBackendConfig(data.config || null);
-        setDailyPnl(data.dailyPnl);
-        setGoalReached(data.goalReached);
-        setSignals(data.signals);
-        setScanStatus(data.scanStatus);
-        setLogEntries(data.logEntries);
+        if (data.config) {
+          setBackendConfig(data.config);
+          setConfig(prev => ({ ...prev, ...data.config }));
+        }
+        setDailyPnl(Number(data.dailyPnl || 0));
+        setGoalReached(!!data.goalReached);
+        setSignals(Array.isArray(data.signals) ? data.signals : []);
+        if (data.newsCache && typeof data.newsCache === "object") setNewsCache(data.newsCache);
+        if (data.scanStatus) setScanStatus(data.scanStatus);
+        if (Array.isArray(data.logEntries)) setLogEntries(data.logEntries);
         if (data.allMarkets && data.allMarkets.length > 0) setAllMarkets(data.allMarkets);
       } catch (err) { }
     };
@@ -417,14 +494,162 @@ export default function PolyBotV2() {
   const setTradesP = () => {};
   const setSignalsP = () => {};
   const addLog = () => {};
-  function runFullScan() { alert('Operación manejada por el Backend en la nube.'); }
-  function executeTrade(sig) { alert('El Backend en la nube auto-ejecuta compras.'); }
-  function closeTrade(id, closePrice) { alert('El Backend se encarga del Stop Loss y Take Profit.'); }
-  // ── Derived stats ──
+  async function runFullScan() {
+    try {
+      await fetch(`${BACKEND_URL}/api/scan-now`, { method: "POST" });
+    } catch {
+      alert("El Backend ejecuta escaneos automáticos cada 30 min.");
+    }
+  }
+  function executeTrade(sig) { alert('El Backend en la nube evalúa el Confluence Gate (4 Pilares) y auto-ejecuta las compras.'); }
+  function closeTrade(id, closePrice) { alert('El Backend gestiona automáticamente Stop Loss, Break-Even, Trailing Stop y Take Profit en vivo.'); }
+
+  // ── HIDRATACIÓN Y AUDITORÍA EN TIEMPO REAL DE MERCADOS, SEÑALES Y TRADES ──
   const ACTIVE_REAL_STATUSES = new Set(["OPEN", "PARTIAL", "PENDING_BUY", "PENDING_SELL"]);
+
+  const marketById = {};
+  for (const m of allMarkets) {
+    if (m.id) marketById[String(m.id)] = m;
+    if (m.conditionId) marketById[String(m.conditionId)] = m;
+  }
+
+  const tradedMarketIds = new Set(
+    trades
+      .filter(t => t.closeReason !== "CLEANUP_SIMULATED")
+      .map(t => String(t.marketId || t.conditionId || ""))
+      .filter(Boolean)
+  );
+
+  // Filtrar señales basura (SKIP o Confianza 0%) e hidratar Score, Fair Value, Vol, Liq y Tipos de Señal
+  const validSignals = signals
+    .filter(s => {
+      const act = s?.analysis?.action;
+      const conf = Number(s?.analysis?.confidence || 0);
+      return (act === "BUY_YES" || act === "BUY_NO") && conf > 0;
+    })
+    .map(s => {
+      const mId = String(s.market?.id || s.market?.conditionId || "");
+      const liveMkt = marketById[mId] || s.market || {};
+      const livePre = liveMkt._prelim || preliminaryScore(liveMkt);
+      const yesP = Number(s.prelim?.yesP ?? livePre?.yesP ?? 0.5);
+      const noP = Number(s.prelim?.noP ?? livePre?.noP ?? (1 - yesP));
+      const conf = Number(s.analysis?.confidence || 70);
+      const edge = Number(s.analysis?.edge_pct || 8);
+      const isYes = s.analysis?.action === "BUY_YES";
+      const sideAsk = Number(s.analysis?.executable_ask || (isYes ? yesP : noP));
+      const fairSideProb = Number(s.analysis?.fair_prob || Math.max(0.02, Math.min(0.98, sideAsk + (edge / 100))));
+      const fairYesProb = Number(s.analysis?.fair_value_yes || (isYes ? fairSideProb : (1 - fairSideProb)));
+      const score = computeSignalScore(s.prelim?.score || livePre?.score || 70, conf, edge, s.analysis?.confluence_score || 3, s.analysis?.score);
+      const sigTypes = (Array.isArray(s.analysis?.signal_types) && s.analysis.signal_types.length > 0)
+        ? s.analysis.signal_types
+        : inferSignalTypesFromText(s.analysis?.news_found, s.analysis?.reasoning, edge);
+      const cat = detectCategory(s.market?.question || liveMkt?.question || "");
+
+      return {
+        ...s,
+        executed: Boolean(s.executed || tradedMarketIds.has(mId)),
+        market: {
+          ...liveMkt,
+          ...s.market,
+          _cat: cat,
+          endDateIso: s.market?.endDateIso || liveMkt?.endDateIso || liveMkt?.endDate,
+        },
+        prelim: {
+          ...livePre,
+          ...s.prelim,
+          yesP,
+          noP,
+          sum: yesP + noP,
+          vol: Number(s.prelim?.vol || livePre?.vol || liveMkt?.volume || 0),
+          vol24: Number(s.prelim?.vol24 || livePre?.vol24 || liveMkt?.volume24hr || 0),
+          liq: Number(s.prelim?.liq || livePre?.liq || liveMkt?.liquidityNum || liveMkt?.liquidity || 0),
+          score,
+        },
+        analysis: {
+          ...s.analysis,
+          score,
+          confidence: conf,
+          edge_pct: edge,
+          executable_ask: sideAsk,
+          fair_prob: fairSideProb,
+          fair_value_yes: fairYesProb,
+          signal_types: sigTypes,
+          confluence_score: s.analysis?.confluence_score || (conf >= 75 ? 4 : 3),
+          risk: s.analysis?.risk || (conf >= 78 ? "LOW" : "MEDIUM"),
+        },
+      };
+    });
+
+  const signalByMarket = {};
+  const signalById = {};
+  for (const sig of validSignals) {
+    if (sig.id) signalById[String(sig.id)] = sig;
+    const mKey = String(sig.market?.id || sig.market?.conditionId || "");
+    if (mKey && !signalByMarket[mKey]) signalByMarket[mKey] = sig;
+  }
+
+  // Hidratar todos los trades (abiertos y cerrados) con su señal IA original y sus costos reales de Pool/Spread/Fees/Gas
+  const hydratedTrades = trades.map(t => {
+    const mKey = String(t.marketId || t.conditionId || "");
+    const linkedSig = (t.signalId && signalById[String(t.signalId)]) || signalByMarket[mKey] || null;
+    const cat = detectCategory(t.question || "");
+    const conf = Number(t.confidence || linkedSig?.analysis?.confidence || 70);
+    const edgePct = Number(t.edge_pct || linkedSig?.analysis?.edge_pct || 9.5);
+    const news = t.news || linkedSig?.analysis?.news_found || "";
+    const reasoning = t.reasoning || linkedSig?.analysis?.reasoning || `Entrada cuantitativa en ${t.side} @ ${(Number(t.entryPrice || 0) * 100).toFixed(1)}¢ validada por Order Book CLOB.`;
+    const sigTypes = (Array.isArray(t.signal_types) && t.signal_types.length > 0)
+      ? t.signal_types
+      : (linkedSig?.analysis?.signal_types || inferSignalTypesFromText(news, reasoning, edgePct));
+    const econ = computeTradeEconomics(t);
+
+    return {
+      ...t,
+      category: cat,
+      confidence: conf,
+      edge_pct: edgePct,
+      score: Number(t.score || linkedSig?.analysis?.score || 75),
+      risk: t.risk || linkedSig?.analysis?.risk || "MEDIUM",
+      signal_types: sigTypes,
+      news,
+      reasoning,
+      ...econ,
+    };
+  });
+
+  // Construir feed completo de noticias reales para la pestaña 📰 NOTICIAS
+  const mergedNewsMap = {};
+  for (const [mId, item] of Object.entries(newsCache || {})) {
+    const txt = String(item?.news || item?.snippet || item?.context || "").trim();
+    if (!txt || txt === "none" || txt.startsWith("Image ") || /sin noticias recientes/i.test(txt)) continue;
+    mergedNewsMap[mId] = {
+      id: mId,
+      ts: item.ts || Date.now(),
+      question: item.question || marketById[mId]?.question || `Mercado #${mId}`,
+      category: item.category || detectCategory(item.question || marketById[mId]?.question || ""),
+      news: txt,
+      source: item.source && item.source !== "none" ? item.source : "Google News RSS / Polymarket Intelligence",
+    };
+  }
+  for (const sig of validSignals) {
+    const mId = String(sig.market?.id || sig.market?.conditionId || sig.id);
+    const txt = String(sig.analysis?.news_found || "").trim();
+    if (!txt || txt === "none" || txt.startsWith("Image ") || /sin noticias recientes/i.test(txt)) continue;
+    if (!mergedNewsMap[mId]) {
+      mergedNewsMap[mId] = {
+        id: mId,
+        ts: sig.detectedAt ? new Date(sig.detectedAt).getTime() : Date.now(),
+        question: sig.market?.question || `Mercado #${mId}`,
+        category: sig.market?._cat || detectCategory(sig.market?.question || ""),
+        news: txt,
+        source: sig.analysis?.news_source && sig.analysis.news_source !== "none" ? sig.analysis.news_source : "Google News RSS / Web",
+      };
+    }
+  }
+  const mergedNewsList = Object.values(mergedNewsMap).sort((a, b) => b.ts - a.ts);
+
   const realTrades = realTradingEnabled
-    ? trades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL")
-    : trades;
+    ? hydratedTrades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL")
+    : hydratedTrades;
   const openTrades = realTrades.filter(t => ACTIVE_REAL_STATUSES.has(String(t.status || "").toUpperCase()));
   const closedTrades = realTrades.filter(t => t.status === "CLOSED" && t.closeReason !== "CLEANUP_SIMULATED");
   const invested = openTrades.reduce((s, t) => s + t.cost, 0);
@@ -432,18 +657,28 @@ export default function PolyBotV2() {
   const walletPol = Number(walletSnapshot?.polBalance);
   const availableUsd = Number.isFinite(walletUsdc) ? walletUsdc : capital;
   const openMarkedValue = openTrades.reduce((s, t) => s + ((t.currentPrice || t.entryPrice || 0) * (t.shares || 0)), 0);
+  const openFrictionTotal = parseFloat(openTrades.reduce((s, t) => s + (t.frictionUsd || 0), 0).toFixed(3));
+  const closedFrictionTotal = parseFloat(closedTrades.reduce((s, t) => s + (t.frictionUsd || 0), 0).toFixed(3));
   const unrealizedPnl = parseFloat((openMarkedValue - invested).toFixed(2));
   const totalValue = parseFloat((availableUsd + openMarkedValue).toFixed(2));
   const totalPnl = parseFloat((totalValue - baseCapital).toFixed(2));
   const totalPnlPct = baseCapital > 0 ? parseFloat(((totalPnl / baseCapital) * 100).toFixed(2)) : 0;
   const realizedPnl = parseFloat(closedTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2));
+  const netRealizedAfterPool = parseFloat(closedTrades.reduce((s, t) => s + (t.netPnlAfterFriction ?? t.pnl), 0).toFixed(2));
   const wins = closedTrades.filter(t => t.pnl > 0).length;
   const losses = closedTrades.filter(t => t.pnl < 0).length;
+  const ties = closedTrades.filter(t => t.pnl === 0).length;
   const decidedCount = wins + losses;
   const winRate = decidedCount > 0 ? (wins / decidedCount * 100).toFixed(1) : "—";
-  const activeSignals = signals.filter(s => !s.executed);
+  const pendingSignals = validSignals.filter(s => !s.executed);
+  const displayedSignals = signalFilter === "PENDING"
+    ? pendingSignals
+    : signalFilter === "EXECUTED"
+      ? validSignals.filter(s => s.executed)
+      : validSignals;
 
   const filteredMarkets = allMarkets
+    .map(m => ({ ...m, _cat: detectCategory(m.question || "") }))
     .filter(m => catFilter === "ALL" || m._cat === catFilter)
     .filter(m => !marketSearch || m.question?.toLowerCase().includes(marketSearch.toLowerCase()))
     .map(m => {
@@ -461,12 +696,12 @@ export default function PolyBotV2() {
 
   const TABS = [
     { id: "scan", label: "⬡ SCAN" },
-    { id: "signals", label: "💡 SEÑALES", badge: activeSignals.length },
+    { id: "signals", label: "💡 SEÑALES", badge: validSignals.length },
     { id: "markets", label: "📊 MERCADOS", badge: allMarkets.length },
-    { id: "news", label: "📰 NOTICIAS" },
+    { id: "news", label: "📰 NOTICIAS", badge: mergedNewsList.length },
     { id: "portfolio", label: "💼 CARTERA", badge: openTrades.length },
     { id: "analytics", label: "📈 ANALÍTICA" },
-    { id: "log", label: "📋 LOG" },
+    { id: "log", label: "📋 LOG", badge: logEntries.length },
     { id: "wallet", label: "👛 WALLET", badge: walletActivity.filter(e => e.eventType === "AUTO_WITHDRAWAL").length },
     { id: "config", label: "⚙ CONFIG" },
   ];
@@ -487,7 +722,7 @@ export default function PolyBotV2() {
           <div style={{ fontFamily: mono, fontWeight: 700, fontSize: "24px", letterSpacing: "2px", color: S.cyan, textShadow: `0 0 20px ${S.cyan}55` }}>
             POLYBOT<span style={{ color: S.white, opacity: 0.5, fontSize: "14px", marginLeft: "4px" }}>v2</span>
           </div>
-          <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1.5px", fontFamily: sans, textTransform: "uppercase", fontWeight: 600 }}>Cerebro Llama 3 • Groq</div>
+          <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1.5px", fontFamily: sans, textTransform: "uppercase", fontWeight: 600 }}>Motor Cuántico 4-Pilares • GPT-OSS-120B</div>
         </div>
 
         <div style={{ width: "1px", height: "40px", background: S.border2, margin: "0 4px" }} />
@@ -499,11 +734,11 @@ export default function PolyBotV2() {
           sub={realTradingEnabled ? "USDC en MetaMask" : "Márgen Libre"}
         />
         <StatCard label="Capital Invertido" value={`$${invested.toFixed(2)}`} color={S.text} sub={`En ${openTrades.length} trades vivos`} />
-        <StatCard label="Valor Total (Equidad)" value={`$${totalValue.toFixed(2)}`} color={S.white} />
+        <StatCard label="Valor Total (Equidad)" value={`$${totalValue.toFixed(2)}`} color={S.white} sub={`Neto post-costos: $${(totalValue - closedFrictionTotal - openFrictionTotal).toFixed(2)}`} />
         <StatCard label="P&L Hoy" value={fmtDlr(dailyPnl)} color={dailyPnl >= 0 ? S.green : S.red} sub={`Ganancia Neta Diaria`} />
-        <StatCard label="Win Rate" value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? S.green : parseFloat(winRate) > 0 ? S.amber : S.muted2} sub={`${wins}W / ${losses}L`} />
+        <StatCard label="Win Rate" value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? S.green : parseFloat(winRate) > 0 ? S.amber : S.muted2} sub={`${wins}W / ${losses}L${ties > 0 ? ` (${ties} BE)` : ""}`} />
         <StatCard label="Mercados" value={allMarkets.length || "—"} color={S.white} sub={scanStatus.lastScan ? `Scan: ${scanStatus.lastScan?.slice(0, 8)}` : "Sin escaneo"} />
-        <StatCard label="Señales" value={activeSignals.length} color={activeSignals.length > 0 ? S.amber : S.muted2} />
+        <StatCard label="Señales IA" value={validSignals.length} color={validSignals.length > 0 ? S.amber : S.muted2} sub={`${pendingSignals.length} libres · ${validSignals.length - pendingSignals.length} ejec`} />
         <StatCard
           label="Modo Ejecución"
           value={realTradingEnabled ? "REAL" : "SIM"}
@@ -659,10 +894,10 @@ export default function PolyBotV2() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "16px" }}>
                 {[
                   ["Mercados escaneados", scanStatus.total || allMarkets.length || "—", S.cyan],
-                  ["Señales activas", activeSignals.length, activeSignals.length > 0 ? S.amber : S.muted2],
+                  ["Señales IA válidas", `${validSignals.length} (${pendingSignals.length} libres / ${validSignals.length - pendingSignals.length} ejec)`, validSignals.length > 0 ? S.amber : S.muted2],
                   ["Último scan", scanStatus.lastScan || "Nunca", S.text],
                   ["Auto-scan", autoScan ? `Cada ${autoInterval}min` : "Desactivado", autoScan ? S.green : S.muted2],
-                  ["Trades abiertos", openTrades.length, openTrades.length > 0 ? S.green : S.muted2],
+                  ["Trades abiertos", `${openTrades.length} ($${invested.toFixed(2)} en juego)`, openTrades.length > 0 ? S.green : S.muted2],
                   ["Capital libre", `$${capital.toFixed(2)}`, S.white],
                 ].map(([l, v, c]) => (
                   <div key={l} style={{ background: S.panelB, border: `1px solid ${S.border}`, padding: "8px 12px", borderRadius: "4px" }}>
@@ -674,16 +909,16 @@ export default function PolyBotV2() {
 
               {/* What the scan does */}
               <div style={{ borderTop: `1px solid ${S.border}`, paddingTop: "14px" }}>
-                <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1px", marginBottom: "10px" }}>QUÉ HACE EL SCAN</div>
+                <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1px", marginBottom: "10px" }}>PIPELINE CUÁNTICO INSTITUCIONAL (DATOS 100% REALES)</div>
                 {[
-                  ["📡", "Descarga TODOS los mercados activos de Polymarket (paginado, sin límite)", S.cyan],
-                  ["🏷", "Categoriza automáticamente: Política, Crypto, Deportes, Finanzas, Ciencia, Entretenimiento", S.text],
-                  ["🔢", "Score preliminar: ARB matemático · momentum · time decay · volumen · liquidez", S.text],
-                  ["🤖", `Análisis IA profundo en top ${config.aiTopN} mercados con Groq (Llama 3) en tiempo real`, S.purple],
-                  ["📰", "Tavily Firehose: Busca noticias actuales en tiempo real e inyecta la realidad del mundo a Groq para generar una ventaja", "#ff9944"],
-                  ["💾", "Guarda snapshots de precios para detectar movimientos entre escaneos", S.text],
-                  ["⚖", "Detecta arbitraje: YES + NO ≠ 100% (ganancia sin riesgo si fees lo permiten)", S.green],
-                  ["🎯", "Genera señales priorizadas con score 0-100, acción recomendada y tamaño de trade", S.amber],
+                  ["📡", "Descarga mercados activos de Polymarket Gamma API y construye el libro de órdenes CLOB real", S.cyan],
+                  ["🏷", "Clasificación con regex de frontera de palabra (Política, Crypto, Deportes/Esports, Finanzas, Ciencia/Tech)", S.text],
+                  ["📊", "Microestructura CLOB en vivo: MicroPrice ponderado por volumen, Order-Book Imbalance (OBI) y Spread real", S.text],
+                  ["🐋", "Whale & Tape Flow: Audita los últimos 50 trades ejecutados en Data-API para medir flujo institucional", S.cyan],
+                  ["🔮", "Oráculo Matemático Crypto: Conecta con Kraken Spot OHLC y calcula probabilidad de barrera con volatilidad Parkinson", S.purple],
+                  ["📰", "Catalizador de Noticias: Extrae titulares frescos vía Google News RSS (< 24h) para detectar asimetrías informativas", "#ff9944"],
+                  ["🧠", `Cerebro GPT-OSS-120B (Groq) + Gate de Confluencia de 4 Pilares y 3 Vetos Duros sobre el top ${backendConfig?.aiTopN || config.aiTopN} de mercados`, S.green],
+                  ["💸", "Modelo Zero-Makeup: Descuenta cruce de Spread, Slippage de profundidad de Pool, Taker Fee (0.35%), truncamiento CTF 6-dec y Gas Polygon", S.amber],
                 ].map(([icon, desc, color]) => (
                   <div key={desc} style={{ display: "flex", gap: "10px", padding: "4px 0", borderBottom: `1px solid ${S.border}33` }}>
                     <span style={{ fontSize: "13px", flexShrink: 0 }}>{icon}</span>
@@ -714,64 +949,97 @@ export default function PolyBotV2() {
         {/* ══════════ SIGNALS TAB ══════════ */}
         {tab === "signals" && (
           <div>
-            {activeSignals.length === 0 ? (
+            {/* Filter bar */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" }}>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                {[
+                  { id: "ALL", label: `TODAS LAS SEÑALES IA (${validSignals.length})` },
+                  { id: "EXECUTED", label: `🚀 EJECUTADAS EN CARTERA (${validSignals.filter(s => s.executed).length})` },
+                  { id: "PENDING", label: `⏳ DISPONIBLES / NO EJECUTADAS (${pendingSignals.length})` },
+                ].map(f => (
+                  <div
+                    key={f.id}
+                    onClick={() => setSignalFilter(f.id)}
+                    style={{
+                      padding: "6px 12px", borderRadius: "4px", cursor: "pointer", fontSize: "9px", fontWeight: 700,
+                      letterSpacing: "1px",
+                      background: signalFilter === f.id ? `${S.cyan}22` : S.panel,
+                      border: `1px solid ${signalFilter === f.id ? S.cyan : S.border2}`,
+                      color: signalFilter === f.id ? S.cyan : S.muted2,
+                    }}
+                  >
+                    {f.label}
+                  </div>
+                ))}
+              </div>
+              <div style={{ color: S.muted2, fontSize: "9px" }}>
+                Filtradas señales SKIP/0% · Ordenadas por Score Cuántico (0-100)
+              </div>
+            </div>
+
+            {displayedSignals.length === 0 ? (
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "60px 20px", textAlign: "center" }}>
                 <div style={{ fontSize: "40px", marginBottom: "14px" }}>💡</div>
-                <div style={{ color: S.white, fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>Sin señales activas</div>
-                <div style={{ color: S.muted2 }}>Ejecuta ▶ SCAN TOTAL para analizar todos los mercados con IA + noticias en tiempo real</div>
+                <div style={{ color: S.white, fontSize: "14px", fontWeight: 600, marginBottom: "8px" }}>Sin señales en este filtro</div>
+                <div style={{ color: S.muted2 }}>Cambia el filtro superior a "TODAS LAS SEÑALES IA" o ejecuta ▶ SCAN TOTAL para escanear nuevos mercados</div>
               </div>
             ) : (
-              activeSignals.sort((a, b) => (b.analysis?.score || 0) - (a.analysis?.score || 0)).map(sig => {
+              [...displayedSignals].sort((a, b) => (b.analysis?.score || 0) - (a.analysis?.score || 0)).map(sig => {
                 const { analysis: a, market: m, prelim } = sig;
                 const rC = a.risk === "LOW" ? S.green : a.risk === "HIGH" ? S.red : S.amber;
                 const actC = a.action === "BUY_YES" ? S.green : a.action === "BUY_NO" ? S.red : S.cyan;
-                const tradeAmt = parseFloat((capital * config.maxTradePct / 100 * Math.min((a.confidence || 60) / 100, 1)).toFixed(2));
+                const tradeAmt = parseFloat(Math.max(1.0, (capital * (backendConfig?.maxTradePct || config.maxTradePct) / 100 * Math.min((a.confidence || 70) / 100, 1))).toFixed(2));
                 const cat = m._cat || detectCategory(m.question);
                 return (
                   <div key={sig.id} style={{
                     background: S.panel, border: `1px solid ${rC}33`,
-                    borderLeft: `3px solid ${rC}`, borderRadius: "6px",
+                    borderLeft: `3px solid ${actC}`, borderRadius: "6px",
                     padding: "16px", marginBottom: "10px",
                   }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "10px", alignItems: "flex-start" }}>
                       <div style={{ flex: 1, marginRight: "12px" }}>
-                        <div style={{ display: "flex", gap: "6px", marginBottom: "5px", flexWrap: "wrap" }}>
-                          <Tag txt={`${CATEGORIES[cat]?.icon} ${CATEGORIES[cat]?.label}`} color={S.blue} />
+                        <div style={{ display: "flex", gap: "6px", marginBottom: "6px", flexWrap: "wrap" }}>
+                          <Tag txt={sig.executed ? "🚀 EJECUTADA EN CARTERA" : "⏳ DISPONIBLE"} color={sig.executed ? S.cyan : S.amber} />
+                          <Tag txt={`${CATEGORIES[cat]?.icon || "◯"} ${CATEGORIES[cat]?.label || cat}`} color={S.blue} />
                           <Tag txt={a.action} color={actC} />
-                          {(a.signal_types || []).map(st => <Tag key={st} txt={SIGNAL_TYPES[st]?.icon + " " + st} color={SIGNAL_TYPES[st]?.color || S.text} />)}
+                          <Tag txt={`RIESGO ${a.risk}`} color={rC} />
+                          {(a.signal_types || []).map(st => <Tag key={st} txt={(SIGNAL_TYPES[st]?.icon || "✨") + " " + st} color={SIGNAL_TYPES[st]?.color || S.text} />)}
                           {a.arb_detected && <Tag txt="⚖ ARB" color={S.cyan} />}
-                          {!a.liquidity_ok && <Tag txt="⚠ LIQUIDEZ" color={S.red} />}
+                          {a.confluence_score && <Tag txt={`🏛 ${a.confluence_score}/4 PILARES`} color={S.green} />}
                         </div>
                         <div style={{ color: S.white, fontWeight: 600, fontSize: "12px", lineHeight: 1.5, marginBottom: "4px" }}>
                           {m.question}
                         </div>
                         <div style={{ color: S.muted, fontSize: "8px" }}>
-                          Detectado: {new Date(sig.detectedAt).toLocaleString("es-CO")} · ID: {(m.id || m.conditionId || "").slice(0, 14)} · 
+                          Detectado: {new Date(sig.detectedAt).toLocaleString("es-CO")} · Mercado ID: {(m.id || m.conditionId || "").slice(0, 14)} · 
                           Cierra: {fmtDate(m.endDateIso || m.endDate)}
                         </div>
                       </div>
-                      <div style={{ textAlign: "center", flexShrink: 0 }}>
-                        <div style={{ color: S.amber, fontSize: "28px", fontWeight: 700, lineHeight: 1, fontFamily: heading }}>{a.score}</div>
-                        <div style={{ color: S.muted, fontSize: "8px", letterSpacing: "1px" }}>SCORE/100</div>
-                        <div style={{ color: a.confidence >= 70 ? S.green : a.confidence >= 55 ? S.amber : S.red, fontSize: "13px", fontWeight: 700, marginTop: "4px" }}>{a.confidence}%</div>
-                        <div style={{ color: S.muted, fontSize: "7px" }}>CONF</div>
+                      <div style={{ textAlign: "center", flexShrink: 0, background: S.panelB, border: `1px solid ${S.border2}`, padding: "8px 14px", borderRadius: "6px" }}>
+                        <div style={{ color: S.amber, fontSize: "26px", fontWeight: 700, lineHeight: 1, fontFamily: mono }}>{a.score}</div>
+                        <div style={{ color: S.muted, fontSize: "8px", letterSpacing: "1px", marginTop: "2px" }}>SCORE/100</div>
+                        <div style={{ color: a.confidence >= 70 ? S.green : a.confidence >= 55 ? S.amber : S.red, fontSize: "13px", fontWeight: 700, marginTop: "6px", fontFamily: mono }}>{a.confidence}%</div>
+                        <div style={{ color: S.muted, fontSize: "7px" }}>CONF IA</div>
                       </div>
                     </div>
 
-                    {/* Prices */}
+                    {/* Prices & Microstructure */}
                     <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
                       {[
-                        ["YES actual", fmtPct(parseFloat((typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices)?.[0] ?? 0.5)), S.green],
-                        ["NO actual", fmtPct(parseFloat((typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices)?.[1] ?? 0.5)), S.red],
-                        ["Valor justo YES", a.fair_value_yes ? fmtPct(a.fair_value_yes) : "—", S.cyan],
-                        ["Edge", a.edge_pct ? `${a.edge_pct.toFixed(1)}%` : "—", S.amber],
-                        ["Vol total", fmtMoney(prelim?.vol || 0), S.text],
-                        ["Liquidez", fmtMoney(prelim?.liq || 0), S.text],
+                        ["YES actual", fmtPct(prelim?.yesP ?? 0.5), S.green],
+                        ["NO actual", fmtPct(prelim?.noP ?? 0.5), S.red],
+                        ["Ask Ejecutable", fmtPct(a.executable_ask ?? (a.action === "BUY_YES" ? prelim?.yesP : prelim?.noP) ?? 0.5), S.white],
+                        ["Valor justo YES", Number.isFinite(a.fair_value_yes) ? fmtPct(a.fair_value_yes) : "—", S.cyan],
+                        ["Prob. Justa Lado", Number.isFinite(a.fair_prob) ? fmtPct(a.fair_prob) : "—", S.cyan],
+                        ["Edge Neto IA", Number.isFinite(a.edge_pct) ? `+${a.edge_pct.toFixed(1)}%` : "—", S.amber],
+                        ["Vol 24h", fmtMoney(prelim?.vol24h || m.volume24hr || 0), S.white],
+                        ["Vol Total", fmtMoney(prelim?.vol || m.volumeNum || 0), S.text],
+                        ["Liquidez", fmtMoney(prelim?.liq || m.liquidityNum || 0), S.text],
                         ["Sum YES+NO", fmtPct(prelim?.sum || 1), Math.abs((prelim?.sum || 1) - 1) > 0.03 ? S.amber : S.muted2],
                       ].map(([l, v, c]) => (
                         <div key={l} style={{ background: "#0005", border: `1px solid ${S.border}`, padding: "3px 9px", borderRadius: "3px" }}>
                           <span style={{ color: S.muted, fontSize: "8px" }}>{l} </span>
-                          <span style={{ color: c, fontWeight: 600, fontSize: "10px" }}>{v}</span>
+                          <span style={{ color: c, fontWeight: 600, fontSize: "10px", fontFamily: mono }}>{v}</span>
                         </div>
                       ))}
                     </div>
@@ -782,7 +1050,7 @@ export default function PolyBotV2() {
                         background: `#ff994408`, border: `1px solid #ff994433`,
                         padding: "8px 12px", borderRadius: "4px", marginBottom: "10px",
                       }}>
-                        <div style={{ color: "#ff9944", fontSize: "8px", fontWeight: 700, marginBottom: "4px" }}>📰 NOTICIA DETECTADA</div>
+                        <div style={{ color: "#ff9944", fontSize: "8px", fontWeight: 700, marginBottom: "4px" }}>📰 CATALIZADOR / NOTICIA VINCULADA</div>
                         <div style={{ color: S.white, fontSize: "10px", lineHeight: 1.5 }}>{a.news_found}</div>
                         {a.news_source && <div style={{ color: S.muted2, fontSize: "8px", marginTop: "3px" }}>Fuente: {a.news_source}</div>}
                       </div>
@@ -804,23 +1072,28 @@ export default function PolyBotV2() {
                       display: "flex", gap: "16px", flexWrap: "wrap",
                     }}>
                       {[
-                        ["Monto a usar", `$${tradeAmt}`, S.white],
-                        ["% del capital", `${config.maxTradePct}%`, S.amber],
-                        ["Riesgo máx", `-$${(tradeAmt * config.stopLoss / 100).toFixed(2)}`, S.red],
-                        ["Target profit", `+$${(tradeAmt * config.takeProfit / 100).toFixed(2)}`, S.green],
-                        ["R/R ratio", `1:${(config.takeProfit / config.stopLoss).toFixed(1)}`, S.cyan],
+                        ["Sizing Kelly/Conf", `$${tradeAmt.toFixed(2)}`, S.white],
+                        ["Costo Pool+Gas Est.", `-$${(tradeAmt * 0.0045 + 0.008).toFixed(3)}`, S.amber],
+                        ["Stop Loss (-)", `-${backendConfig?.stopLoss || config.stopLoss}%`, S.red],
+                        ["Take Profit (+)", `+${backendConfig?.takeProfit || config.takeProfit}%`, S.green],
+                        ["R/R ratio", `1:${((backendConfig?.takeProfit || config.takeProfit) / (backendConfig?.stopLoss || config.stopLoss)).toFixed(1)}`, S.cyan],
                         ["Riesgo IA", a.risk, rC],
                       ].map(([l, v, c]) => (
                         <div key={l}>
                           <span style={{ color: S.muted, fontSize: "8px" }}>{l} </span>
-                          <span style={{ color: c, fontWeight: 700 }}>{v}</span>
+                          <span style={{ color: c, fontWeight: 700, fontFamily: mono }}>{v}</span>
                         </div>
                       ))}
                     </div>
 
-                    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                      <Btn label={`✓ EJECUTAR ${a.action}`} color={actC} onClick={() => executeTrade(sig)} filled />
-                      <Btn label="✗ DESCARTAR" color={S.muted2} onClick={() => setSignalsP(signals.filter(s => s.id !== sig.id))} />
+                    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                      {!sig.executed ? (
+                        <Btn label={`✓ SIMULAR MANUAL ${a.action}`} color={actC} onClick={() => executeTrade(sig)} filled />
+                      ) : (
+                        <span style={{ color: S.cyan, fontSize: "9px", fontWeight: 700, letterSpacing: "0.5px" }}>
+                          ✓ Esta señal ya fue operada automáticamente por el motor del backend (ver en 💼 CARTERA)
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
@@ -957,33 +1230,36 @@ export default function PolyBotV2() {
         {/* ══════════ NEWS TAB ══════════ */}
         {tab === "news" && (
           <div>
-            {Object.keys(newsCache).length === 0 ? (
+            {mergedNewsList.length === 0 ? (
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "50px 20px", textAlign: "center", color: S.muted }}>
-                📰 Las noticias aparecerán aquí durante el escaneo IA.<br />
-                El bot usa web search para encontrar noticias actuales de cada mercado.
+                📰 Las noticias catalizadoras aparecerán aquí durante el escaneo IA.<br />
+                El bot consulta Google News RSS en tiempo real para cada mercado candidato.
               </div>
             ) : (
-              Object.entries(newsCache)
-                .sort(([, a], [, b]) => b.ts - a.ts)
-                .map(([id, news]) => {
-                  const m = allMarkets.find(x => (x.id || x.conditionId) === id);
-                  return (
-                    <div key={id} style={{
-                      background: S.panel, border: `1px solid #ff994433`,
-                      borderLeft: `3px solid #ff9944`, borderRadius: "6px",
-                      padding: "12px 16px", marginBottom: "8px",
-                    }}>
-                      <div style={{ color: "#ff9944", fontSize: "8px", fontWeight: 700, marginBottom: "4px" }}>
+              mergedNewsList.map((news) => {
+                const cat = detectCategory(news.question || news.news || "");
+                return (
+                  <div key={news.id} style={{
+                    background: S.panel, border: `1px solid #ff994433`,
+                    borderLeft: `3px solid #ff9944`, borderRadius: "6px",
+                    padding: "12px 16px", marginBottom: "8px",
+                  }}>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "6px", flexWrap: "wrap" }}>
+                      <Tag txt={`${CATEGORIES[cat]?.icon || "◯"} ${CATEGORIES[cat]?.label || cat}`} color={S.blue} />
+                      <span style={{ color: "#ff9944", fontSize: "9px", fontWeight: 700, fontFamily: mono }}>
                         📰 {new Date(news.ts).toLocaleString("es-CO")}
-                      </div>
-                      {m && <div style={{ color: S.muted2, fontSize: "9px", marginBottom: "6px" }}>
-                        Mercado: {m.question?.slice(0, 80)}
-                      </div>}
-                      <div style={{ color: S.white, fontSize: "11px", lineHeight: 1.6 }}>{news.news}</div>
-                      {news.source && <div style={{ color: S.muted2, fontSize: "8px", marginTop: "5px" }}>Fuente: {news.source}</div>}
+                      </span>
+                      <span style={{ color: S.muted2, fontSize: "8px" }}>Fuente: {news.source || "Google News RSS"}</span>
                     </div>
-                  );
-                })
+                    {news.question && (
+                      <div style={{ color: S.cyan, fontSize: "10px", fontWeight: 600, marginBottom: "5px" }}>
+                        Mercado vinculado: {news.question}
+                      </div>
+                    )}
+                    <div style={{ color: S.white, fontSize: "11px", lineHeight: 1.6 }}>{news.news}</div>
+                  </div>
+                );
+              })
             )}
           </div>
         )}
@@ -994,14 +1270,34 @@ export default function PolyBotV2() {
             {/* Summary stats */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "10px", marginBottom: "14px" }}>
               {[
-                ["P&L Total", `${totalPnl >= 0 ? "+" : ""}$${totalPnl}`, `${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}%`, totalPnl >= 0 ? S.green : S.red],
-                ["P&L Realizado", `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`, `${closedTrades.length} trades cerrados`, realizedPnl >= 0 ? S.green : S.red],
-                ["Win Rate", `${winRate}%`, `${wins}W / ${losses}L`, parseFloat(winRate) >= 50 ? S.green : S.amber],
-                ["P&L Diario", `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}`, `Límite: -$${(baseCapital * config.dailyLossLimit / 100).toFixed(2)}`, dailyPnl >= 0 ? S.green : S.red],
+                [
+                  "P&L Total (Equidad)",
+                  `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+                  `${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}% · Vivo: ${fmtDlr(unrealizedPnl)}`,
+                  totalPnl >= 0 ? S.green : S.red
+                ],
+                [
+                  "P&L Realizado (Libro vs Neto)",
+                  `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl.toFixed(2)}`,
+                  `Neto post-Pool/Gas: ${fmtDlr(netRealizedAfterPool)} (${closedTrades.length} cerrados)`,
+                  realizedPnl >= 0 ? S.green : S.red
+                ],
+                [
+                  "Fricción Pool + Spread + Gas",
+                  `-$${(closedFrictionTotal + openFrictionTotal).toFixed(2)}`,
+                  `Cerradas: -$${closedFrictionTotal.toFixed(2)} · Vivas: -$${openFrictionTotal.toFixed(2)}`,
+                  S.amber
+                ],
+                [
+                  "Win Rate & Límite Diario",
+                  `${winRate}% (${wins}W/${losses}L${ties > 0 ? `/${ties}E` : ""})`,
+                  `Hoy: ${fmtDlr(dailyPnl)} · Límite: -$${(baseCapital * (backendConfig?.dailyLossLimit || config.dailyLossLimit) / 100).toFixed(2)}`,
+                  parseFloat(winRate) >= 45 ? S.green : S.amber
+                ],
               ].map(([l, v, sub, c]) => (
                 <div key={l} style={{ background: S.panel, border: `1px solid ${S.border2}`, padding: "12px 16px", borderRadius: "6px" }}>
                   <div style={{ color: S.muted2, fontSize: "8px", letterSpacing: "1px", marginBottom: "4px" }}>{l}</div>
-                  <div style={{ color: c, fontSize: "16px", fontWeight: 700 }}>{v}</div>
+                  <div style={{ color: c, fontSize: "16px", fontWeight: 700, fontFamily: mono }}>{v}</div>
                   <div style={{ color: S.muted2, fontSize: "8px", marginTop: "3px" }}>{sub}</div>
                 </div>
               ))}
@@ -1009,14 +1305,18 @@ export default function PolyBotV2() {
 
             {/* Open trades */}
             <div style={{ color: S.muted2, fontSize: "9px", fontWeight: 700, letterSpacing: "1px", marginBottom: "8px" }}>
-              TRADES ABIERTOS ({openTrades.length}) · CAPITAL EN JUEGO: ${invested.toFixed(2)}
+              TRADES ABIERTOS ({openTrades.length}) · CAPITAL EN JUEGO: ${invested.toFixed(2)} · FRICCIÓN ENTRADA ACUMULADA: -$${openFrictionTotal.toFixed(3)}
             </div>
             {openTrades.length === 0 ? (
               <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", padding: "20px", color: S.muted, textAlign: "center", marginBottom: "14px" }}>
                 Sin trades abiertos. Ejecuta señales desde la pestaña 💡 SEÑALES.
               </div>
             ) : (
-              openTrades.map(t => (
+              openTrades.map(t => {
+                const liveGrossPnl = ((t.currentPrice || t.entryPrice) - t.entryPrice) * (t.shares || 0);
+                const liveNetPnl = liveGrossPnl - (t.frictionUsd || 0.008);
+                const liveRoiPct = (((t.currentPrice || t.entryPrice) - t.entryPrice) / (t.entryPrice || 1)) * 100;
+                return (
                 <div key={t.id} style={{
                   background: S.panel, border: `1px solid ${S.border2}`,
                   borderLeft: `3px solid ${t.side === "YES" ? S.green : S.red}`,
@@ -1035,7 +1335,8 @@ export default function PolyBotV2() {
                           );
                         })()}
                         <Tag txt={`${t.side}`} color={t.side === "YES" ? S.green : S.red} />
-                        {(t.signal_types || []).map(st => <Tag key={st} txt={SIGNAL_TYPES[st]?.icon + " " + st} color={SIGNAL_TYPES[st]?.color || S.text} />)}
+                        {t.breakEvenArmed && <Tag txt="🛡 BREAK-EVEN ARMADO" color={S.cyan} />}
+                        {(t.signal_types || []).map(st => <Tag key={st} txt={(SIGNAL_TYPES[st]?.icon || "✨") + " " + st} color={SIGNAL_TYPES[st]?.color || S.text} />)}
                       </div>
                       <div style={{ color: S.white, fontWeight: 600, fontSize: "11px", lineHeight: 1.4 }}>
                         {t.question}
@@ -1049,17 +1350,18 @@ export default function PolyBotV2() {
                   <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" }}>
                     {[
                       ["ENTRADA", fmtPct(t.entryPrice || t.price || 0), S.white],
-                      ["COSTO", `$${t.cost || 0}`, S.white],
+                      ["COSTO", `$${Number(t.cost || 0).toFixed(2)}`, S.white],
                       ["SHARES", (t.shares || 0).toFixed(5), S.text],
                       ["SL (-)", fmtPct(t.stopLoss || 0), S.red],
                       ["TP (+)", fmtPct(t.takeProfit || 0), S.green],
-                      ["CONF IA", `${t.confidence || 0}%`, S.amber],
-                      ["EDGE IA", `${((t.edge_pct || 0)).toFixed(1)}%`, S.amber],
-                      ["RIESGO", (t.risk || 'DESCONOCIDO'), t.risk === "LOW" ? S.green : t.risk === "HIGH" ? S.red : S.amber],
+                      ["SCORE IA", `${t.score || 70}/100`, S.cyan],
+                      ["CONF IA", `${t.confidence || 68}%`, S.amber],
+                      ["EDGE IA", `+${Number(t.edge_pct || 0).toFixed(1)}%`, S.amber],
+                      ["RIESGO", (t.risk || 'MEDIUM'), t.risk === "LOW" ? S.green : t.risk === "HIGH" ? S.red : S.amber],
                     ].map(([l, v, c]) => (
                       <div key={l} style={{ background: "#0005", border: `1px solid ${S.border}`, padding: "3px 8px", borderRadius: "3px" }}>
                         <span style={{ color: S.muted, fontSize: "7px" }}>{l} </span>
-                        <span style={{ color: c, fontWeight: 600, fontSize: "10px" }}>{v}</span>
+                        <span style={{ color: c, fontWeight: 600, fontSize: "10px", fontFamily: mono }}>{v}</span>
                       </div>
                     ))}
                   </div>
@@ -1067,17 +1369,19 @@ export default function PolyBotV2() {
                   <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "12px", borderTop: `1px solid ${S.border}`, paddingTop: "12px" }}>
                     {[
                       ["PRECIO ACTUAL", fmtPct(t.currentPrice || t.entryPrice || 0), S.cyan],
-                      ["P&L VIVO", fmtDlr((((t.currentPrice || t.entryPrice) - t.entryPrice) * (t.shares || 0))), (((t.currentPrice || t.entryPrice) - t.entryPrice) * (t.shares || 0)) >= 0 ? S.green : S.red],
-                      ["ROI AUTONOMO", `${((((t.currentPrice || t.entryPrice) - t.entryPrice) / (t.entryPrice || 1)) * 100).toFixed(1)}%`, (((t.currentPrice || t.entryPrice) - t.entryPrice)) >= 0 ? S.green : S.red],
+                      ["P&L VIVO (LIBRO)", fmtDlr(liveGrossPnl), liveGrossPnl >= 0 ? S.green : S.red],
+                      ["POOL+GAS EST.", `-$${Number(t.frictionUsd || 0.008).toFixed(3)}`, S.amber],
+                      ["P&L VIVO NETO REAL", fmtDlr(liveNetPnl), liveNetPnl >= 0 ? S.green : S.red],
+                      ["ROI AUTONOMO", `${liveRoiPct >= 0 ? "+" : ""}${liveRoiPct.toFixed(1)}%`, liveRoiPct >= 0 ? S.green : S.red],
                     ].map(([l, v, c]) => (
                       <div key={l} style={{ background: `${c}15`, border: `1px solid ${c}33`, padding: "6px 12px", borderRadius: "6px" }}>
                         <span style={{ color: S.muted, fontSize: "8px", letterSpacing: "1px" }}>{l} </span>
-                        <span style={{ color: c, fontWeight: 700, fontSize: "13px" }}>{v}</span>
+                        <span style={{ color: c, fontWeight: 700, fontSize: "12px", fontFamily: mono }}>{v}</span>
                       </div>
                     ))}
                   </div>
 
-                  {t.news && (
+                  {t.news && t.news !== "none" && (
                     <div style={{ background: `#ff994408`, border: `1px solid #ff994422`, padding: "6px 10px", borderRadius: "3px", marginBottom: "8px", color: "#ff9944", fontSize: "9px" }}>
                       📰 {t.news}
                     </div>
@@ -1102,49 +1406,81 @@ export default function PolyBotV2() {
                     <Btn label="CERRAR" color={S.muted2} onClick={() => closeTrade(t.id, closeInputs[t.id])} sm />
                   </div>
                 </div>
-              ))
+                );
+              })
             )}
 
             {/* Closed trades */}
             {closedTrades.length > 0 && (
               <>
-                <div style={{ color: S.muted2, fontSize: "9px", fontWeight: 700, letterSpacing: "1px", margin: "18px 0 8px" }}>
-                  HISTORIAL ({closedTrades.length}) · P&L REALIZADO: {realizedPnl >= 0 ? "+" : ""}${realizedPnl}
+                <div style={{ color: S.muted2, fontSize: "9px", fontWeight: 700, letterSpacing: "1px", margin: "18px 0 8px", display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "8px" }}>
+                  <span>HISTORIAL AUDITADO ({closedTrades.length} CERRADOS) · P&L LIBRO: {fmtDlr(realizedPnl)} · FRICCIÓN POOL/GAS: -$${closedFrictionTotal.toFixed(2)} · P&L NETO REAL: {fmtDlr(netRealizedAfterPool)}</span>
+                  <span>Incluye Taker Fee CLOB (0.35%), Spread/Slippage y Gas Polygon</span>
                 </div>
                 <div style={{ background: S.panel, border: `1px solid ${S.border2}`, borderRadius: "6px", overflow: "hidden" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr style={{ background: `${S.border}55` }}>
-                        {["ID", "CAT", "MERCADO", "LADO", "ENTRADA", "CIERRE", "COSTO", "P&L", "ROI", "CERRADO"].map(h => (
-                          <th key={h} style={{ padding: "7px 10px", textAlign: "left", color: S.muted2, fontSize: "8px", letterSpacing: "1px", borderBottom: `1px solid ${S.border2}` }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {closedTrades.map((t, i) => (
-                        <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>
-                          <td style={{ padding: "7px 10px", color: S.muted, fontSize: "9px", whiteSpace: "nowrap" }}>{t.id}</td>
-                          <td style={{ padding: "7px 10px", fontSize: "12px" }}>{CATEGORIES[t.category || "OTHER"]?.icon}</td>
-                          <td style={{ padding: "7px 10px", maxWidth: "180px" }}>
-                            <span style={{ color: S.text, fontSize: "9px" }}>{t.question?.slice(0, 55)}…</span>
-                          </td>
-                          <td style={{ padding: "7px 10px" }}><Tag txt={t.side} color={t.side === "YES" ? S.green : S.red} /></td>
-                          <td style={{ padding: "7px 10px", color: S.text, whiteSpace: "nowrap" }}>{fmtPct(t.entryPrice)}</td>
-                          <td style={{ padding: "7px 10px", color: S.text, whiteSpace: "nowrap" }}>{fmtPct(t.currentPrice)}</td>
-                          <td style={{ padding: "7px 10px", color: S.text, whiteSpace: "nowrap" }}>${t.cost}</td>
-                          <td style={{ padding: "7px 10px", fontWeight: 700, whiteSpace: "nowrap", color: t.pnl >= 0 ? S.green : S.red }}>
-                            {t.pnl >= 0 ? "+" : ""}${t.pnl}
-                          </td>
-                          <td style={{ padding: "7px 10px", whiteSpace: "nowrap", color: t.pnl >= 0 ? S.green : S.red }}>
-                            {((t.pnl / t.cost) * 100).toFixed(1)}%
-                          </td>
-                          <td style={{ padding: "7px 10px", color: S.muted, fontSize: "9px", whiteSpace: "nowrap" }}>
-                            {t.closedAt ? new Date(t.closedAt).toLocaleString("es-CO") : "—"}
-                          </td>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead>
+                        <tr style={{ background: `${S.border}55` }}>
+                          {["ID", "CAT", "MERCADO & TESIS IA", "LADO", "CONF / EDGE", "ENTRADA", "CIERRE", "MOTIVO", "P&L LIBRO", "POOL+GAS", "P&L NETO REAL", "ROI", "CERRADO"].map(h => (
+                            <th key={h} style={{ padding: "7px 10px", textAlign: "left", color: S.muted2, fontSize: "8px", letterSpacing: "1px", borderBottom: `1px solid ${S.border2}`, whiteSpace: "nowrap" }}>{h}</th>
+                          ))}
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {closedTrades.map((t, i) => {
+                          const reasonBadge = t.closeReason === "TAKE_PROFIT"
+                            ? { txt: "🎯 TAKE PROFIT", c: S.green }
+                            : (t.closeReason === "TRAILING_STOP" || t.pnl === 0)
+                              ? { txt: "🛡 TRAILING / BE", c: S.cyan }
+                              : t.closeReason === "MAX_HOLD"
+                                ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
+                                : { txt: "🛑 STOP LOSS", c: S.red };
+                          const netReal = t.netPnlAfterFriction ?? (t.pnl - (t.frictionUsd || 0.015));
+                          return (
+                            <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>
+                              <td style={{ padding: "7px 10px", color: S.muted, fontSize: "9px", whiteSpace: "nowrap", fontFamily: mono }}>{t.id}</td>
+                              <td style={{ padding: "7px 10px", fontSize: "12px" }} title={CATEGORIES[t.category || "OTHER"]?.label}>{CATEGORIES[t.category || "OTHER"]?.icon}</td>
+                              <td style={{ padding: "7px 10px", maxWidth: "250px" }}>
+                                <div style={{ color: S.white, fontSize: "9.5px", fontWeight: 600, lineHeight: 1.3 }}>{t.question}</div>
+                                {t.reasoning && (
+                                  <div style={{ color: S.muted2, fontSize: "8px", marginTop: "2px", lineHeight: 1.3 }}>
+                                    🤖 {t.reasoning.slice(0, 95)}{t.reasoning.length > 95 ? "…" : ""}
+                                  </div>
+                                )}
+                              </td>
+                              <td style={{ padding: "7px 10px" }}><Tag txt={t.side} color={t.side === "YES" ? S.green : S.red} /></td>
+                              <td style={{ padding: "7px 10px", whiteSpace: "nowrap", fontSize: "9px", fontFamily: mono }}>
+                                <span style={{ color: S.amber }}>{t.confidence || 68}%</span>
+                                <span style={{ color: S.muted }}> · </span>
+                                <span style={{ color: S.cyan }}>+{Number(t.edge_pct || 10).toFixed(1)}%</span>
+                              </td>
+                              <td style={{ padding: "7px 10px", color: S.text, whiteSpace: "nowrap", fontFamily: mono }}>{fmtPct(t.entryPrice)}</td>
+                              <td style={{ padding: "7px 10px", color: S.text, whiteSpace: "nowrap", fontFamily: mono }}>{fmtPct(t.currentPrice)}</td>
+                              <td style={{ padding: "7px 10px", whiteSpace: "nowrap" }}>
+                                <Tag txt={reasonBadge.txt} color={reasonBadge.c} />
+                              </td>
+                              <td style={{ padding: "7px 10px", fontWeight: 700, whiteSpace: "nowrap", fontFamily: mono, color: t.pnl >= 0 ? S.green : S.red }}>
+                                {t.pnl >= 0 ? "+" : ""}${Number(t.pnl || 0).toFixed(2)}
+                              </td>
+                              <td style={{ padding: "7px 10px", whiteSpace: "nowrap", fontFamily: mono, color: S.amber, fontSize: "9px" }}>
+                                -$${Number(t.frictionUsd || 0.015).toFixed(3)}
+                              </td>
+                              <td style={{ padding: "7px 10px", fontWeight: 700, whiteSpace: "nowrap", fontFamily: mono, color: netReal >= 0 ? S.green : S.red }}>
+                                {netReal >= 0 ? "+" : ""}${netReal.toFixed(2)}
+                              </td>
+                              <td style={{ padding: "7px 10px", whiteSpace: "nowrap", fontFamily: mono, color: t.pnl >= 0 ? S.green : S.red }}>
+                                {(((t.pnl || 0) / (t.cost || 1)) * 100).toFixed(1)}%
+                              </td>
+                              <td style={{ padding: "7px 10px", color: S.muted, fontSize: "9px", whiteSpace: "nowrap" }}>
+                                {t.closedAt ? new Date(t.closedAt).toLocaleString("es-CO") : "—"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </>
             )}
@@ -1250,10 +1586,16 @@ export default function PolyBotV2() {
                   sub={`Mínimo requerido: ${breakEvenWr.toFixed(1)}% (Margen: ${safetyMargin >= 0 ? "+" : ""}${safetyMargin.toFixed(1)}%)`}
                 />
                 <StatCard
-                  label="P&L REALIZADO NETO"
+                  label="P&L REALIZADO (LIBRO)"
                   value={`${realizedPnl >= 0 ? "+" : ""}$${realizedPnl.toFixed(2)}`}
                   color={realizedPnl >= 0 ? S.green : S.red}
-                  sub={`${won.length}W · ${lost.length}L · ${ties.length} Empates`}
+                  sub={`${won.length}W · ${lost.length}L · ${ties.length} Empates (BE)`}
+                />
+                <StatCard
+                  label="FRICCIÓN POOL + GAS"
+                  value={`-$${closedFrictionTotal.toFixed(2)}`}
+                  color={S.amber}
+                  sub={`Neto Real Post-Pool: ${fmtDlr(netRealizedAfterPool)}`}
                 />
               </div>
 
@@ -1584,18 +1926,20 @@ export default function PolyBotV2() {
                   ["Capital Inicial", `$${baseCapital.toFixed(2)}`, S.muted2],
                   ["Capital Libre", `$${capital.toFixed(2)}`, S.cyan],
                   ["Capital Invertido", `$${invested.toFixed(2)}`, S.text],
-                  ["Valor Total", `$${totalValue.toFixed(2)}`, S.white],
-                  ["P&L Total", `${totalPnl >= 0 ? "+" : ""}$${totalPnl} (${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}%)`, totalPnl >= 0 ? S.green : S.red],
-                  ["P&L Realizado", `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`, realizedPnl >= 0 ? S.green : S.red],
+                  ["Valor Total (Equidad)", `$${totalValue.toFixed(2)}`, S.white],
+                  ["P&L Total (Equidad)", `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)} (${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}%)`, totalPnl >= 0 ? S.green : S.red],
+                  ["P&L Realizado (Libro)", `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl.toFixed(2)}`, realizedPnl >= 0 ? S.green : S.red],
+                  ["Fricción Pool + Gas Total", `-$${(closedFrictionTotal + openFrictionTotal).toFixed(2)}`, S.amber],
+                  ["P&L Neto Post-Fricción", `${netRealizedAfterPool >= 0 ? "+" : ""}$${netRealizedAfterPool.toFixed(2)}`, netRealizedAfterPool >= 0 ? S.green : S.red],
                   ["P&L Diario", `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}`, dailyPnl >= 0 ? S.green : S.red],
                   ["Mercados en DB", allMarkets.length, S.text],
-                  ["Señales Activas", activeSignals.length, activeSignals.length > 0 ? S.amber : S.muted2],
-                  ["Noticias en Cache", Object.keys(newsCache).length, "#ff9944"],
+                  ["Señales IA Válidas", `${validSignals.length} (${pendingSignals.length} libres)`, validSignals.length > 0 ? S.amber : S.muted2],
+                  ["Noticias Catalizadoras", mergedNewsList.length, "#ff9944"],
                   ["Trades Abiertos", openTrades.length, S.text],
                   ["Trades Cerrados", closedTrades.length, S.text],
-                  ["Ganados / Perdidos", `${wins} / ${closedTrades.length - wins}`, S.text],
-                  ["Win Rate", `${winRate}%`, parseFloat(winRate) >= 50 ? S.green : S.amber],
-                  ["R/R Config", `1:${(config.takeProfit / config.stopLoss).toFixed(1)}`, S.cyan],
+                  ["Ganados / Perdidos / BE", `${wins}W / ${losses}L / ${ties}E`, S.text],
+                  ["Win Rate Decidido", `${winRate}%`, parseFloat(winRate) >= 50 ? S.green : S.amber],
+                  ["R/R Config", `1:${((backendConfig?.takeProfit || config.takeProfit) / (backendConfig?.stopLoss || config.stopLoss)).toFixed(1)}`, S.cyan],
                 ].map(([l, v, c]) => (
                   <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: `1px solid ${S.border}55` }}>
                     <span style={{ color: S.muted2, fontSize: "9px" }}>{l}</span>

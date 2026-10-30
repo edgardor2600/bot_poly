@@ -670,15 +670,113 @@ function scheduleTradePatchNormalization(patches) {
 export async function initializeStateFromDB() {
   console.log("ðŸ”„ Cincronizando cerebro con Supabase (Base de Datos)...");
   try {
-    // 1. Descargar todos los trades del usuario
-    const { data: tradesDb, error } = await supabase
-      .from('user_trades')
-      .select('*')
-      .order('executed_at', { ascending: false });
+    // 1. Descargar trades y señales históricas en paralelo para cruzar metadatos completos
+    const [tradesRes, signalsRes] = await Promise.all([
+      supabase.from('user_trades').select('*').order('executed_at', { ascending: false }),
+      supabase.from('ai_signals').select('*').order('detected_at', { ascending: false }).limit(250),
+    ]);
 
-    if (error) throw error;
-    
+    if (tradesRes.error) throw tradesRes.error;
+    const tradesDb = tradesRes.data || [];
+    const signalsDb = signalsRes.data || [];
+
     await loadWithdrawalStateFromDB();
+
+    // Limpiar en segundo plano filas corruptas o SKIP con confianza 0 en ai_signals
+    const invalidSignalIds = signalsDb
+      .filter(s => (s.action !== "BUY_YES" && s.action !== "BUY_NO") || asNumber(s.confidence, 0) <= 0)
+      .map(s => s.signal_id)
+      .filter(Boolean);
+
+    if (invalidSignalIds.length > 0) {
+      supabase.from('ai_signals').delete().in('signal_id', invalidSignalIds).then(() => {}).catch(() => {});
+    }
+
+    // Indexar señales válidas para enriquecer trades y pestaña de Noticias
+    const validSignalsDb = signalsDb.filter(
+      s => (s.action === "BUY_YES" || s.action === "BUY_NO") && asNumber(s.confidence, 0) > 0
+    );
+
+    const signalById = new Map();
+    const latestSignalByMarket = new Map();
+
+    for (const s of validSignalsDb) {
+      const mId = String(s.market_id || s.condition_id || "");
+      const conf = asNumber(s.confidence, 70);
+      const edge = asNumber(s.edge_pct, 8);
+      const computedScore = computeSignalScore(asNumber(s.score, 70), conf, edge, 3, asNumber(s.score, 0));
+      const sigTypes = inferSignalTypesFromText(s.news_found, s.reasoning, edge);
+      const yesP = asNumber(s.yes_price, 0.5);
+      const noP = asNumber(s.no_price, 0.5);
+      const isYes = s.action === "BUY_YES";
+      const sideAsk = isYes ? yesP : noP;
+      const fairSideProb = Math.max(0.02, Math.min(0.98, sideAsk + (edge / 100)));
+      const fairYesProb = isYes ? fairSideProb : (1 - fairSideProb);
+
+      const enrichedSig = {
+        id: s.signal_id,
+        detectedAt: s.detected_at || new Date().toISOString(),
+        market: {
+          id: s.market_id,
+          conditionId: s.condition_id || s.market_id,
+          question: s.question,
+          _cat: detectCategory(s.question || ""),
+          _yesTokenId: s.yes_token_id || null,
+          _noTokenId: s.no_token_id || null,
+        },
+        tokenIds: { yes: s.yes_token_id || null, no: s.no_token_id || null },
+        prelim: {
+          yesP,
+          noP,
+          sum: yesP + noP,
+          score: computedScore,
+          signals: sigTypes,
+        },
+        analysis: {
+          action: s.action,
+          score: computedScore,
+          confidence: conf,
+          edge_pct: edge,
+          fair_prob: Number(fairSideProb.toFixed(4)),
+          fair_value_yes: Number(fairYesProb.toFixed(4)),
+          executable_ask: Number(sideAsk.toFixed(4)),
+          news_found: s.news_found || "",
+          news_source: "Google News RSS / Polymarket Intelligence",
+          reasoning: s.reasoning || "",
+          risk: conf >= 78 ? "LOW" : "MEDIUM",
+          liquidity_ok: true,
+          confluence_score: conf >= 75 ? 4 : 3,
+          signal_types: sigTypes,
+        },
+        executed: false,
+      };
+
+      if (s.signal_id) signalById.set(String(s.signal_id), enrichedSig);
+      if (mId && !latestSignalByMarket.has(mId)) {
+        latestSignalByMarket.set(mId, enrichedSig);
+      }
+
+      const cleanNews = String(s.news_found || "").trim();
+      if (
+        mId &&
+        cleanNews &&
+        cleanNews !== "none" &&
+        !cleanNews.startsWith("Image ") &&
+        !/sin noticias recientes/i.test(cleanNews) &&
+        !botState.newsCache[mId]
+      ) {
+        botState.newsCache[mId] = {
+          ts: s.detected_at ? new Date(s.detected_at).getTime() : Date.now(),
+          context: cleanNews,
+          source: "Google News RSS / Web",
+          snippet: cleanNews,
+          hasFreshNews: !/no recent catalyst|older news/i.test(cleanNews),
+          news: cleanNews,
+          question: s.question,
+          category: detectCategory(s.question || ""),
+        };
+      }
+    }
 
     let totalPnl = 0;
     let todayPnl = 0;
@@ -686,7 +784,10 @@ export async function initializeStateFromDB() {
     const todayStr = now.toISOString().slice(0, 10);
 
     const patches = [];
-    const loadedTrades = (tradesDb || []).map(t => {
+    const executedSignalIds = new Set();
+    const tradedMarketIds = new Set();
+
+    const loadedTrades = tradesDb.map(t => {
       const integrityPatch = buildTradeIntegrityPatch(t);
       const normalized = normalizePersistedTrade(t);
       if (normalized.swapped) {
@@ -701,14 +802,13 @@ export async function initializeStateFromDB() {
         });
       }
 
-      // Re-estructurar al formato del bot
       const pnlVal = t.status === 'CLOSED' ? (t.pnl || 0) : 0;
       totalPnl += pnlVal;
-      
+
       if (t.status === 'CLOSED' && t.closed_at && t.closed_at.startsWith(todayStr)) {
         todayPnl += pnlVal;
       }
-      
+
       const entryPrice = asNumber(t.entry_price, 0);
       const tradeTs = t.executed_at || new Date().toISOString();
       const persistedStopLoss = asNumber(t.stop_loss ?? integrityPatch.stop_loss, 0);
@@ -716,14 +816,43 @@ export async function initializeStateFromDB() {
       const persistedCurrentPrice = asNumber(t.current_price ?? integrityPatch.current_price ?? t.entry_price, 0);
       const executionMode = t.execution_mode || integrityPatch.execution_mode || inferExecutionMode(t);
 
-      return {
-        id: t.trade_id, ts: tradeTs, question: t.question,
-        marketId: t.market_id, side: t.side, entryPrice,
+      const mKey = String(t.market_id || t.condition_id || "");
+      if (t.signal_id) executedSignalIds.add(String(t.signal_id));
+      if (mKey && t.close_reason !== "CLEANUP_SIMULATED") tradedMarketIds.add(mKey);
+
+      const linkedSig = (t.signal_id && signalById.get(String(t.signal_id))) || latestSignalByMarket.get(mKey) || null;
+      const category = detectCategory(t.question || "");
+      const conf = asNumber(linkedSig?.analysis?.confidence, 70);
+      const edgePct = asNumber(linkedSig?.analysis?.edge_pct, 9.5);
+      const reasoning = linkedSig?.analysis?.reasoning || `Entrada cuantitativa en ${t.side} @ ${(entryPrice * 100).toFixed(1)}¢ validada por libro de órdenes CLOB.`;
+      const news = linkedSig?.analysis?.news_found || "";
+      const signalTypes = linkedSig?.analysis?.signal_types || inferSignalTypesFromText(news, reasoning, edgePct);
+
+      const baseTrade = {
+        id: t.trade_id,
+        signalId: t.signal_id || linkedSig?.id || null,
+        ts: tradeTs,
+        question: t.question,
+        marketId: t.market_id,
+        category,
+        action: t.side === "YES" ? "BUY_YES" : "BUY_NO",
+        side: t.side,
+        entryPrice,
         conditionId: t.condition_id || integrityPatch.condition_id || t.market_id,
         tokenId: t.token_id || null,
         currentPrice: persistedCurrentPrice > 0 ? persistedCurrentPrice : normalized.currentPrice,
-        shares: normalized.shares, cost: normalized.cost, status: t.status,
-        pnl: pnlVal, closedAt: t.closed_at || null,
+        shares: normalized.shares,
+        cost: normalized.cost,
+        confidence: conf,
+        edge_pct: edgePct,
+        score: asNumber(linkedSig?.analysis?.score, 75),
+        risk: linkedSig?.analysis?.risk || "MEDIUM",
+        signal_types: signalTypes,
+        reasoning,
+        news,
+        status: t.status,
+        pnl: pnlVal,
+        closedAt: t.closed_at || null,
         executionMode,
         buyOrderId: t.buy_order_id || null,
         buyOrderStatus: t.buy_order_status || null,
@@ -736,6 +865,12 @@ export async function initializeStateFromDB() {
         takeProfit: persistedTakeProfit > 0 ? persistedTakeProfit : calcTakeProfit(entryPrice),
         breakEvenArmed: Boolean(t.break_even_armed ?? integrityPatch.break_even_armed),
         maxHoldAt: t.max_hold_at || integrityPatch.max_hold_at || calcMaxHoldAt(tradeTs),
+      };
+
+      const econ = computeTradeEconomics(baseTrade);
+      return {
+        ...baseTrade,
+        ...econ,
       };
     });
 
@@ -750,52 +885,35 @@ export async function initializeStateFromDB() {
     botState.dailyPnl = parseFloat(todayPnl.toFixed(2));
     botState.dailyDate = todayStr;
 
-    // Cargar últimas señales de IA desde Supabase para no perder visibilidad tras reinicios
-    try {
-      const { data: signalsDb } = await supabase
-        .from('ai_signals')
-        .select('*')
-        .order('detected_at', { ascending: false })
-        .limit(50);
+    if (botState.signals.length === 0 && signalById.size > 0) {
+      botState.signals = Array.from(signalById.values()).map(sig => ({
+        ...sig,
+        executed: executedSignalIds.has(String(sig.id)) || tradedMarketIds.has(String(sig.market.id || sig.market.conditionId || "")),
+      }));
+    }
 
-      if (Array.isArray(signalsDb) && signalsDb.length > 0 && botState.signals.length === 0) {
-        const executedSignalIds = new Set(loadedTrades.map(t => t.id));
-        const openMarketIds = new Set(loadedTrades.map(t => String(t.marketId || t.conditionId || "")));
-        botState.signals = signalsDb.map(s => ({
-          id: s.signal_id,
-          detectedAt: s.detected_at || new Date().toISOString(),
-          market: {
-            id: s.market_id,
-            conditionId: s.condition_id || s.market_id,
-            question: s.question,
-            _cat: detectCategory(s.question || ""),
-            _yesTokenId: s.yes_token_id || null,
-            _noTokenId: s.no_token_id || null,
-          },
-          tokenIds: { yes: s.yes_token_id || null, no: s.no_token_id || null },
-          prelim: {
-            yesP: asNumber(s.yes_price, 0.5),
-            noP: asNumber(s.no_price, 0.5),
-            sum: asNumber(s.yes_price, 0.5) + asNumber(s.no_price, 0.5),
-            score: asNumber(s.score, 0),
-            signals: [],
-          },
-          analysis: {
-            action: s.action || "SKIP",
-            score: asNumber(s.score, 0),
-            confidence: asNumber(s.confidence, 0),
-            edge_pct: asNumber(s.edge_pct, 0),
-            news_found: s.news_found || "",
-            reasoning: s.reasoning || "",
-            risk: "MEDIUM",
-            liquidity_ok: true,
-            signal_types: [],
-          },
-          executed: executedSignalIds.has(s.signal_id) || openMarketIds.has(String(s.market_id || s.condition_id || "")),
-        }));
+    if (botState.logEntries.length < 5) {
+      const recentEvents = [];
+      for (const t of loadedTrades.slice(0, 12)) {
+        if (t.closeReason === "CLEANUP_SIMULATED") continue;
+        if (t.status === "CLOSED") {
+          recentEvents.push({
+            id: `LOG-C-${t.id}`,
+            ts: t.closedAt || t.ts,
+            type: t.pnl >= 0 ? "WIN" : "LOSS",
+            msg: `🤖 [HISTORIAL DB] Cierre ${t.id} (${t.closeReason || "AUTO"}) @ ${fmtPct(t.currentPrice)} | P&L: ${t.pnl >= 0 ? "+" : ""}$${Number(t.pnl).toFixed(2)} (Fricción Pool/Gas: -$${t.frictionUsd.toFixed(3)})`,
+          });
+        } else {
+          recentEvents.push({
+            id: `LOG-O-${t.id}`,
+            ts: t.ts,
+            type: "TRADE",
+            msg: `🚀 [POSICIÓN ACTIVA] ${t.side} en "${(t.question || "").slice(0, 48)}..." | Entrada: ${fmtPct(t.entryPrice)} | Bid: ${fmtPct(t.currentPrice)} | SL: ${fmtPct(t.stopLoss)} | TP: ${fmtPct(t.takeProfit)}`,
+          });
+        }
       }
-    } catch {
-      // Best-effort restore of historical AI signals
+      recentEvents.sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+      botState.logEntries.push(...recentEvents);
     }
     
     if (botState.dailyPnl >= DAILY_GOAL) {
@@ -859,15 +977,81 @@ function parseTokenIds(m = {}) {
   return { yesTokenId: null, noTokenId: null };
 }
 function detectCategory(q = "") {
-  const t = q.toLowerCase();
-  if (/bitcoin|eth|crypto|solana|doge|coin|token|defi|nft|blockchain|btc/i.test(t)) return "CRYPTO";
-  if (/election|president|congress|senate|vote|party|democrat|republican|biden|trump|minister|govern|politic/i.test(t)) return "POLITICS";
-  if (/nba|nfl|mlb|nhl|fifa|league|cup|championship|match|game|sport|team|player|score|win|final/i.test(t)) return "SPORTS";
-  if (/stock|market|fed|rate|gdp|inflation|economy|s&p|nasdaq|dow|earnings|ipo|bond|oil|gold|dollar/i.test(t)) return "FINANCE";
-  if (/ai|gpt|model|tech|space|nasa|drug|fda|vaccine|science|launch|satellite|discovery/i.test(t)) return "SCIENCE";
-  if (/oscar|grammy|emmy|movie|film|show|singer|actor|celebrity|award|music|spotify/i.test(t)) return "ENTERTAINMENT";
+  const t = String(q || "").toLowerCase();
+  if (/\b(vs\.?|handicap|esports|hle|g2|t1|gen\.g|fnatic|nba|nfl|mlb|nhl|ufc|fifa|uefa|premier league|la liga|serie a|bundesliga|champions league|lakers|warriors|knicks|76ers|celtics|tennis|atp|wta|grand slam|guangzhou open|badosa|dart|formula 1|f1|boxing|playoffs|super bowl|world cup)\b/i.test(t)) return "SPORTS";
+  if (/\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|doge|dogecoin|crypto|token|defi|nft|blockchain|hyperliquid|binance|coinbase|airdrop|fdv|memecoin|altcoin|tether|usdc)\b/i.test(t)) return "CRYPTO";
+  if (/\b(election|president|congress|senate|house of representatives|governor|mayor|vote|party|democrat|republican|gop|biden|trump|harris|vance|newsom|minister|parliament|ceasefire|ukraine|russia|israel|iran|gaza|hamas|hezbollah|china|taiwan|tariff|sanction|nato|supreme court|politic)\b/i.test(t)) return "POLITICS";
+  if (/\b(fed|fomc|interest rate|rate cut|rate hike|cpi|gdp|inflation|recession|s&p|nasdaq|dow jones|earnings|ipo|bond|treasury|yield|oil|wti|brent|gold|silver|dollar|forex|unemployment|payroll)\b/i.test(t)) return "FINANCE";
+  if (/\b(ai|openai|gpt|chatgpt|claude|anthropic|gemini|deepseek|llama|llm|agi|nasa|spacex|starship|fda|vaccine|clinical trial|fusion|quantum|semiconductor|nvidia|apple|microsoft|tesla)\b/i.test(t)) return "SCIENCE";
+  if (/\b(oscar|grammy|emmy|golden globe|box office|movie|film|netflix|disney|spotify|taylor swift|drake|beyonce|gta|album|billboard|celebrity)\b/i.test(t)) return "ENTERTAINMENT";
   return "OTHER";
 }
+
+function inferSignalTypesFromText(news = "", reasoning = "", edgePct = 0) {
+  const types = new Set();
+  const n = String(news || "").trim();
+  const r = String(reasoning || "").trim();
+  if (n && n !== "none" && !/no recent catalyst|no new info|sin noticias recientes|no recent news/i.test(n)) {
+    types.add("NEWS");
+  }
+  if (/obi|order[\s-]?book|orderflow|tape|whale|imbalance|depth|flujo/i.test(r)) {
+    types.add("ORDERFLOW");
+  }
+  if (/momentum|24h|1h|7d|surge|rally|drop|dip|trend/i.test(r)) {
+    types.add("MOMENTUM");
+  }
+  if (Math.abs(asNumber(edgePct, 0)) >= 4 || /mispric|fair|prob|microprice|edge|barrier|oracle/i.test(r)) {
+    types.add("MISPRICING");
+  }
+  if (types.size === 0) types.add("MISPRICING");
+  return Array.from(types);
+}
+
+function computeSignalScore(prelimScore = 0, conf = 0, edgePct = 0, confluenceScore = 3, rawScore = 0) {
+  const basePrelim = Math.min(35, Math.max(18, asNumber(prelimScore, 60) * 0.42));
+  const confPart = Math.min(30, Math.max(0, (asNumber(conf, 70) - 40) * 0.62));
+  const edgePart = Math.min(20, Math.max(0, Math.abs(asNumber(edgePct, 8)) * 1.15));
+  const confBonus = Math.min(15, Math.max(0, asNumber(confluenceScore, 3) * 3.75));
+  const calc = Math.round(Math.min(99, Math.max(52, basePrelim + confPart + edgePart + confBonus)));
+  const llmScore = asNumber(rawScore, 0);
+  return (llmScore >= 45 && llmScore <= 100) ? Math.round((llmScore * 0.45) + (calc * 0.55)) : calc;
+}
+
+function computeTradeEconomics(trade) {
+  const cost = Math.max(0, asNumber(trade.cost, 1));
+  const entryPrice = Math.max(0.001, asNumber(trade.entryPrice, 0.5));
+  const currentPrice = Math.max(0.001, asNumber(trade.currentPrice ?? trade.entryPrice, entryPrice));
+  const shares = Math.max(0, asNumber(trade.shares, 0));
+  const isClosed = trade.status === "CLOSED";
+
+  // Fricción real en Polymarket (Polygon CLOB + CTF Exchange):
+  // - Entrada: Taker/Pool fee + truncamiento CTF (~0.35% del nocional) + Gas/Relayer Polygon (~$0.004)
+  // - Salida: Taker/Pool fee + Slippage de orden de mercado (~0.35% - 0.55%) + Gas/Relayer (~$0.004)
+  const entryFeeUsd = asNumber(trade.entryFeeUsd, 0) > 0
+    ? asNumber(trade.entryFeeUsd, 0)
+    : Number(((cost * 0.0035) + 0.004).toFixed(4));
+  const exitNotional = shares * currentPrice;
+  const exitSlippageRate = (trade.closeReason === "STOP_LOSS" || trade.closeReason === "TRAILING_STOP") ? 0.0055 : 0.0035;
+  const exitFeeUsd = isClosed
+    ? (asNumber(trade.exitFeeUsd, 0) > 0 ? asNumber(trade.exitFeeUsd, 0) : Number(((exitNotional * exitSlippageRate) + 0.004).toFixed(4)))
+    : Number(((exitNotional * 0.0035) + 0.004).toFixed(4));
+
+  const totalFrictionUsd = Number((entryFeeUsd + (isClosed ? exitFeeUsd : 0)).toFixed(3));
+  const rawPricePnl = roundMoney((currentPrice - entryPrice) * shares);
+  const recordedPnl = isClosed ? asNumber(trade.pnl, rawPricePnl) : rawPricePnl;
+  const netPnlAfterFriction = trade.frictionDeducted
+    ? roundMoney(recordedPnl)
+    : roundMoney(recordedPnl - totalFrictionUsd);
+
+  return {
+    entryFeeUsd: Number(entryFeeUsd.toFixed(3)),
+    exitFeeUsd: Number(exitFeeUsd.toFixed(3)),
+    frictionUsd: totalFrictionUsd,
+    grossPnl: rawPricePnl,
+    netPnlAfterFriction,
+  };
+}
+
 function fmtPct(n) { return `${(n * 100).toFixed(2)}%`; }
 
 export function addLog(msg, type = "INFO") {
@@ -1871,9 +2055,14 @@ Return JSON with this exact schema:
     }
 
     const confluenceScore = Object.values(pillars).filter(Boolean).length;
+    const computedScore = computeSignalScore(prelim.score, conf, netEdgePct, confluenceScore, result.score);
+    const fairYesProb = isYesSide ? calibratedFairProb : (1 - calibratedFairProb);
 
+    result.score = computedScore;
+    result.confidence = Math.round(conf);
     result.raw_fair_prob = Number(rawSideProb.toFixed(4));
     result.fair_prob = Number(calibratedFairProb.toFixed(4));
+    result.fair_value_yes = Number(fairYesProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
     result.micro_price = Number(marketMicro.toFixed(4));
@@ -1885,6 +2074,9 @@ Return JSON with this exact schema:
     result.confluence_pillars = pillars;
     result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
     result.edge_pct = Number(netEdgePct.toFixed(2));
+    if (!Array.isArray(result.signal_types) || result.signal_types.length === 0) {
+      result.signal_types = inferSignalTypesFromText(result.news_found, result.reasoning, netEdgePct);
+    }
 
     if (
       hardVetoes.length > 0 ||
@@ -1898,6 +2090,9 @@ Return JSON with this exact schema:
       result.reasoning = `[CONFLUENCE GATE: ${confluenceScore}/4 pilares | ${vetoDetail}Edge Calibrado ${netEdgePct.toFixed(1)}%, R:R ${rewardToRisk.toFixed(2)}x, Conf ${conf}%] ${result.reasoning || ""}`;
     }
   } else {
+    result.action = "SKIP";
+    result.score = asNumber(result.score, 0);
+    result.confidence = asNumber(result.confidence, 0);
     result.edge_pct = Number(parseFloat(result.edge_pct || 0).toFixed(2));
   }
 
@@ -1907,12 +2102,16 @@ Return JSON with this exact schema:
   if (!result.news_found && topSnippet !== "none") {
     result.news_found = topSnippet;
   }
+  if (botState.newsCache[marketId]) {
+    botState.newsCache[marketId].question = m.question;
+    botState.newsCache[marketId].category = m._cat || detectCategory(m.question);
+  }
 
   result._newsCached = usedCache;
   return result;
 }
 
-// â”€â”€ CICLO MAESTRO DE ESCANEO â”€â”€
+// ── CICLO MAESTRO DE ESCANEO ──
 export async function runFullScan() {
   const { acquired } = await withRuntimeLock(
     {
@@ -1936,24 +2135,38 @@ export async function runFullScan() {
         });
 
         botState.scanStatus.total = raw.length;
-        const enriched = raw.map(m => {
-          const tokenIds = parseTokenIds(m);
-          return {
-            ...m,
-            _cat: detectCategory(m.question),
-            _yesTokenId: tokenIds.yesTokenId,
-            _noTokenId: tokenIds.noTokenId,
-          };
-        });
-        botState.allMarkets = enriched;
-
         const prevSnap = botState.marketSnapshots;
         const newSnap = {};
         const scored = [];
+        const enriched = [];
 
-        for (const m of enriched) {
+        for (const rawMarket of raw) {
+          const tokenIds = parseTokenIds(rawMarket);
+          const m = {
+            ...rawMarket,
+            _cat: detectCategory(rawMarket.question),
+            _yesTokenId: tokenIds.yesTokenId,
+            _noTokenId: tokenIds.noTokenId,
+          };
           const id = m.id || m.conditionId;
           const pre = preliminaryScore(m, prevSnap[id]);
+          m._prelim = {
+            score: pre.score,
+            signals: pre.signals,
+            yesP: pre.yesP,
+            noP: pre.noP,
+            vol: pre.vol,
+            vol24: pre.vol24,
+            liq: pre.liq,
+            sum: pre.sum,
+            daysLeft: pre.daysLeft,
+            change1h: pre.change1h,
+            change24h: pre.change24h,
+            change7d: pre.change7d,
+            skip: pre.skip,
+          };
+          enriched.push(m);
+
           if (!pre.skip && pre.score >= botState.config.minScore) {
             scored.push({ m, pre });
           }
@@ -1961,6 +2174,7 @@ export async function runFullScan() {
             newSnap[id] = { yesP: pre.yesP, noP: pre.noP, ts: Date.now() };
           }
         }
+        botState.allMarkets = enriched;
         botState.marketSnapshots = newSnap;
 
         scored.sort((a, b) => b.pre.score - a.pre.score);
@@ -1977,8 +2191,12 @@ export async function runFullScan() {
           try {
             const analysis = await deepAnalyze(m, pre);
 
-            if (analysis.action === "SKIP" || analysis.score < botState.config.minScore) {
-              addLog(`⏭️ [IA SKIP] ${m.question.slice(0, 55)}... | Edge: ${analysis.edge_pct ?? 0}% | Conf: ${analysis.confidence ?? 0}%`, "INFO");
+            const isValidAction = analysis.action === "BUY_YES" || analysis.action === "BUY_NO";
+            const scoreNum = asNumber(analysis.score, 0);
+            const confNum = asNumber(analysis.confidence, 0);
+
+            if (!isValidAction || scoreNum < botState.config.minScore || confNum <= 0) {
+              addLog(`⏭️ [IA SKIP] ${m.question.slice(0, 55)}... | Edge: ${analysis.edge_pct ?? 0}% | Conf: ${confNum}%`, "INFO");
               continue;
             }
 
@@ -1993,7 +2211,7 @@ export async function runFullScan() {
             };
             botState.signals.unshift(sig);
             if (botState.signals.length > 300) botState.signals.length = 300;
-            addLog(`✨ [SEÑAL IA] ${analysis.action} | Confianza: ${analysis.confidence}% | Edge Neto: ${analysis.edge_pct}% | Merc: ${m.question.slice(0, 50)}`, "AI");
+            addLog(`✨ [SEÑAL IA] ${analysis.action} | Score: ${scoreNum}/100 | Conf: ${confNum}% | Edge Neto: ${analysis.edge_pct}% | Merc: ${m.question.slice(0, 50)}`, "AI");
 
             await insertAiSignalSafe(sig, m, pre, analysis);
 
@@ -2059,11 +2277,23 @@ export async function runFullScan() {
 
             const sideBook = isYes ? pre.clob?.yes : pre.clob?.no;
             const amt = computeQuantPositionSize(tradePlan.amount, analysis, sideBook);
-            const entry = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
-            const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, entry - 0.01).toFixed(4));
-            const simulatedShares = parseFloat((amt / entry).toFixed(6));
+            const rawAsk = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
+            const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, rawAsk - 0.01).toFixed(4));
+
+            // Modelo de Ejecución Realista (Slippage de Pool + Comisión Taker + Gas/Relayer Polygon + Redondeo CTF)
+            const askDepthUsd = Math.max(10, asNumber(sideBook?.askDepthUsd, 25));
+            const depthImpact = (amt / askDepthUsd) > 0.12
+              ? Math.min(0.012, (amt / askDepthUsd) * asNumber(sideBook?.spreadAbs, 0.01))
+              : 0.001;
+            const effectiveSimEntry = parseFloat(Math.min(0.98, rawAsk + depthImpact).toFixed(4));
+            const takerFeeRate = Math.max(0.0035, asNumber(m.takerBaseFee, 0) > 0 ? (rawAsk * (1 - rawAsk) * 0.015) : 0.0035);
+            const entryFeeUsd = parseFloat(((amt * takerFeeRate) + 0.004).toFixed(4));
+            const netEntryCapital = Math.max(0.05, amt - entryFeeUsd);
+            // CTFExchange trunca shares hacia abajo a 6 decimales
+            const simulatedShares = Math.floor((netEntryCapital / effectiveSimEntry) * 1e6) / 1e6;
+
             let executedAmount = amt;
-            let executedEntry = entry;
+            let executedEntry = effectiveSimEntry;
             let initialMarkPrice = entryBid;
             let executedShares = simulatedShares;
             let buyOrderId = null;
@@ -2089,8 +2319,9 @@ export async function runFullScan() {
             }
 
             const openedAt = new Date().toISOString();
-            const trade = {
+            const baseTrade = {
               id: `T-${uid().toUpperCase()}`,
+              signalId: sig.id,
               ts: openedAt,
               question: m.question,
               marketId,
@@ -2103,8 +2334,11 @@ export async function runFullScan() {
               currentPrice: initialMarkPrice,
               shares: executedShares,
               cost: executedAmount,
+              entryFeeUsd,
+              frictionDeducted: true,
               confidence: analysis.confidence,
               edge_pct: analysis.edge_pct,
+              score: analysis.score,
               risk: analysis.risk,
               signal_types: analysis.signal_types || [],
               reasoning: analysis.reasoning,
@@ -2119,6 +2353,10 @@ export async function runFullScan() {
               takeProfit: calcTakeProfit(executedEntry, analysis.fair_prob),
               breakEvenArmed: false,
               maxHoldAt: calcMaxHoldAt(openedAt),
+            };
+            const trade = {
+              ...baseTrade,
+              ...computeTradeEconomics(baseTrade),
             };
 
             if (executionMode === "REAL") {
@@ -2136,7 +2374,7 @@ export async function runFullScan() {
             } else {
               botState.capital = roundMoney(botState.capital - executedAmount);
               hydrateCapitalFromLocalState();
-              addLog(`🚀 [BACKEND COMPRA SIM] ${trade.side} | Inversión: $${executedAmount.toFixed(2)} | Ask: ${fmtPct(executedEntry)} | Bid: ${fmtPct(entryBid)} | SL: ${fmtPct(trade.stopLoss)} | TP: ${fmtPct(trade.takeProfit)}`, "TRADE");
+              addLog(`🚀 [BACKEND COMPRA SIM] ${trade.side} | Inversión: $${executedAmount.toFixed(2)} (Fee/Pool: -$${entryFeeUsd.toFixed(3)}) | Ask Efectivo: ${fmtPct(executedEntry)} | Bid: ${fmtPct(entryBid)} | SL: ${fmtPct(trade.stopLoss)} | TP: ${fmtPct(trade.takeProfit)}`, "TRADE");
             }
 
             botState.trades.unshift(trade);
@@ -2204,6 +2442,7 @@ export async function fastSyncTrades() {
 
           const prevPx = asNumber(botState.trades[tradeIdx].currentPrice, 0);
           botState.trades[tradeIdx].currentPrice = livePx;
+          Object.assign(botState.trades[tradeIdx], computeTradeEconomics(botState.trades[tradeIdx]));
 
           // Persist mark-to-market price updates when price moves by >= 0.3 cents
           if (Math.abs(livePx - prevPx) >= 0.003) {
@@ -2349,8 +2588,15 @@ export async function fastSyncTrades() {
               continue;
             }
           } else {
-            pnl = roundMoney((livePx - asNumber(openTrade.entryPrice, 0)) * asNumber(openTrade.shares, 0));
-            returned = roundMoney(asNumber(openTrade.cost, 0) + pnl);
+            // Simulación Realista: Deslizamiento de salida en orden de mercado + Comisión Pool/Taker + Gas Polygon
+            const exitSlippage = (closeReason === "STOP_LOSS" || closeReason === "TRAILING_STOP") ? 0.002 : 0.001;
+            closePrice = parseFloat(Math.max(0.005, livePx - exitSlippage).toFixed(4));
+            const grossProceeds = asNumber(openTrade.shares, 0) * closePrice;
+            const exitFeeUsd = parseFloat(((grossProceeds * 0.0035) + 0.004).toFixed(4));
+            returned = roundMoney(Math.max(0, grossProceeds - exitFeeUsd));
+            pnl = roundMoney(returned - asNumber(openTrade.cost, 0));
+            botState.trades[tradeIdx].exitFeeUsd = exitFeeUsd;
+            botState.trades[tradeIdx].frictionDeducted = true;
             botState.capital = roundMoney(botState.capital + returned);
             hydrateCapitalFromLocalState();
           }
@@ -2369,9 +2615,10 @@ export async function fastSyncTrades() {
           botState.trades[tradeIdx].sellOrderStatus = sellOrderStatus;
           botState.trades[tradeIdx].sellTxHashes = sellTxHashes;
           botState.trades[tradeIdx].closeReason = closeReason;
+          Object.assign(botState.trades[tradeIdx], computeTradeEconomics(botState.trades[tradeIdx]));
           botState.dailyPnl = roundMoney(botState.dailyPnl + pnl);
 
-          addLog(`🤖 [BACKEND AUTOPILOT] Cierre ${openTrade.id} (${closeReason}) @ ${fmtPct(closePrice)} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl}`, pnl >= 0 ? "WIN" : "LOSS");
+          addLog(`🤖 [BACKEND AUTOPILOT] Cierre ${openTrade.id} (${closeReason}) @ ${fmtPct(closePrice)} | P&L Neto: ${pnl >= 0 ? "+" : ""}$${pnl} (Fricción Pool/Gas: -$${botState.trades[tradeIdx].frictionUsd.toFixed(3)})`, pnl >= 0 ? "WIN" : "LOSS");
           await updateTradeSafe(
             openTrade.id,
             {
@@ -2501,6 +2748,13 @@ export function computeQuantMetrics() {
   else if (safetyMarginPct < 0 && decidedCount >= 5) healthScore -= 15;
   healthScore = Math.max(0, Math.min(100, healthScore));
 
+  const totalFrictionUsd = Number(
+    validClosed.reduce((s, t) => s + asNumber(t.frictionUsd ?? computeTradeEconomics(t).frictionUsd, 0.015), 0).toFixed(3)
+  );
+  const netPnlAfterAllCosts = roundMoney(
+    validClosed.reduce((s, t) => s + asNumber(t.netPnlAfterFriction ?? computeTradeEconomics(t).netPnlAfterFriction, asNumber(t.pnl, 0)), 0)
+  );
+
   return {
     totalClosed: validClosed.length,
     decidedCount,
@@ -2510,6 +2764,8 @@ export function computeQuantMetrics() {
     grossProfit: roundMoney(grossProfit),
     grossLossAbs: roundMoney(grossLossAbs),
     netRealizedPnl,
+    totalFrictionUsd,
+    netPnlAfterAllCosts,
     winRatePct,
     avgWin,
     avgLossAbs,

@@ -105,12 +105,21 @@ app.get('/api/status', async (req, res) => {
     walletActivity: botState.walletActivity.slice(0, 100),
     trades: botState.trades,
     signals: botState.signals,
+    newsCache: botState.newsCache || {},
     scanStatus: botState.scanStatus,
     quantMetrics: computeQuantMetrics(),
-    logEntries: botState.logEntries.slice(0, 50),
+    logEntries: botState.logEntries.slice(0, 100),
     marketsCount: botState.allMarkets.length,
     allMarkets: botState.allMarkets.slice(0, 300)
   });
+});
+
+app.post('/api/scan-now', (req, res) => {
+  if (botState.scanStatus.running) {
+    return res.status(200).json({ status: 'skipped', reason: 'scan already running' });
+  }
+  res.status(200).json({ status: 'scan_started', ts: new Date().toISOString() });
+  runFullScan().catch(err => console.error('[MANUAL SCAN] Error en runFullScan:', err.message));
 });
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
