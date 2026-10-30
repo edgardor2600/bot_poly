@@ -2798,6 +2798,11 @@ Return JSON with this exact schema:
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
 
+  // Capturar la intención cruda del LLM y el lado bajo consideración
+  const rawLlmAction = String(result.action || "SKIP").toUpperCase();
+  result.raw_action = rawLlmAction;
+  let consideredSide = rawLlmAction === "BUY_YES" ? "YES" : (rawLlmAction === "BUY_NO" ? "NO" : null);
+
   // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA (v2.5.1) ──
   const normalizeProb = (v) => {
     const n = parseFloat(v);
@@ -2825,6 +2830,13 @@ Return JSON with this exact schema:
     }
   }
 
+  if (result.action === "BUY_YES") consideredSide = "YES";
+  else if (result.action === "BUY_NO") consideredSide = "NO";
+  else if (!consideredSide && Number.isFinite(estYesProb)) {
+    consideredSide = estYesProb >= 0.5 ? "YES" : "NO";
+  }
+  result.considered_side = consideredSide;
+
   let selectedBook = null;
   let rawSideProb = null;
   let isYesSide = false;
@@ -2833,7 +2845,8 @@ Return JSON with this exact schema:
     isYesSide = true;
     if (!yesTradable || !yesBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez/WOBI. ${result.reasoning || ""}`;
+      result.skip_reason = `[FILTRO CLOB] Lado YES bloqueado por spread (${yesBook?.spreadPct ? yesBook.spreadPct.toFixed(1) + "%" : "alto"}) o liquidez`;
+      result.reasoning = `${result.skip_reason}. ${result.reasoning || ""}`;
     } else {
       selectedBook = yesBook;
       rawSideProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -2842,7 +2855,8 @@ Return JSON with this exact schema:
     isYesSide = false;
     if (!noTradable || !noBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez/WOBI. ${result.reasoning || ""}`;
+      result.skip_reason = `[FILTRO CLOB] Lado NO bloqueado por spread (${noBook?.spreadPct ? noBook.spreadPct.toFixed(1) + "%" : "alto"}) o liquidez`;
+      result.reasoning = `${result.skip_reason}. ${result.reasoning || ""}`;
     } else {
       selectedBook = noBook;
       rawSideProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -2911,6 +2925,8 @@ Return JSON with this exact schema:
 
     if (lacksCatalyst && (effectiveObi < 0.45 || sideTapeImbalance < 0.25)) {
       result.action = "SKIP";
+      result.considered_side = selectedSide;
+      result.skip_reason = `Sin noticia fresca ni flujo institucional fuerte`;
       result.reasoning = `[FILTRO CATALIZADOR] Sin noticia nueva ni flujo institucional fuerte (WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)}). ${result.reasoning || ""}`;
     }
 
@@ -3121,11 +3137,21 @@ Return JSON with this exact schema:
       risk === "HIGH"
     ) {
       result.action = "SKIP";
+      result.considered_side = selectedSide;
+      const reasons = [];
+      if (hardVetoes.length > 0) reasons.push(hardVetoes[0]);
+      if (netEdgePct < MIN_NET_EDGE_PCT) reasons.push(`Edge ${netEdgePct.toFixed(1)}% < min ${MIN_NET_EDGE_PCT}%`);
+      if (conf < MIN_AI_CONFIDENCE) reasons.push(`Conf ${conf}% < min ${MIN_AI_CONFIDENCE}%`);
+      if (confluenceScore < 3) reasons.push(`Pilares ${confluenceScore}/4 < 3`);
+      if (risk === "HIGH") reasons.push(`Riesgo ALTO`);
+      result.skip_reason = reasons.join(" · ");
       const vetoDetail = hardVetoes.length > 0 ? `Veto: ${hardVetoes.join("; ")} | ` : "";
       result.reasoning = `[CONFLUENCE GATE: ${confluenceScore}/4 pilares | ${vetoDetail}Edge Calibrado ${netEdgePct.toFixed(1)}%, R:R ${rewardToRisk.toFixed(2)}x, Conf ${conf}%] ${result.reasoning || ""}`;
     }
   } else {
     result.action = "SKIP";
+    result.considered_side = result.considered_side || (Number.isFinite(estYesProb) ? (estYesProb >= 0.5 ? "YES" : "NO") : null);
+    result.skip_reason = result.skip_reason || "La IA evaluó que no hay ventaja estadística (SKIP)";
     result.score = asNumber(result.score, 0);
     result.confidence = asNumber(result.confidence, 0);
     result.edge_pct = Number(parseFloat(result.edge_pct || 0).toFixed(2));
@@ -3232,7 +3258,9 @@ export async function runFullScan() {
             const confNum = asNumber(analysis.confidence, 0);
 
             if (!isValidAction || scoreNum < botState.config.minScore || confNum <= 0) {
-              addLog(`⏭️ [IA SKIP] ${m.question.slice(0, 55)}... | Edge: ${analysis.edge_pct ?? 0}% | Conf: ${confNum}%`, "INFO");
+              const sideTag = analysis.considered_side ? `[Lado: ${analysis.considered_side}]` : `[Sin lado claro]`;
+              const skipWhy = analysis.skip_reason || (analysis.reasoning ? analysis.reasoning.slice(0, 110) : "Sin ventaja estadística");
+              addLog(`⏭️ [IA SKIP] ${sideTag} ${m.question.slice(0, 48)}... | Edge: ${analysis.edge_pct ?? 0}% | Conf: ${confNum}% | Motivo: ${skipWhy}`, "INFO");
               continue;
             }
 
