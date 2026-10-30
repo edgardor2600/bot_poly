@@ -1,7 +1,7 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { runFullScan, fastSyncTrades, checkDayRollover, botState, initializeStateFromDB, BASE_CAPITAL, refreshDbReadiness } from './botCore.js';
+import { runFullScan, fastSyncTrades, checkDayRollover, botState, initializeStateFromDB, BASE_CAPITAL, refreshDbReadiness, computeQuantMetrics } from './botCore.js';
 import { getNumberEnv, requireEnv } from './env.js';
 import { getLiveWalletSnapshot, initPolymarketClient, isRealTradingEnabled } from './polymarketClient.js';
 
@@ -106,6 +106,7 @@ app.get('/api/status', async (req, res) => {
     trades: botState.trades,
     signals: botState.signals,
     scanStatus: botState.scanStatus,
+    quantMetrics: computeQuantMetrics(),
     logEntries: botState.logEntries.slice(0, 50),
     marketsCount: botState.allMarkets.length,
     allMarkets: botState.allMarkets.slice(0, 300)

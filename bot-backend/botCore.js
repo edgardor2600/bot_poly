@@ -1830,6 +1830,48 @@ Return JSON with this exact schema:
     const rawEdgePct = (rawSideProb - executableAsk) * 100;
     const netEdgePct = (calibratedFairProb - executableAsk - spreadCost - feeCost - longshotPenalty) * 100;
 
+    // 3. SISTEMA INSTITUCIONAL DE CONFLUENCIA DE 4 PILARES (Confluence Gate)
+    const conf = parseFloat(result.confidence || 0);
+    const risk = String(result.risk || "MEDIUM").toUpperCase();
+    const whaleSideCount = tradeFlow ? (isYesSide ? tradeFlow.whaleYesCount : tradeFlow.whaleNoCount) : 0;
+    const estStopLoss = calcStopLoss(executableAsk, selectedBook.bestBid);
+    const estTakeProfit = calcTakeProfit(executableAsk, calibratedFairProb);
+    const rewardToRisk = (executableAsk - estStopLoss) > 0
+      ? (estTakeProfit - executableAsk) / (executableAsk - estStopLoss)
+      : 0;
+
+    const pillars = {
+      bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && selectedBook.obi >= -0.05,
+      orderflowAlignment: (selectedBook.obi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
+      catalystOrMath: (hasFreshNews && !lacksCatalyst) || (selectedBook.obi >= 0.35 && sideTapeImbalance >= 0.20),
+      positiveExpectancy: netEdgePct >= 6.5 && conf >= 70 && rewardToRisk >= 1.75,
+    };
+
+    const hardVetoes = [];
+
+    // Veto Duro A: Prohibido comprar contra el flujo del Order Book y de la Cinta simultáneamente
+    if (selectedBook.obi < -0.05 && sideTapeImbalance <= 0.05) {
+      hardVetoes.push(`Flujo en contra (OBI=${selectedBook.obi.toFixed(2)}, Tape=${sideTapeImbalance.toFixed(2)})`);
+    }
+
+    // Veto Duro B: En Cripto con modelo de barrera, la probabilidad matemática de Parkinson no puede contradecir la compra
+    if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
+      const mathSideProb = isYesSide ? cryptoQuant.mathYesProb : (1 - cryptoQuant.mathYesProb);
+      pillars.catalystOrMath = mathSideProb >= (executableAsk + 0.03);
+      if (mathSideProb < executableAsk) {
+        hardVetoes.push(`Modelo Parkinson contradice compra (MathProb=${(mathSideProb * 100).toFixed(1)}% < Ask=${(executableAsk * 100).toFixed(1)}%)`);
+      }
+    }
+
+    // Veto Duro C: En Deportes/Esports exigir confluencia extrema (evitar apuestas 50/50 o en vivo sin ventaja institucional)
+    if (isSportsMatch) {
+      if (conf < 80 || lacksCatalyst || !hasFreshNews || selectedBook.obi < 0.20 || sideTapeImbalance < 0.15) {
+        hardVetoes.push(`Deportes bloqueado sin catalizador + flujo institucional unánime`);
+      }
+    }
+
+    const confluenceScore = Object.values(pillars).filter(Boolean).length;
+
     result.raw_fair_prob = Number(rawSideProb.toFixed(4));
     result.fair_prob = Number(calibratedFairProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
@@ -1838,15 +1880,22 @@ Return JSON with this exact schema:
     result.obi = Number((selectedBook.obi ?? 0).toFixed(3));
     result.tape_imbalance = Number(sideTapeImbalance.toFixed(3));
     result.spread_pct = Number(selectedBook.spreadPct.toFixed(2));
+    result.reward_to_risk = Number(rewardToRisk.toFixed(2));
+    result.confluence_score = confluenceScore;
+    result.confluence_pillars = pillars;
     result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
     result.edge_pct = Number(netEdgePct.toFixed(2));
 
-    const conf = parseFloat(result.confidence || 0);
-    const risk = String(result.risk || "MEDIUM").toUpperCase();
-
-    if (netEdgePct < MIN_NET_EDGE_PCT || conf < MIN_AI_CONFIDENCE || risk === "HIGH") {
+    if (
+      hardVetoes.length > 0 ||
+      confluenceScore < 3 ||
+      netEdgePct < MIN_NET_EDGE_PCT ||
+      conf < MIN_AI_CONFIDENCE ||
+      risk === "HIGH"
+    ) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO BAYESIANO: Edge Calibrado ${netEdgePct.toFixed(1)}% (min ${MIN_NET_EDGE_PCT}%), RawEdge ${rawEdgePct.toFixed(1)}%, Conf ${conf}%, Risk ${risk}] ${result.reasoning || ""}`;
+      const vetoDetail = hardVetoes.length > 0 ? `Veto: ${hardVetoes.join("; ")} | ` : "";
+      result.reasoning = `[CONFLUENCE GATE: ${confluenceScore}/4 pilares | ${vetoDetail}Edge Calibrado ${netEdgePct.toFixed(1)}%, R:R ${rewardToRisk.toFixed(2)}x, Conf ${conf}%] ${result.reasoning || ""}`;
     }
   } else {
     result.edge_pct = Number(parseFloat(result.edge_pct || 0).toFixed(2));
@@ -2164,15 +2213,15 @@ export async function fastSyncTrades() {
           const openTrade = botState.trades[tradeIdx];
           const entryPrice = asNumber(openTrade.entryPrice, 0);
 
-          // 1. Break-even activation
+          // 1. Break-even activation (requiere al menos +2.8c y +5.5% sobre entrada para no ahogar el trade con ruido de ticks)
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0) {
             const triggerPrice = Math.max(
-              entryPrice * (1 + (botState.config.breakEvenTriggerPct / 100)),
-              entryPrice + 0.02
+              entryPrice * (1 + Math.max(5.5, botState.config.breakEvenTriggerPct) / 100),
+              entryPrice + 0.028
             );
             if (livePx >= triggerPrice) {
               const breakEvenStop = parseFloat(
-                Math.max(entryPrice * (1 + (botState.config.breakEvenBufferPct / 100)), entryPrice + 0.005).toFixed(4)
+                Math.max(entryPrice * (1 + (botState.config.breakEvenBufferPct / 100)), entryPrice + 0.006).toFixed(4)
               );
               if (breakEvenStop > asNumber(openTrade.stopLoss, 0)) {
                 openTrade.stopLoss = breakEvenStop;
@@ -2183,9 +2232,9 @@ export async function fastSyncTrades() {
             }
           }
 
-          // 2. Dynamic Trailing Stop once gain is >= 6% and >= +3c above entry
-          if (openTrade.breakEvenArmed && entryPrice > 0 && livePx >= Math.max(entryPrice * 1.06, entryPrice + 0.03)) {
-            const trailedStop = parseFloat((livePx - 0.022).toFixed(4));
+          // 2. Dynamic Trailing Stop once gain is >= 8% and >= +3.8c above entry (deja 2.6c de respiro al Order Book)
+          if (openTrade.breakEvenArmed && entryPrice > 0 && livePx >= Math.max(entryPrice * 1.08, entryPrice + 0.038)) {
+            const trailedStop = parseFloat((livePx - 0.026).toFixed(4));
             if (trailedStop > asNumber(openTrade.stopLoss, 0) + 0.005) {
               openTrade.stopLoss = trailedStop;
               await updateTradeSafe(trade.id, { stop_loss: trailedStop, current_price: livePx });
@@ -2200,7 +2249,7 @@ export async function fastSyncTrades() {
 
           let closeReason = null;
           if (takeProfit > 0 && livePx >= takeProfit) closeReason = "TAKE_PROFIT";
-          else if (stopLoss > 0 && livePx <= stopLoss) closeReason = "STOP_LOSS";
+          else if (stopLoss > 0 && livePx <= stopLoss) closeReason = openTrade.breakEvenArmed ? "TRAILING_STOP" : "STOP_LOSS";
           else if (maxHoldReached) closeReason = "MAX_HOLD";
 
           if (!closeReason) continue;
@@ -2371,6 +2420,108 @@ export function checkDayRollover() {
   }
   // El bot SOLO se detiene al llegar a la meta diaria real (P&L >= DAILY_GOAL).
   // Ya no se cierra por hora del reloj.
+}
+
+// ── MOTOR INSTITUCIONAL DE AUDITORÍA Y MÉTRICAS CUANTITATIVAS (+EV / Profit Factor / Payoff / Attribution) ──
+export function computeQuantMetrics() {
+  const validClosed = botState.trades.filter(
+    t => t.status === "CLOSED" && t.closeReason !== "CLEANUP_SIMULATED"
+  );
+  const wins = validClosed.filter(t => asNumber(t.pnl, 0) > 0);
+  const losses = validClosed.filter(t => asNumber(t.pnl, 0) < 0);
+  const ties = validClosed.filter(t => asNumber(t.pnl, 0) === 0);
+
+  const grossProfit = wins.reduce((s, t) => s + asNumber(t.pnl, 0), 0);
+  const grossLossAbs = losses.reduce((s, t) => s + Math.abs(asNumber(t.pnl, 0)), 0);
+  const netRealizedPnl = roundMoney(grossProfit - grossLossAbs);
+
+  const decidedCount = wins.length + losses.length;
+  const winRatePct = decidedCount > 0 ? roundMoney((wins.length / decidedCount) * 100) : 0;
+  const avgWin = wins.length > 0 ? roundMoney(grossProfit / wins.length) : 0;
+  const avgLossAbs = losses.length > 0 ? roundMoney(grossLossAbs / losses.length) : 0;
+  const payoffRatio = avgLossAbs > 0 ? roundMoney(avgWin / avgLossAbs) : (avgWin > 0 ? 9.99 : 0);
+  const profitFactor = grossLossAbs > 0 ? roundMoney(grossProfit / grossLossAbs) : (grossProfit > 0 ? 9.99 : 0);
+
+  const breakEvenWinRatePct = payoffRatio > 0
+    ? roundMoney((1 / (1 + payoffRatio)) * 100)
+    : 50;
+  const safetyMarginPct = roundMoney(winRatePct - breakEvenWinRatePct);
+
+  const winProb = decidedCount > 0 ? (wins.length / decidedCount) : 0;
+  const lossProb = decidedCount > 0 ? (losses.length / decidedCount) : 0;
+  const expectancyPerTrade = decidedCount > 0
+    ? Number(((winProb * avgWin) - (lossProb * avgLossAbs)).toFixed(3))
+    : 0;
+
+  const byCategory = {};
+  for (const t of validClosed) {
+    const cat = t.category || detectCategory(t.question || "");
+    if (!byCategory[cat]) {
+      byCategory[cat] = { count: 0, wins: 0, losses: 0, pnl: 0 };
+    }
+    byCategory[cat].count++;
+    const p = asNumber(t.pnl, 0);
+    if (p > 0) byCategory[cat].wins++;
+    else if (p < 0) byCategory[cat].losses++;
+    byCategory[cat].pnl = roundMoney(byCategory[cat].pnl + p);
+  }
+
+  const byExitReason = {
+    TAKE_PROFIT: { count: 0, pnl: 0 },
+    TRAILING_PROTECTED: { count: 0, pnl: 0 },
+    STOP_LOSS: { count: 0, pnl: 0 },
+    MAX_HOLD: { count: 0, pnl: 0 },
+  };
+  for (const t of validClosed) {
+    const p = asNumber(t.pnl, 0);
+    if (t.closeReason === "TAKE_PROFIT") {
+      byExitReason.TAKE_PROFIT.count++;
+      byExitReason.TAKE_PROFIT.pnl = roundMoney(byExitReason.TAKE_PROFIT.pnl + p);
+    } else if (t.closeReason === "TRAILING_STOP" || t.breakEvenArmed || p >= 0) {
+      byExitReason.TRAILING_PROTECTED.count++;
+      byExitReason.TRAILING_PROTECTED.pnl = roundMoney(byExitReason.TRAILING_PROTECTED.pnl + p);
+    } else if (t.closeReason === "MAX_HOLD") {
+      byExitReason.MAX_HOLD.count++;
+      byExitReason.MAX_HOLD.pnl = roundMoney(byExitReason.MAX_HOLD.pnl + p);
+    } else {
+      byExitReason.STOP_LOSS.count++;
+      byExitReason.STOP_LOSS.pnl = roundMoney(byExitReason.STOP_LOSS.pnl + p);
+    }
+  }
+
+  let healthScore = 50;
+  if (profitFactor >= 1.5) healthScore += 25;
+  else if (profitFactor >= 1.15) healthScore += 15;
+  else if (profitFactor < 1.0 && decidedCount >= 5) healthScore -= 20;
+
+  if (payoffRatio >= 2.0) healthScore += 15;
+  else if (payoffRatio >= 1.4) healthScore += 8;
+
+  if (safetyMarginPct >= 10) healthScore += 10;
+  else if (safetyMarginPct < 0 && decidedCount >= 5) healthScore -= 15;
+  healthScore = Math.max(0, Math.min(100, healthScore));
+
+  return {
+    totalClosed: validClosed.length,
+    decidedCount,
+    winsCount: wins.length,
+    lossesCount: losses.length,
+    tiesCount: ties.length,
+    grossProfit: roundMoney(grossProfit),
+    grossLossAbs: roundMoney(grossLossAbs),
+    netRealizedPnl,
+    winRatePct,
+    avgWin,
+    avgLossAbs,
+    payoffRatio,
+    profitFactor,
+    breakEvenWinRatePct,
+    safetyMarginPct,
+    expectancyPerTrade,
+    healthScore,
+    byCategory,
+    byExitReason,
+  };
 }
 
 

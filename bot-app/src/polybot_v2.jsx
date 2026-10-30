@@ -1158,6 +1158,56 @@ export default function PolyBotV2() {
           
           const won = closed.filter(t => t.pnl > 0);
           const lost = closed.filter(t => t.pnl < 0);
+          const ties = closed.filter(t => t.pnl === 0);
+          const decided = won.length + lost.length;
+
+          const grossProfit = won.reduce((acc, t) => acc + (t.pnl || 0), 0);
+          const grossLossAbs = lost.reduce((acc, t) => acc + Math.abs(t.pnl || 0), 0);
+          const avgWin = won.length > 0 ? grossProfit / won.length : 0;
+          const avgLossAbs = lost.length > 0 ? grossLossAbs / lost.length : 0;
+          const payoffRatio = avgLossAbs > 0 ? (avgWin / avgLossAbs) : (avgWin > 0 ? 9.99 : 0);
+          const profitFactor = grossLossAbs > 0 ? (grossProfit / grossLossAbs) : (grossProfit > 0 ? 9.99 : 0);
+          const breakEvenWr = payoffRatio > 0 ? ((1 / (1 + payoffRatio)) * 100) : 50;
+          const actualWrNum = decided > 0 ? ((won.length / decided) * 100) : 0;
+          const safetyMargin = actualWrNum - breakEvenWr;
+          const expectancy = decided > 0
+            ? ((won.length / decided) * avgWin) - ((lost.length / decided) * avgLossAbs)
+            : 0;
+
+          // Atribución por Categoría
+          const catStats = {};
+          for (const t of closed) {
+            const cat = t.category || detectCategory(t.question || "");
+            if (!catStats[cat]) catStats[cat] = { count: 0, wins: 0, losses: 0, pnl: 0 };
+            catStats[cat].count++;
+            if (t.pnl > 0) catStats[cat].wins++;
+            else if (t.pnl < 0) catStats[cat].losses++;
+            catStats[cat].pnl += (t.pnl || 0);
+          }
+
+          // Atribución por Razón de Salida
+          const exitStats = {
+            TAKE_PROFIT: { label: "🎯 Take Profit Limpio", count: 0, pnl: 0, color: S.green },
+            TRAILING_PROTECTED: { label: "🛡 Break-Even / Trailing", count: 0, pnl: 0, color: S.cyan },
+            STOP_LOSS: { label: "🛑 Stop Loss Cortado", count: 0, pnl: 0, color: S.red },
+            MAX_HOLD: { label: "⏰ Salida por Tiempo (24h)", count: 0, pnl: 0, color: S.amber },
+          };
+          for (const t of closed) {
+            const p = t.pnl || 0;
+            if (t.closeReason === "TAKE_PROFIT") {
+              exitStats.TAKE_PROFIT.count++;
+              exitStats.TAKE_PROFIT.pnl += p;
+            } else if (t.closeReason === "TRAILING_STOP" || t.breakEvenArmed || p >= 0) {
+              exitStats.TRAILING_PROTECTED.count++;
+              exitStats.TRAILING_PROTECTED.pnl += p;
+            } else if (t.closeReason === "MAX_HOLD") {
+              exitStats.MAX_HOLD.count++;
+              exitStats.MAX_HOLD.pnl += p;
+            } else {
+              exitStats.STOP_LOSS.count++;
+              exitStats.STOP_LOSS.pnl += p;
+            }
+          }
           
           const won24 = last24h.filter(t => t.pnl > 0);
           const lost24 = last24h.filter(t => t.pnl < 0);
@@ -1168,18 +1218,86 @@ export default function PolyBotV2() {
           const worstTrade = closed.reduce((w, t) => (t.pnl < (w?.pnl || 9999)) ? t : w, null);
 
           return (
-            <div style={{ maxWidth: "1000px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "16px" }}>
+            <div style={{ maxWidth: "1050px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "16px" }}>
               <div style={{ color: S.cyan, fontSize: "16px", fontWeight: 700, letterSpacing: "2px", fontFamily: heading }}>
-                RENDIMIENTO Y MÉTRICAS CUANTITATIVAS
+                AUDITORÍA CUANTITATIVA INSTITUCIONAL (+EV & RIESGO)
               </div>
               
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
-                 <StatCard label="P&L REALIZADO HISTÓRICO" value={`${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`} color={realizedPnl >= 0 ? S.green : S.red} sub={`Basado en ${closed.length} operaciones`} />
-                 <StatCard label="TASA DE ACIERTO (WIN RATE)" value={winRate + "%"} color={winRate > 50 ? S.green : S.amber} sub={`${won.length} Ganadas · ${lost.length} Perdidas`} />
-                 <StatCard label="BALANCE LÍQUIDO" value={`$${availableUsd.toFixed(2)}`} color={availableUsd >= baseCapital ? S.green : S.amber} sub={`Excluye margen bloqueado ($${invested.toFixed(2)})`} />
+              {/* FILA 1: MÉTRICAS DE ESPERANZA MATEMÁTICA */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(185px, 1fr))", gap: "12px" }}>
+                <StatCard
+                  label="PROFIT FACTOR (PF)"
+                  value={profitFactor.toFixed(2) + "x"}
+                  color={profitFactor >= 1.3 ? S.green : profitFactor >= 1.0 ? S.amber : S.red}
+                  sub={`Bruto: +$${grossProfit.toFixed(2)} / -$${grossLossAbs.toFixed(2)}`}
+                />
+                <StatCard
+                  label="ESPERANZA / TRADE (EV)"
+                  value={`${expectancy >= 0 ? "+" : ""}$${expectancy.toFixed(3)}`}
+                  color={expectancy > 0 ? S.green : S.red}
+                  sub={expectancy > 0 ? "Sistema +EV (Rentable a largo plazo)" : "Requiere mayor filtrado"}
+                />
+                <StatCard
+                  label="PAYOFF RATIO (W/L)"
+                  value={`${payoffRatio.toFixed(2)} : 1`}
+                  color={payoffRatio >= 1.8 ? S.green : S.amber}
+                  sub={`Media Win +$${avgWin.toFixed(2)} vs Loss -$${avgLossAbs.toFixed(2)}`}
+                />
+                <StatCard
+                  label="WIN RATE vs EQUILIBRIO"
+                  value={`${actualWrNum.toFixed(1)}%`}
+                  color={safetyMargin >= 0 ? S.green : S.red}
+                  sub={`Mínimo requerido: ${breakEvenWr.toFixed(1)}% (Margen: ${safetyMargin >= 0 ? "+" : ""}${safetyMargin.toFixed(1)}%)`}
+                />
+                <StatCard
+                  label="P&L REALIZADO NETO"
+                  value={`${realizedPnl >= 0 ? "+" : ""}$${realizedPnl.toFixed(2)}`}
+                  color={realizedPnl >= 0 ? S.green : S.red}
+                  sub={`${won.length}W · ${lost.length}L · ${ties.length} Empates`}
+                />
               </div>
 
-              <div className="glass-panel" style={{ padding: "20px", marginTop: "16px", background: `linear-gradient(135deg, ${S.panel} 0%, rgba(0, 50, 80, 0.1) 100%)` }}>
+              {/* FILA 2: DESGLOSE POR TIPO DE SALIDA Y CATEGORÍA */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                <div className="glass-panel" style={{ padding: "16px" }}>
+                  <div style={{ color: S.accent, fontSize: "11px", fontWeight: 700, marginBottom: "12px", letterSpacing: "1px", borderBottom: `1px solid ${S.border}`, paddingBottom: "8px" }}>
+                    EFECTIVIDAD POR MECANISMO DE SALIDA
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    {Object.values(exitStats).map(ex => (
+                      <div key={ex.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px" }}>
+                        <span style={{ color: S.text }}>{ex.label} <span style={{ color: S.muted }}>({ex.count})</span></span>
+                        <span style={{ color: ex.pnl >= 0 ? S.green : S.red, fontWeight: 700, fontFamily: mono }}>
+                          {ex.pnl >= 0 ? "+" : ""}${ex.pnl.toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="glass-panel" style={{ padding: "16px" }}>
+                  <div style={{ color: S.accent, fontSize: "11px", fontWeight: 700, marginBottom: "12px", letterSpacing: "1px", borderBottom: `1px solid ${S.border}`, paddingBottom: "8px" }}>
+                    ATRIBUCIÓN DE P&L POR CATEGORÍA DE MERCADO
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                    {Object.entries(catStats).map(([cat, st]) => {
+                      const catWr = (st.wins + st.losses) > 0 ? ((st.wins / (st.wins + st.losses)) * 100).toFixed(0) : 0;
+                      return (
+                        <div key={cat} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px" }}>
+                          <span style={{ color: S.text }}>
+                            {CATEGORIES[cat]?.icon || "◯"} {CATEGORIES[cat]?.label || cat} <span style={{ color: S.muted }}>({st.wins}W/{st.losses}L · {catWr}% WR)</span>
+                          </span>
+                          <span style={{ color: st.pnl >= 0 ? S.green : S.red, fontWeight: 700, fontFamily: mono }}>
+                            {st.pnl >= 0 ? "+" : ""}${st.pnl.toFixed(2)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="glass-panel" style={{ padding: "20px", marginTop: "4px", background: `linear-gradient(135deg, ${S.panel} 0%, rgba(0, 50, 80, 0.1) 100%)` }}>
                  <div style={{ color: S.accent, fontSize: "12px", fontWeight: 700, marginBottom: "16px", fontFamily: heading, borderBottom: `1px solid ${S.border}`, paddingBottom: "10px", letterSpacing: "1px" }}>
                    REPORTE ÚLTIMAS 24 HORAS
                  </div>
@@ -1197,9 +1315,9 @@ export default function PolyBotV2() {
                      <div style={{ color: S.text, fontSize: "28px", fontWeight: 700, fontFamily: mono }}>{last24h.length}</div>
                    </div>
                    <div>
-                     <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1px", marginBottom: "4px" }}>EFECTIVIDAD 24H</div>
-                     <div style={{ color: won24.length > lost24.length ? S.green : S.amber, fontSize: "28px", fontWeight: 700, fontFamily: mono }}>
-                       {last24h.length > 0 ? ((won24.length / last24h.length) * 100).toFixed(0) : 0}%
+                     <div style={{ color: S.muted2, fontSize: "9px", letterSpacing: "1px", marginBottom: "4px" }}>EFECTIVIDAD DECIDIDA 24H</div>
+                     <div style={{ color: won24.length >= lost24.length ? S.green : S.amber, fontSize: "28px", fontWeight: 700, fontFamily: mono }}>
+                       {(won24.length + lost24.length) > 0 ? ((won24.length / (won24.length + lost24.length)) * 100).toFixed(0) : 0}%
                      </div>
                    </div>
                  </div>
