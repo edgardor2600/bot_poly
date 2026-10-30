@@ -1486,7 +1486,9 @@ export default function PolyBotV2() {
                                 ? { txt: "🛡 BREAK EVEN", c: S.cyan }
                                 : t.closeReason === "MAX_HOLD"
                                   ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
-                                  : { txt: "🛑 STOP LOSS", c: S.red };
+                                  : t.closeReason === "THESIS_INVALIDATED"
+                                    ? { txt: "⚡ TESIS INVALIDADA", c: S.amber }
+                                    : { txt: "🛑 STOP LOSS", c: S.red };
                           const netReal = t.netPnlAfterFriction ?? (t.pnl - (t.frictionUsd || 0.015));
                           return (
                             <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>

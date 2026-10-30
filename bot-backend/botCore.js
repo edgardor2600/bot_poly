@@ -1733,9 +1733,169 @@ export function computeTimeDecayedTapeMetrics(trades = [], targetSide = "YES") {
 }
 
 /**
- * 3. Detector de Catalizador Ya Descontado ("Priced-In Veto")
- * Bloquea compras tardías cuando la noticia tiene > 1.5h y el precio ya subió
- * gran parte del recorrido proyectado por la IA.
+ * 1. Consistencia Combinatoria Segura en Eventos Multi-Resultado (Normalización de Kolmogorov v2.5.1)
+ * - Verifica estrictamente negRisk === true y excluye escaleras acumulativas (above/below/by/before)
+ * - Filtra contratos polvo (< 2.5¢) contaminados por el piso de tick de 1¢
+ * - Descuenta el overround tanto en BUY_YES como en BUY_NO
+ */
+export function computeSiblingNormalizedMicro({
+  market,
+  selectedSide,
+  rawMarketMicro,
+  siblingMarkets = [],
+}) {
+  const isNegRiskGroup = Boolean(
+    market?.negRisk === true ||
+    market?.enableNegRisk === true ||
+    market?.neg_risk === true ||
+    market?.neg_risk_market_id
+  );
+
+  // Excluir escaleras de precios acumulativas ("above $X", "reach $Y", "by [Date]")
+  const qText = (market?.question || market?.groupItemTitle || "").toLowerCase();
+  const isCumulativeLadder = /\b(above|below|over|under|reach|hit|touch|dip|by\s+\w+\s+\d+|before)\b/i.test(qText);
+
+  if (!isNegRiskGroup || isCumulativeLadder || !Array.isArray(siblingMarkets) || siblingMarkets.length < 2) {
+    return rawMarketMicro;
+  }
+
+  // Filtrar contratos "polvo" (< 2.5¢) cuyo tick floor distorsiona la suma de Kolmogorov
+  const activeSiblings = siblingMarkets.filter((sib) => {
+    const sibYesPx = Number(sib?.microPrice ?? sib?.bestAsk ?? sib?._prelim?.yesP ?? sib?.yesPrice ?? 0);
+    return Number.isFinite(sibYesPx) && sibYesPx >= 0.025 && sibYesPx <= 0.975;
+  });
+
+  if (activeSiblings.length < 2) return rawMarketMicro;
+
+  const activeYesSum = activeSiblings.reduce((acc, sib) => {
+    return acc + Number(sib?.microPrice ?? sib?.bestAsk ?? sib?._prelim?.yesP ?? sib?.yesPrice ?? 0);
+  }, 0);
+
+  // Solo normalizar cuando la suma de activos principales muestra un overround real (1.03 < Suma <= 1.25)
+  if (activeYesSum <= 1.03 || activeYesSum > 1.25) {
+    return rawMarketMicro;
+  }
+
+  const rawImpliedYes = selectedSide === "YES" ? rawMarketMicro : (1.0 - rawMarketMicro);
+  const normalizedYes = Math.min(0.99, Math.max(0.01, rawImpliedYes / activeYesSum));
+  const normalizedSideMicro = selectedSide === "YES" ? normalizedYes : (1.0 - normalizedYes);
+
+  // Mezcla conservadora: 70% microprecio normalizado + 30% microprecio local directo
+  return Number(((0.70 * normalizedSideMicro) + (0.30 * rawMarketMicro)).toFixed(4));
+}
+
+/**
+ * 2. Reconciliador Bayesiano Tetlock + Escudo Anti-Cuchillo Cayendo + PAR Simétrico (v2.5.1)
+ * - Elimina el doble conteo de LR: retrae el logit posterior hacia la tasa base según la vejez de la noticia
+ * - Corrige el signo direccional de change1h / change24h para BUY_NO
+ * - Bloquea compras a ciegas cuando el precio colapsa en vivo (Veto F) o cuando Groq diverge >24¢ sin noticia fresca (Veto G)
+ */
+export function evaluateTetlockAndCatalystGuard({
+  selectedSide,
+  baseRateYesProb,
+  estimatedYesProb,
+  declaredLikelihoodRatio = 1.0,
+  hasFreshNews,
+  newsAgeHours = 12.0,
+  marketMicro,
+  gammaChange1h = 0,
+  gammaChange24h = 0,
+  tapeVelocity6h = 0,
+  wObi = 0,
+  etiImbalance = 0,
+}) {
+  const clampP = (p) => Math.max(0.01, Math.min(0.99, Number(p)));
+  const logit = (p) => Math.log(clampP(p) / (1.0 - clampP(p)));
+  const sigmoid = (z) => 1.0 / (1.0 + Math.exp(-Math.max(-20, Math.min(20, z))));
+
+  // ── A. Orientación Direccional Simétrica (YES vs NO) ──
+  const dirSign = selectedSide === "YES" ? 1.0 : -1.0;
+  const sideChange1h  = dirSign * Number(gammaChange1h || 0);
+  const sideChange24h = dirSign * Number(gammaChange24h || 0);
+
+  // Avance favorable reciente (para detectar Catalizador Ya Descontado - PAR)
+  const directionalMoveUp = Math.max(
+    0,
+    Number(tapeVelocity6h || 0),
+    sideChange1h,
+    sideChange24h * 0.65
+  );
+
+  // Caída adversa reciente (para detectar "Falling Knife" / Noticia en vivo no indexada en RSS)
+  const directionalMoveDown = Math.min(
+    0,
+    Number(tapeVelocity6h || 0),
+    sideChange1h,
+    sideChange24h * 0.75
+  );
+
+  // ── B. Reconciliación Bayesiana en Log-Odds SIN Doble Conteo ──
+  const p0Side = clampP(selectedSide === "YES" ? baseRateYesProb : (1.0 - baseRateYesProb));
+  const p1Side = clampP(selectedSide === "YES" ? estimatedYesProb : (1.0 - estimatedYesProb));
+
+  const logitP0 = logit(p0Side);
+  const logitP1 = logit(p1Side);
+  const impliedUpdate = logitP1 - logitP0;
+
+  // Acotar el salto máximo permitido por coherencia con el LR declarado por el modelo
+  const rawLr = Math.max(0.25, Math.min(4.0, Number(declaredLikelihoodRatio) || 1.0));
+  const declaredLrLog = Math.abs(Math.log(rawLr));
+  const boundedUpdate = Math.sign(impliedUpdate) * Math.min(
+    Math.abs(impliedUpdate),
+    Math.max(0.15, declaredLrLog * 1.25)
+  );
+
+  // Factor de frescura temporal de la noticia (decae exponencialmente después de 30 min)
+  const freshnessFactor = hasFreshNews
+    ? Math.exp(-0.18 * Math.max(0, newsAgeHours - 0.5))
+    : 0.25;
+
+  // Probabilidad ciega reconciliada (antes de penalizar por PAR)
+  const preParLogit = logitP0 + (boundedUpdate * freshnessFactor);
+  const preParSideProb = clampP(sigmoid(preParLogit));
+
+  // ── C. Cálculo Simétrico del Price Absorption Ratio (PAR) ──
+  const projectedRemainingMove = Math.max(0.005, preParSideProb - marketMicro);
+  const par = directionalMoveUp > 0.015
+    ? directionalMoveUp / (directionalMoveUp + projectedRemainingMove)
+    : 0.0;
+
+  // Si el precio ya subió por la noticia, retraemos proporcionalmente el impulso informativo
+  const finalNewsRetention = freshnessFactor * (1.0 - 0.65 * par);
+  const reconciledBlindLogit = logitP0 + (boundedUpdate * finalNewsRetention);
+  const blindSideProb = clampP(sigmoid(reconciledBlindLogit));
+
+  // ── D. Vetos de Segundo Orden (Blindaje de Producción) ──
+  // Veto D: Catalizador Ya Descontado (Chasing Top)
+  const vetoD_PricedIn =
+    (hasFreshNews && newsAgeHours > 1.5 && par >= 0.65) ||
+    directionalMoveUp >= 0.11;
+
+  // Veto F: "Falling Knife" / Flujo Informado Adverso (El contrato se desploma >= 6.5¢ en contra y el libro no absorbe)
+  const vetoF_FallingKnife =
+    directionalMoveDown <= -0.065 &&
+    (wObi < 0.22 || etiImbalance < 0.18);
+
+  // Veto G: Alucinación de Valor Ciego (Groq a ciegas diverge >= 24¢ del CLOB sin noticia de última hora <= 3h)
+  const blindDivergenceAbs = Math.abs(blindSideProb - marketMicro);
+  const vetoG_BlindHallucination =
+    blindDivergenceAbs >= 0.24 &&
+    (!hasFreshNews || newsAgeHours > 3.0);
+
+  return {
+    blindSideProb: Number(blindSideProb.toFixed(4)),
+    par: Number(par.toFixed(3)),
+    directionalMoveUp: Number(directionalMoveUp.toFixed(4)),
+    directionalMoveDown: Number(directionalMoveDown.toFixed(4)),
+    blindDivergenceAbs: Number(blindDivergenceAbs.toFixed(4)),
+    vetoD_PricedIn,
+    vetoF_FallingKnife,
+    vetoG_BlindHallucination,
+  };
+}
+
+/**
+ * 3. Detector de Catalizador Ya Descontado ("Priced-In Veto" - Alias de compatibilidad)
  */
 export function evaluateCatalystPricedIn({
   hasFreshNews,
@@ -1745,30 +1905,21 @@ export function evaluateCatalystPricedIn({
   priceVelocity6h = 0,
 }) {
   const projectedRemainingMove = Math.max(0.001, rawSideProb - marketMicro);
-
-  // Si en las últimas 6h el precio ya avanzó en nuestra dirección:
   if (priceVelocity6h > 0.02) {
     const totalImpliedMoveFromBase = priceVelocity6h + projectedRemainingMove;
-    const priceAbsorptionRatio = priceVelocity6h / totalImpliedMoveFromBase; // PAR en [0, 1]
-
-    // Veto Duro: Si la noticia tiene más de 1.5 horas y el mercado ya absorbió >= 65%
-    // del movimiento total, o si ya subió +11¢ en las últimas 6h sin flujo fresco nuevo:
+    const priceAbsorptionRatio = priceVelocity6h / totalImpliedMoveFromBase;
     const isAlreadyPricedIn =
       (hasFreshNews && newsAgeHours > 1.5 && priceAbsorptionRatio >= 0.65) ||
       priceVelocity6h >= 0.11;
-
-    // Penalización progresiva sobre el peso de la IA a medida que el precio ya corrió
     const freshnessDecay = hasFreshNews
       ? Math.exp(-0.18 * Math.max(0, newsAgeHours - 0.5)) * (1.0 - 0.60 * priceAbsorptionRatio)
       : 0.0;
-
     return {
       isAlreadyPricedIn,
       priceAbsorptionRatio: Number(priceAbsorptionRatio.toFixed(3)),
       effectiveCatalystWeightBoost: Number((0.12 * Math.max(0, freshnessDecay)).toFixed(4)),
     };
   }
-
   const freshnessDecay = hasFreshNews ? Math.exp(-0.15 * Math.max(0, newsAgeHours - 0.5)) : 0.0;
   return {
     isAlreadyPricedIn: false,
@@ -1829,37 +1980,6 @@ export function computeDualCryptoOracleProb({
     contractType: "AMERICAN_BARRIER_TOUCH",
     pMath: Number(probTouch.toFixed(4)),
   };
-}
-
-/**
- * 5. Consistencia Combinatoria en Eventos Multi-Resultado (Normalización de Kolmogorov)
- * Si el mercado pertenece a un evento con múltiples candidatos mutuamente excluyentes,
- * descuenta el overround (Suma P_j > 1.0) sobre el MicroPrice.
- */
-function computeSiblingNormalizedMicro(m, rawMicro, isYesSide) {
-  const eventKey = String(m?.events?.[0]?.slug || m?.events?.[0]?.id || "");
-  if (!eventKey || !Array.isArray(botState.allMarkets) || botState.allMarkets.length < 2) {
-    return rawMicro;
-  }
-
-  const siblings = botState.allMarkets.filter(cand => {
-    const cKey = String(cand?.events?.[0]?.slug || cand?.events?.[0]?.id || "");
-    return cKey === eventKey && cand?.negRisk === true;
-  });
-
-  if (siblings.length < 2) return rawMicro;
-
-  const sumYesP = siblings.reduce((sum, s) => sum + asNumber(s?._prelim?.yesP, 0), 0);
-  if (sumYesP <= 1.03 || sumYesP > 1.40) return rawMicro;
-
-  // Normalizar probabilidad implícita de YES dividiendo por la suma del grupo
-  if (isYesSide) {
-    return Math.max(0.01, Math.min(0.99, rawMicro / sumYesP));
-  }
-  const impliedYes = 1 - rawMicro;
-  const normalizedYes = impliedYes / sumYesP;
-  // Para BUY_NO, el overround de YES inflaba artificialmente el precio de YES; mantenemos ancla conservadora
-  return Math.max(0.01, Math.min(0.99, (rawMicro + (1 - normalizedYes)) / 2));
 }
 
 async function getCryptoSpotContext(question, daysLeft) {
@@ -2251,7 +2371,7 @@ Return JSON with this exact schema:
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
 
-  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA (v2.5.0) ──
+  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA (v2.5.1) ──
   const normalizeProb = (v) => {
     const n = parseFloat(v);
     if (!Number.isFinite(n)) return null;
@@ -2261,15 +2381,6 @@ Return JSON with this exact schema:
   let estYesProb = normalizeProb(result.estimated_yes_prob);
   const baseRateYes = normalizeProb(result.base_rate_prob) ?? estYesProb;
   const rawLikelihoodRatio = Math.max(0.25, Math.min(4.0, asNumber(result.evidence_likelihood_ratio, 1.0)));
-
-  if (Number.isFinite(baseRateYes) && Number.isFinite(estYesProb)) {
-    const safeBase = Math.max(0.02, Math.min(0.98, baseRateYes));
-    const decayedLR = 1.0 + (rawLikelihoodRatio - 1.0) * Math.exp(-0.15 * Math.max(0, minNewsAgeHours - 0.5));
-    const priorOdds = safeBase / (1 - safeBase);
-    const postOdds  = priorOdds * Math.max(0.25, decayedLR);
-    const bayesianYesProb = postOdds / (1 + postOdds);
-    estYesProb = (0.55 * estYesProb) + (0.45 * bayesianYesProb);
-  }
 
   // Si es un mercado cripto con Oráculo Dual (Digital Europeo vs Barrera Americana), anclar con la probabilidad estocástica exacta
   if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb) && Number.isFinite(estYesProb)) {
@@ -2334,34 +2445,36 @@ Return JSON with this exact schema:
       ? eTape.etiImbalance
       : (tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0);
 
-    // Consistencia Combinatoria entre hermanos (descuenta overround en eventos multi-resultado)
-    const marketMicro = computeSiblingNormalizedMicro(m, wBook.pMicroWeighted, isYesSide);
+    // 1b. Consistencia Combinatoria Segura entre hermanos (filtra polvo <2.5¢, excluye escaleras acumulativas y verifica negRisk)
+    const eventKey = String(m?.events?.[0]?.slug || m?.events?.[0]?.id || "");
+    const siblingMarkets = (eventKey && Array.isArray(botState.allMarkets))
+      ? botState.allMarkets.filter(cand => String(cand?.events?.[0]?.slug || cand?.events?.[0]?.id || "") === eventKey)
+      : [];
+    const marketMicro = computeSiblingNormalizedMicro({
+      market: m,
+      selectedSide,
+      rawMarketMicro: wBook.pMicroWeighted,
+      siblingMarkets,
+    });
 
-    // Velocidad de precio en 6h combinando la cinta de trades y los deltas de Gamma
-    const sideChange1h  = isYesSide ? asNumber(change1h, 0) : -asNumber(change1h, 0);
-    const sideChange24h = isYesSide ? asNumber(change24h, 0) : -asNumber(change24h, 0);
-    const effectivePriceVelocity6h = Math.max(eTape.priceVelocity6h, sideChange1h, sideChange24h * 0.65);
-
-    // 2. Detector de Catalizador Ya Descontado (Priced-In Detector / PAR)
-    const catalystAudit = evaluateCatalystPricedIn({
+    // 2. Reconciliador Bayesiano Tetlock + Escudo Anti-Cuchillo Cayendo + PAR Simétrico (v2.5.1)
+    const fallbackYesProb = isYesSide ? rawSideProb : (1.0 - rawSideProb);
+    const tetlockGuard = evaluateTetlockAndCatalystGuard({
+      selectedSide,
+      baseRateYesProb: Number.isFinite(baseRateYes) ? baseRateYes : fallbackYesProb,
+      estimatedYesProb: Number.isFinite(estYesProb) ? estYesProb : fallbackYesProb,
+      declaredLikelihoodRatio: rawLikelihoodRatio,
       hasFreshNews,
       newsAgeHours: minNewsAgeHours,
       marketMicro,
-      rawSideProb,
-      priceVelocity6h: effectivePriceVelocity6h,
+      gammaChange1h: asNumber(change1h, 0),
+      gammaChange24h: asNumber(change24h, 0),
+      tapeVelocity6h: eTape.priceVelocity6h,
+      wObi: effectiveObi,
+      etiImbalance: sideTapeImbalance,
     });
 
-    // Si hay base_rate_prob y LR, penalizar LR también por PAR (1 - 0.75 * PAR)
-    if (Number.isFinite(baseRateYes) && catalystAudit.priceAbsorptionRatio > 0) {
-      const safeBase = Math.max(0.02, Math.min(0.98, isYesSide ? baseRateYes : (1 - baseRateYes)));
-      const sideRawLR = isYesSide ? rawLikelihoodRatio : (1 / Math.max(0.25, rawLikelihoodRatio));
-      const lrEffective = 1.0 + (sideRawLR - 1.0)
-        * Math.exp(-0.15 * Math.max(0, minNewsAgeHours - 0.5))
-        * Math.max(0, 1.0 - 0.75 * catalystAudit.priceAbsorptionRatio);
-      const pOdds = (safeBase / (1 - safeBase)) * Math.max(0.25, lrEffective);
-      const pPostPar = pOdds / (1 + pOdds);
-      rawSideProb = Math.max(0.01, Math.min(0.99, (0.50 * rawSideProb) + (0.50 * pPostPar)));
-    }
+    rawSideProb = tetlockGuard.blindSideProb;
 
     // Protección dura contra mercados deportivos donde la IA confunde marcadores pasados o no tiene catalizador nuevo
     const isSportsMatch = m._cat === "SPORTS" || /\b(vs\.?|handicap|esports|nba|nfl|mlb|nhl|ufc|match|game|atp|premier league|champions)\b/i.test(m.question || "");
@@ -2379,14 +2492,14 @@ Return JSON with this exact schema:
       rawSideProb = Math.min(rawSideProb, marketMicro + 0.14);
     }
 
-    // 3. Peso adaptativo de la IA usando el decaimiento continuo de frescura (catalystAudit.effectiveCatalystWeightBoost)
-    let aiWeight = 0.50 + (lacksCatalyst ? 0 : catalystAudit.effectiveCatalystWeightBoost);
+    // 3. Peso adaptativo de la IA SIN doble conteo de hasFreshNews (la noticia ya fue ponderada en blindSideProb)
+    let aiWeight = 0.50;
     if (effectiveObi >= 0.18)          aiWeight += 0.06;
     else if (effectiveObi <= -0.15)    aiWeight -= 0.10;
     if (sideTapeImbalance >= 0.18)     aiWeight += 0.06;
     else if (sideTapeImbalance <= -0.20) aiWeight -= 0.10;
     if (liq > 50000)                   aiWeight -= 0.08;
-    aiWeight = Math.max(0.35, Math.min(0.72, aiWeight));
+    aiWeight = Math.max(0.35, Math.min(0.68, aiWeight));
 
     // 4. Pooling en espacio Log-Odds (corrige sobreconfianza del LLM en extremos)
     const clampP  = (p) => Math.max(0.01, Math.min(0.99, Number(p)));
@@ -2406,7 +2519,7 @@ Return JSON with this exact schema:
     const daysToResolution  = hoursToResolution / 24;
 
     const timeConvergenceBase = Math.pow(24 / Math.max(24, hoursToResolution), 0.45);
-    const catalystBoost       = (hasFreshNews && !lacksCatalyst && !catalystAudit.isAlreadyPricedIn) ? 0.35 : 0.0;
+    const catalystBoost       = (hasFreshNews && !lacksCatalyst && !tetlockGuard.vetoD_PricedIn) ? 0.35 : 0.0;
     const orderflowBoost      = (effectiveObi >= 0.25 && sideTapeImbalance >= 0.20) ? 0.20 : 0.0;
     const kappa24h            = Math.max(0.25, Math.min(1.0, timeConvergenceBase + catalystBoost + orderflowBoost));
 
@@ -2459,7 +2572,7 @@ Return JSON with this exact schema:
     const pillars = {
       bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && effectiveObi >= -0.05,
       orderflowAlignment: (effectiveObi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
-      catalystOrMath: (hasFreshNews && !lacksCatalyst && !catalystAudit.isAlreadyPricedIn) || (effectiveObi >= 0.35 && sideTapeImbalance >= 0.20),
+      catalystOrMath: (hasFreshNews && !lacksCatalyst && !tetlockGuard.vetoD_PricedIn) || (effectiveObi >= 0.35 && sideTapeImbalance >= 0.20),
       positiveExpectancy: netEdgePct >= MIN_NET_EDGE_PCT && conf >= 70 && rewardToRisk >= 1.75,
     };
 
@@ -2496,14 +2609,24 @@ Return JSON with this exact schema:
       }
     }
 
-    // Veto Duro D (NUEVO v2.5.0): Catalizador Ya Descontado / Chasing Veto (PAR >= 65% o salto >= +11¢ en 6h)
-    if (catalystAudit.isAlreadyPricedIn) {
-      hardVetoes.push(`VETO_D_CATALYST_ALREADY_PRICED_IN (PAR=${(catalystAudit.priceAbsorptionRatio * 100).toFixed(0)}%, Vel6h=+${(effectivePriceVelocity6h * 100).toFixed(1)}¢, NewsAge=${minNewsAgeHours.toFixed(1)}h)`);
+    // Veto Duro D (v2.5.1): Catalizador Ya Descontado / Chasing Veto (PAR >= 65% o salto >= +11¢ en 6h)
+    if (tetlockGuard.vetoD_PricedIn) {
+      hardVetoes.push(`VETO_D_CATALYST_ALREADY_PRICED_IN (PAR=${(tetlockGuard.par * 100).toFixed(0)}%, MoveUp=+${(tetlockGuard.directionalMoveUp * 100).toFixed(1)}¢, NewsAge=${minNewsAgeHours.toFixed(1)}h)`);
     }
 
-    // Veto Duro E (NUEVO v2.5.0): Latencia Deportiva In-Play (<= 3.5h para resolución)
+    // Veto Duro E (v2.5.0): Latencia Deportiva In-Play (<= 3.5h para resolución)
     if (isSportsMatch && hoursToResolution <= 3.5) {
       hardVetoes.push(`VETO_E_SPORTS_LIVE_LATENCY_RISK (${hoursToResolution.toFixed(1)}h <= 3.5h)`);
+    }
+
+    // Veto Duro F (NUEVO v2.5.1): Escudo Anti-Cuchillo Cayendo ("Falling Knife" / Flujo Informado Adverso no indexado en RSS)
+    if (tetlockGuard.vetoF_FallingKnife) {
+      hardVetoes.push(`VETO_F_INFORMED_ADVERSE_DUMP (Move=${(tetlockGuard.directionalMoveDown * 100).toFixed(1)}¢, WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)})`);
+    }
+
+    // Veto Duro G (NUEVO v2.5.1): Divergencia Ciega Extrema sin Noticia de Última Hora (<= 3h)
+    if (tetlockGuard.vetoG_BlindHallucination) {
+      hardVetoes.push(`VETO_G_BLIND_LLM_DIVERGENCE (Diff=${(tetlockGuard.blindDivergenceAbs * 100).toFixed(1)}¢ sin noticia <=3h)`);
     }
 
     const confluenceScore = Object.values(pillars).filter(Boolean).length;
@@ -2516,7 +2639,7 @@ Return JSON with this exact schema:
     result.fair_prob = Number(calibratedFairProb.toFixed(4));
     result.reachable_fair_prob_24h = Number(reachableFairProb24h.toFixed(4));
     result.kappa_24h = Number(kappa24h.toFixed(3));
-    result.price_absorption_ratio = catalystAudit.priceAbsorptionRatio;
+    result.price_absorption_ratio = tetlockGuard.par;
     result.fair_value_yes = Number(fairYesProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
@@ -2980,6 +3103,33 @@ export async function fastSyncTrades() {
             }
           } else if (maxHoldReached) {
             closeReason = "MAX_HOLD";
+          }
+
+          // ─── 3b. Salida Anticipada por Invalidación de Microestructura (v2.5.1) ──
+          // Si la operación lleva >= 15 min abierta, está en pérdida >= 1.0¢ y aún no tocó SL,
+          // verificamos si el Order Book colapsó en nuestra contra (WOBI <= -0.32).
+          // Si hay pared de venta institucional encima, cortamos antes de regalar el Stop Loss completo.
+          if (!closeReason && !openTrade.breakEvenArmed && openTrade.tokenId) {
+            const openedRaw = openTrade.ts || openTrade.openedAt;
+            const openedAtMs = openedRaw ? new Date(openedRaw).getTime() : NaN;
+            const minutesHeld = Number.isFinite(openedAtMs) ? (Date.now() - openedAtMs) / 60000 : 0;
+            const currentLossCents = entryPrice - livePx;
+
+            if (minutesHeld >= 15 && currentLossCents >= 0.010) {
+              const liveBookSnap = await getOrderBookSnapshot(openTrade.tokenId).catch(() => null);
+              if (
+                liveBookSnap &&
+                Number.isFinite(liveBookSnap.wObi) &&
+                liveBookSnap.wObi <= -0.32 &&
+                liveBookSnap.pMicroWeighted < livePx
+              ) {
+                closeReason = "THESIS_INVALIDATED";
+                addLog(
+                  `⚡ [THESIS INVALIDATED] Salida anticipada en ${trade.id}: libro volcado en contra (WOBI=${liveBookSnap.wObi.toFixed(2)}, Pérdida=-${(currentLossCents * 100).toFixed(1)}¢). Cortando antes del SL.`,
+                  "RISK"
+                );
+              }
+            }
           }
 
           if (!closeReason) {
