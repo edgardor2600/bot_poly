@@ -19,6 +19,7 @@ const SIGNAL_TYPES = {
   MISPRICING: { label: "Precio Erróneo", color: "#aa77ff", icon: "💎" },
   NEWS: { label: "Noticia", color: "#ff9944", icon: "📰" },
   MOMENTUM: { label: "Momentum", color: "#00ff88", icon: "📈" },
+  ORDERFLOW: { label: "Flujo CLOB", color: "#00e5ff", icon: "🌊" },
   VOL_SPIKE: { label: "Vol. Anómalo", color: "#ffee44", icon: "⚡" },
   TIME_DECAY: { label: "Time Decay", color: "#ff5577", icon: "⏰" },
 };
@@ -425,7 +426,7 @@ export default function PolyBotV2() {
     ? trades.filter(t => String(t.executionMode || t.execution_mode || "").toUpperCase() === "REAL")
     : trades;
   const openTrades = realTrades.filter(t => ACTIVE_REAL_STATUSES.has(String(t.status || "").toUpperCase()));
-  const closedTrades = realTrades.filter(t => t.status === "CLOSED");
+  const closedTrades = realTrades.filter(t => t.status === "CLOSED" && t.closeReason !== "CLEANUP_SIMULATED");
   const invested = openTrades.reduce((s, t) => s + t.cost, 0);
   const walletUsdc = Number(walletSnapshot?.usdcBalance);
   const walletPol = Number(walletSnapshot?.polBalance);
@@ -437,7 +438,9 @@ export default function PolyBotV2() {
   const totalPnlPct = baseCapital > 0 ? parseFloat(((totalPnl / baseCapital) * 100).toFixed(2)) : 0;
   const realizedPnl = parseFloat(closedTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2));
   const wins = closedTrades.filter(t => t.pnl > 0).length;
-  const winRate = closedTrades.length > 0 ? (wins / closedTrades.length * 100).toFixed(1) : "—";
+  const losses = closedTrades.filter(t => t.pnl < 0).length;
+  const decidedCount = wins + losses;
+  const winRate = decidedCount > 0 ? (wins / decidedCount * 100).toFixed(1) : "—";
   const activeSignals = signals.filter(s => !s.executed);
 
   const filteredMarkets = allMarkets
@@ -498,7 +501,7 @@ export default function PolyBotV2() {
         <StatCard label="Capital Invertido" value={`$${invested.toFixed(2)}`} color={S.text} sub={`En ${openTrades.length} trades vivos`} />
         <StatCard label="Valor Total (Equidad)" value={`$${totalValue.toFixed(2)}`} color={S.white} />
         <StatCard label="P&L Hoy" value={fmtDlr(dailyPnl)} color={dailyPnl >= 0 ? S.green : S.red} sub={`Ganancia Neta Diaria`} />
-        <StatCard label="Win Rate" value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? S.green : parseFloat(winRate) > 0 ? S.amber : S.muted2} sub={`${wins}W / ${closedTrades.length - wins}L`} />
+        <StatCard label="Win Rate" value={`${winRate}%`} color={parseFloat(winRate) >= 50 ? S.green : parseFloat(winRate) > 0 ? S.amber : S.muted2} sub={`${wins}W / ${losses}L`} />
         <StatCard label="Mercados" value={allMarkets.length || "—"} color={S.white} sub={scanStatus.lastScan ? `Scan: ${scanStatus.lastScan?.slice(0, 8)}` : "Sin escaneo"} />
         <StatCard label="Señales" value={activeSignals.length} color={activeSignals.length > 0 ? S.amber : S.muted2} />
         <StatCard
@@ -993,7 +996,7 @@ export default function PolyBotV2() {
               {[
                 ["P&L Total", `${totalPnl >= 0 ? "+" : ""}$${totalPnl}`, `${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct}%`, totalPnl >= 0 ? S.green : S.red],
                 ["P&L Realizado", `${realizedPnl >= 0 ? "+" : ""}$${realizedPnl}`, `${closedTrades.length} trades cerrados`, realizedPnl >= 0 ? S.green : S.red],
-                ["Win Rate", `${winRate}%`, `${wins}W / ${closedTrades.length - wins}L`, parseFloat(winRate) >= 50 ? S.green : S.amber],
+                ["Win Rate", `${winRate}%`, `${wins}W / ${losses}L`, parseFloat(winRate) >= 50 ? S.green : S.amber],
                 ["P&L Diario", `${dailyPnl >= 0 ? "+" : ""}$${dailyPnl.toFixed(2)}`, `Límite: -$${(baseCapital * config.dailyLossLimit / 100).toFixed(2)}`, dailyPnl >= 0 ? S.green : S.red],
               ].map(([l, v, sub, c]) => (
                 <div key={l} style={{ background: S.panel, border: `1px solid ${S.border2}`, padding: "12px 16px", borderRadius: "6px" }}>

@@ -290,16 +290,90 @@ async function findPersistedOpenTradeForMarket(marketId, conditionId) {
   }) || null;
 }
 
+function isMarketInCooldown(marketId, conditionId, question) {
+  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const mKey = String(marketId || "");
+  const cKey = String(conditionId || "");
+  const qKey = String(question || "").trim().toLowerCase();
+
+  let tradesLast24h = 0;
+
+  for (const t of botState.trades) {
+    if (t.closeReason === "CLEANUP_SIMULATED") continue;
+    const sameMarket =
+      (mKey && String(t.marketId) === mKey) ||
+      (cKey && String(t.conditionId) === cKey) ||
+      (qKey && String(t.question || "").trim().toLowerCase() === qKey);
+    if (!sameMarket) continue;
+
+    if (shouldManageTrade(t)) {
+      return { blocked: true, reason: "Ya existe posición activa en este mercado" };
+    }
+
+    const closedMs = t.closedAt ? new Date(t.closedAt).getTime() : (t.ts ? new Date(t.ts).getTime() : 0);
+    if (Number.isFinite(closedMs) && closedMs > 0) {
+      if ((now - closedMs) < SIX_HOURS_MS) {
+        const minsLeft = Math.ceil((SIX_HOURS_MS - (now - closedMs)) / 60000);
+        return { blocked: true, reason: `Cooldown anti-overtrading activo (${minsLeft} min restantes)` };
+      }
+      if ((now - closedMs) < DAY_MS) {
+        tradesLast24h++;
+      }
+    }
+  }
+
+  if (tradesLast24h >= 2) {
+    return { blocked: true, reason: "Límite de 2 operaciones por mercado en 24h alcanzado" };
+  }
+
+  return { blocked: false, reason: null };
+}
+
 async function buildTradePlan() {
+  const openTrades = getOpenTrades();
+  const openExposure = sumOpenExposure(openTrades);
+  const maxOpenTrades = Math.max(1, asNumber(botState.config.maxOpenTrades, 3));
+
   if (!isRealTradingEnabled()) {
-    const simulatedAmount = roundMoney(botState.config.maxTradeUsdc || 1);
+    if (openTrades.length >= maxOpenTrades) {
+      return {
+        allowed: false,
+        amount: 0,
+        reason: `Máximo de trades abiertos alcanzado (${openTrades.length}/${maxOpenTrades})`,
+        freeUsdc: botState.capital,
+        polBalance: 0,
+        openExposure,
+        walletSnapshot: null,
+      };
+    }
+
+    const totalEquity = botState.capital + openExposure;
+    const maxExposureUsdc = totalEquity * (asNumber(botState.config.maxExposurePct, 30) / 100);
+    const remainingExposureCapacity = Math.max(0, maxExposureUsdc - openExposure);
+    const simulatedAmount = roundMoney(Math.min(botState.config.maxTradeUsdc || 1, remainingExposureCapacity));
+    const minTradeUsdc = asNumber(botState.config.minTradeUsdc, 1);
+
+    if (simulatedAmount < minTradeUsdc) {
+      return {
+        allowed: false,
+        amount: 0,
+        reason: `Límite de exposición máxima (${botState.config.maxExposurePct}%) alcanzado`,
+        freeUsdc: botState.capital,
+        polBalance: 0,
+        openExposure,
+        walletSnapshot: null,
+      };
+    }
+
     return {
       allowed: botState.capital >= simulatedAmount,
       amount: simulatedAmount,
       reason: botState.capital >= simulatedAmount ? null : `Capital simulado insuficiente (${botState.capital.toFixed(2)})`,
       freeUsdc: botState.capital,
       polBalance: 0,
-      openExposure: sumOpenExposure(getOpenTrades()),
+      openExposure,
       walletSnapshot: null,
     };
   }
@@ -1239,9 +1313,12 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     const pre = item.pre || item.prelim;
     if (!m || !pre) continue;
 
-    // Diversificación de eventos: máximo 1 candidato por evento raíz en el lote top de IA
+    // Diversificación de eventos y Cooldown Anti-Overtrading (6h tras cierre / máx 2 trades en 24h)
     const eventKey = pre.eventSlug || m.id;
     if (eventKey && seenEvents.has(eventKey)) continue;
+
+    const cooldownCheck = isMarketInCooldown(m.id, m.conditionId, m.question);
+    if (cooldownCheck.blocked) continue;
 
     const condId = m.conditionId || m.condition_id || null;
     const [yesBook, noBook, tradeFlow] = await Promise.all([
@@ -1638,6 +1715,7 @@ CRITICAL RULES:
 2. Never recommend a side marked Tradable=NO.
 3. Check PRICE_ACTION (1h/24h/7d) vs news age: if a market already moved >20% in 24h because of old news, that catalyst is ALREADY PRICED IN — return action="SKIP".
 4. Avoid the Longshot Bias: be extra skeptical of buying outcomes priced below 18c unless mathematical or hard-news evidence is overwhelming.
+5. SPORTS & ESPORTS WARNING: If the live CLOB price is between 15c and 85c, the match HAS NOT BEEN PLAYED YET. Any final score in RECENT_NEWS is from a PAST game earlier in the season — NEVER treat a past game score as the result of the upcoming match. If there is no fresh injury/lineup catalyst ("no recent catalyst"), return action="SKIP".
 Return ONLY raw valid JSON.`
       },
       {
@@ -1709,15 +1787,31 @@ Return JSON with this exact schema:
     rawSideProb = Math.max(0.01, Math.min(0.99, rawSideProb));
     const executableAsk = selectedBook.bestAsk;
     const marketMicro = selectedBook.microPrice ?? selectedBook.midPrice ?? executableAsk;
+    const sideTapeImbalance = tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0;
+
+    // Protección dura contra mercados deportivos donde la IA confunde marcadores pasados o no tiene catalizador nuevo
+    const isSportsMatch = m._cat === "SPORTS" || /\b(vs\.?|handicap|esports|nba|nfl|mlb|nhl|ufc)\b/i.test(m.question || "");
+    const lacksCatalyst = /no recent catalyst|no new info|older news|no recent news|sin noticias recientes/i.test(
+      `${result.news_found || ""} ${result.reasoning || ""}`
+    );
+
+    if (lacksCatalyst && (selectedBook.obi < 0.45 || sideTapeImbalance < 0.25)) {
+      result.action = "SKIP";
+      result.reasoning = `[FILTRO CATALIZADOR] Sin noticia nueva ni flujo institucional fuerte (OBI=${selectedBook.obi.toFixed(2)}, Tape=${sideTapeImbalance.toFixed(2)}). ${result.reasoning || ""}`;
+    }
+
+    if (isSportsMatch && executableAsk >= 0.20 && executableAsk <= 0.80) {
+      // Un partido entre 20c y 80c aún no se ha resuelto; bloquear alucinaciones de "marcador final ya jugado"
+      rawSideProb = Math.min(rawSideProb, marketMicro + 0.14);
+    }
 
     // 1. Contracción Bayesiana (Bayesian Shrinkage) hacia el Micro-Precio eficiente del mercado
     // Evita que la sobreconfianza del LLM invente edges irreales sin respaldo de noticias + flujo
     let aiWeight = 0.56;
-    if (hasFreshNews) aiWeight += 0.08;
+    if (hasFreshNews && !lacksCatalyst) aiWeight += 0.08;
     if (selectedBook.obi >= 0.15) aiWeight += 0.06;
     else if (selectedBook.obi <= -0.15) aiWeight -= 0.08;
 
-    const sideTapeImbalance = tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0;
     if (sideTapeImbalance >= 0.15) aiWeight += 0.06;
     else if (sideTapeImbalance <= -0.20) aiWeight -= 0.08;
 
