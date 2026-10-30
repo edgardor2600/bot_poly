@@ -1505,7 +1505,9 @@ export default function PolyBotV2() {
                                     ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
                                     : t.closeReason === "THESIS_INVALIDATED"
                                       ? { txt: "⚡ TESIS INVALIDADA", c: S.amber }
-                                      : { txt: "🛑 STOP LOSS", c: S.red };
+                                      : t.closeReason === "OPPORTUNITY_COST_SWAP"
+                                        ? { txt: "♻️ ROTACIÓN CAPITAL", c: S.cyan }
+                                        : { txt: "🛑 STOP LOSS", c: S.red };
                           const netReal = t.netPnlAfterFriction ?? (t.pnl - (t.frictionUsd || 0.015));
                           return (
                             <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>

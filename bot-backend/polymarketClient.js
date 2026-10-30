@@ -589,22 +589,43 @@ export function computeExecutableBookWalk({
   };
 }
 
-export async function getTokenSellPrice(tokenId, targetShares = null) {
-  if (!tokenId) return null;
+/**
+ * Cotización de salida dual (v2.6.1):
+ *  - bestBid  → precio marginal del tope del libro. ÚNICO valor válido para GATILLOS (SL, Break-Even, Trailing, TP).
+ *  - vwapBid  → precio medio ejecutable de vender `targetShares` barriendo bids[]. Para LIQUIDACIÓN y contabilidad de PnL.
+ * Evita que el adelgazamiento transitorio del nivel 2 dispare Stop Loss falsos.
+ */
+export async function getTokenExitQuote(tokenId, targetShares = null) {
+  if (!tokenId) return { bestBid: null, vwapBid: null, realSellSlippage: 0 };
 
-  // 1. Primary source (works in BOTH simulation and real trading): real CLOB L2 VWAP Bid / bestBid
   const book = await getOrderBookSnapshot(tokenId);
   if (book && Number.isFinite(book.bestBid) && book.bestBid > 0.001 && book.bestBid < 0.999) {
+    let vwapBid = book.bestBid;
+    let realSellSlippage = 0;
     if (Number.isFinite(Number(targetShares)) && Number(targetShares) > 0 && Array.isArray(book.bids) && book.bids.length > 0) {
       const walk = computeExecutableBookWalk({
         bids: book.bids,
         asks: book.asks || [],
         targetSellShares: Number(targetShares),
       });
-      if (Number.isFinite(walk.vwapBid) && walk.vwapBid > 0.001 && walk.vwapBid < 0.999) {
-        return walk.vwapBid;
+      if (Number.isFinite(walk.vwapBid) && walk.vwapBid > 0.001 && walk.vwapBid <= book.bestBid) {
+        vwapBid = walk.vwapBid;
+        realSellSlippage = Math.max(0, book.bestBid - walk.vwapBid);
       }
     }
+    return { bestBid: book.bestBid, vwapBid, realSellSlippage };
+  }
+
+  const fallbackPx = await getTokenSellPrice(tokenId);
+  return { bestBid: fallbackPx, vwapBid: null, realSellSlippage: 0 };
+}
+
+export async function getTokenSellPrice(tokenId) {
+  if (!tokenId) return null;
+
+  // 1. Primary source (works in BOTH simulation and real trading): real CLOB top-of-book bestBid (precio de gatillo)
+  const book = await getOrderBookSnapshot(tokenId);
+  if (book && Number.isFinite(book.bestBid) && book.bestBid > 0.001 && book.bestBid < 0.999) {
     return book.bestBid;
   }
 

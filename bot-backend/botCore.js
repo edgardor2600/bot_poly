@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { computeExecutableBookWalk, getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+import { computeExecutableBookWalk, getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenExitQuote, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
 export { computeExecutableBookWalk };
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
@@ -1513,7 +1513,9 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
   const seenEvents = new Set();
   const maxProbes = Math.min(scoredMarkets.length, Math.max(targetCount * 4, 24));
 
-  for (let i = 0; i < maxProbes && verified.length < targetCount; i++) {
+  const poolSize = Math.max(targetCount, targetCount * 2);
+
+  for (let i = 0; i < maxProbes && verified.length < poolSize; i++) {
     const item = scoredMarkets[i];
     const m = item.m || item.market;
     const pre = item.pre || item.prelim;
@@ -1525,6 +1527,9 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
 
     // Guardia Anti-Correlación Temática (v2.6.0): no analizar mercados correlacionados con posiciones ya abiertas
     if (hasCorrelatedOpenPosition(m, botState.trades)) continue;
+
+    // v2.7.0: tampoco gastar llamadas a Groq en candidatos correlacionados entre sí dentro del mismo lote
+    if (hasCorrelatedOpenPosition(m, verified.map(v => ({ status: "OPEN", question: v.m.question, eventId: v.m?.events?.[0]?.id })))) continue;
 
     const cooldownCheck = isMarketInCooldown(m.id, m.conditionId, m.question);
     if (cooldownCheck.blocked) continue;
@@ -1574,10 +1579,24 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     }
 
     if (eventKey) seenEvents.add(eventKey);
+
+    // v2.7.0: puntuación de asimetría microestructural pre-Groq (S_pre) sobre los libros tradables
+    pre.alphaScore = computePreGroqAlphaScore({
+      yesBook: yesTradable ? yesBook : null,
+      noBook: noTradable ? noBook : null,
+      tradeFlow,
+      liquidity: asNumber(m.liquidityNum ?? m.liquidity ?? pre.liq, 0),
+    });
     verified.push({ m, pre });
   }
 
-  return verified;
+  // v2.7.0: Groq analiza primero los libros con mayor huella de dinero informado (no los más eficientes/líquidos)
+  verified.sort((a, b) => (b.pre.alphaScore || 0) - (a.pre.alphaScore || 0));
+  const selected = verified.slice(0, targetCount);
+  if (selected.length > 0) {
+    addLog(`🎯 [ALPHA PRE-GROQ] Ranking S_pre: ${selected.map(v => `${v.pre.alphaScore.toFixed(2)}`).join(" > ")} (pool ${verified.length})`, "FILTER");
+  }
+  return selected;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1998,9 +2017,24 @@ export function computeDualCryptoOracleProb({
 }
 
 /**
- * 5. Deriva Estocástica de Supervivencia (Poisson Theta Adjustment — v2.6.0)
- * Penaliza compras de YES en mercados tipo "¿Ocurrirá X antes de T?" donde cada hora
- * sin evento erosiona el precio, y bonifica compras de NO que cobran ese decaimiento.
+ * Detecta la polaridad de Theta de un mercado de evento discreto (v2.6.1).
+ *  +1 → YES es el salto disruptivo ("¿Ocurrirá X antes de T?"): el tiempo sin evento erosiona YES y favorece NO.
+ *  -1 → YES es la retención del status-quo o la negación ("remain / stay / hold / not strike"):
+ *       el tiempo sin evento FAVORECE a YES y erosiona NO.
+ */
+export function detectHazardPolarity(questionText = "") {
+  const q = String(questionText).toLowerCase();
+  const isStatusQuoRetention =
+    /\b(remain|remains|remaining|stay|stays|staying|keep|keeps|retain|retains|survive|survives|maintain|maintains|still)\b/.test(q) ||
+    /\b(will not|won't|wont|not\s+(?:strike|invade|attack|resign|raise|cut|cross|fall|drop|announce|launch|fire|hit|reach|default|end|collapse)|no\s+(?:new|more|further)|fail to|without)\b/.test(q) ||
+    /\b(ceasefire|cease-fire|truce|peace|deal|agreement|ban|lockdown)\b[^?]*\b(hold|holds|last|lasts|survive|survives|remain|remains)\b/.test(q);
+  return isStatusQuoRetention ? -1 : 1;
+}
+
+/**
+ * 5. Deriva Estocástica de Supervivencia (Poisson Theta Adjustment — v2.6.0 / polaridad v2.6.1)
+ * Penaliza compras del lado disruptivo en mercados tipo "¿Ocurrirá X antes de T?" donde cada hora
+ * sin evento erosiona el precio, y bonifica compras del lado pasivo que cobran ese decaimiento.
  */
 export function computeThetaAdjustedFairProb24h({
   questionText = "",
@@ -2015,9 +2049,9 @@ export function computeThetaAdjustedFairProb24h({
   const baseReachable = marketMicro + kappa24h * (calibratedFairProb - marketMicro);
   const qLower = String(questionText).toLowerCase();
 
-  // Detectar mercados de ocurrencia de evento discreto (Hazard-Rate Markets)
+  // Detectar mercados de ocurrencia de evento discreto (Hazard-Rate Markets) o de retención de status-quo
   const isDiscreteHazardMarket =
-    /\b(before|by |will .* strike|will .* invade|will .* resign|will .* fire|will .* announce|will .* reach|will .* hit|in [a-z]+ 2026)\b/i.test(qLower) &&
+    /\b(before|by |through|until|will .* strike|will .* invade|will .* resign|will .* fire|will .* announce|will .* reach|will .* hit|will .* remain|will .* stay|in [a-z]+ 2026)\b/i.test(qLower) &&
     !/\b(vs\.?|win the|match|election winner)\b/i.test(qLower);
 
   if (!isDiscreteHazardMarket || hoursToResolution > 336) {
@@ -2026,22 +2060,46 @@ export function computeThetaAdjustedFairProb24h({
 
   // Tasa de erosión en 24h cuando no ocurre el evento discreto
   const timeFraction24h = Math.min(0.50, 24.0 / Math.max(24.0, hoursToResolution));
-  const yesMicro = selectedSide === "YES" ? marketMicro : (1.0 - marketMicro);
+  const sideMicro = selectedSide === "YES" ? marketMicro : (1.0 - marketMicro);
 
-  // Si hay noticia fresca hoy, el decaimiento pasivo de YES se reduce a la mitad
+  // Si hay noticia fresca hoy, el decaimiento pasivo se reduce a la mitad
   const hazardDecayRate = hasFreshNews ? 0.06 : 0.14;
-  const thetaShiftMag = Math.min(0.028, yesMicro * (1.0 - yesMicro) * timeFraction24h * hazardDecayRate * 4.0);
+  const thetaShiftMag = Math.min(0.028, sideMicro * (1.0 - sideMicro) * timeFraction24h * hazardDecayRate * 4.0);
 
-  // Para YES, el paso del tiempo sin evento resta valor (-thetaShiftMag).
-  // Para NO, el paso del tiempo sin evento suma valor (+thetaShiftMag).
-  const directionalTheta = selectedSide === "YES" ? -thetaShiftMag : +thetaShiftMag;
+  // Polaridad: en mercados estándar (+1) el paso del tiempo sin evento resta a YES y suma a NO.
+  // En mercados de status-quo/negación (-1) la física se invierte: suma a YES y resta a NO.
+  const polarity = detectHazardPolarity(questionText);
+  const yesTheta = -polarity * thetaShiftMag;
+  const directionalTheta = selectedSide === "YES" ? yesTheta : -yesTheta;
 
   return Number(clampProb(baseReachable + directionalTheta).toFixed(4));
 }
 
 /**
- * 6. Bloqueo de Concentración Temática entre las 3 Posiciones Abiertas (v2.6.0)
- * Impide abrir dos trades del mismo evento, mismo activo cripto o alta superposición léxica (Jaccard >= 0.34).
+ * Mapa de conceptos temáticos (v2.6.1): sinónimos macro / cripto / geopolíticos que Jaccard literal no detecta.
+ * Dos mercados que comparten un concepto se consideran la misma apuesta subyacente.
+ */
+const THEMATIC_CONCEPTS = [
+  ["FED_RATES", /\b(fed|federal reserve|fomc|powell|jerome powell|interest rates?|rate (?:cut|cuts|hike|hikes|reduction|decision|increase)|rates? (?:cut|cuts|hike|hikes|reduction)|\d+\s?bps|basis points?)\b/i],
+  ["CRYPTO_MAJOR", /\b(bitcoin|btc|ethereum|eth|ether|solana|sol|xrp|ripple|dogecoin|doge|crypto|cryptocurrency)\b/i],
+  ["TARIFFS_TRADE", /\b(tariffs?|trade war|trade deal|duties|customs)\b/i],
+  ["MIDDLE_EAST_CONFLICT", /\b(israel|iran|gaza|hamas|hezbollah|houthis?|lebanon|tehran|netanyahu|ceasefire|cease-fire)\b/i],
+  ["RUSSIA_UKRAINE", /\b(russia|ukraine|putin|zelensky|zelenskyy|kyiv|kremlin)\b/i],
+];
+
+export function extractThematicConcepts(text = "") {
+  const found = new Set();
+  const s = String(text || "");
+  for (const [concept, rx] of THEMATIC_CONCEPTS) {
+    if (rx.test(s)) found.add(concept);
+  }
+  return found;
+}
+
+/**
+ * 6. Bloqueo de Concentración Temática entre las 3 Posiciones Abiertas (v2.6.0 / sinónimos v2.6.1)
+ * Impide abrir dos trades del mismo evento, mismo concepto temático (Fed, cripto, aranceles, Medio Oriente...)
+ * o alta superposición léxica (Jaccard >= 0.34).
  */
 export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
   if (!Array.isArray(openTrades) || openTrades.length === 0) return false;
@@ -2067,6 +2125,7 @@ export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
     candidateMarket?.events?.[0]?.id ||
     candidateMarket?.events?.[0]?.slug;
   const candTokens = tokenize(candidateMarket?.question);
+  const candConcepts = extractThematicConcepts(candidateMarket?.question);
 
   for (const trade of openTrades) {
     if (trade.status !== "OPEN" && trade.status !== "PARTIAL") continue;
@@ -2077,7 +2136,15 @@ export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
       return true;
     }
 
-    // 2. Superposición léxica de Jaccard >= 0.34 (ej. dos mercados distintos sobre Bitcoin o Trump)
+    // 2. Mismo concepto temático (sinónimos: Fed/Powell/FOMC/rate cut; BTC/ETH/SOL; Israel/Iran...)
+    if (candConcepts.size > 0) {
+      const openConcepts = extractThematicConcepts(trade.question);
+      for (const c of candConcepts) {
+        if (openConcepts.has(c)) return true;
+      }
+    }
+
+    // 3. Superposición léxica de Jaccard >= 0.34
     const openTokens = tokenize(trade.question);
     if (candTokens.size > 0 && openTokens.size > 0) {
       let intersection = 0;
@@ -2093,6 +2160,123 @@ export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
   }
 
   return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POLYBOT v2.7.0 — RANKING PRE-GROQ, TORNEO DE CAPITAL Y AUTOCALIBRACIÓN EMPÍRICA
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 7. Puntuación de Asimetría Microestructural Pre-Groq (S_pre)
+ * S_pre = 0.35·|WOBI| + 0.35·|ETI| + 0.20·exp(-60·S_abs) + 0.10·1[Liq ∈ [2500, 45000]]
+ * Prioriza enviar a Groq los libros donde el dinero informado ya deja huella microestructural.
+ */
+export function computePreGroqAlphaScore({ yesBook = null, noBook = null, tradeFlow = null, liquidity = 0 } = {}) {
+  const books = [yesBook, noBook].filter(b => b && b.isValid);
+  if (books.length === 0) return 0;
+
+  const absWobi = Math.max(...books.map(b => Math.abs(Number(b.wObi ?? b.obi ?? 0)) || 0));
+  const minSpread = Math.min(...books.map(b => Number.isFinite(Number(b.spreadAbs)) ? Number(b.spreadAbs) : 0.05));
+
+  let absEti = 0;
+  if (Array.isArray(tradeFlow?.rawTrades) && tradeFlow.rawTrades.length > 0) {
+    absEti = Math.abs(computeTimeDecayedTapeMetrics(tradeFlow.rawTrades, "YES").etiImbalance || 0);
+  } else if (tradeFlow) {
+    absEti = Math.abs(Number(tradeFlow.tapeImbalance) || 0);
+  }
+
+  const liq = Number(liquidity) || 0;
+  const liqBand = (liq >= 2500 && liq <= 45000) ? 1 : 0;
+
+  const score =
+    0.35 * Math.min(1, absWobi) +
+    0.35 * Math.min(1, absEti) +
+    0.20 * Math.exp(-60 * Math.max(0, minSpread)) +
+    0.10 * liqBand;
+  return Number(score.toFixed(4));
+}
+
+/**
+ * 8. Utilidad Binaria de la Señal (Torneo Kelly-Sharpe)
+ * U = NetEdge¢ / sqrt(P_ask·(1 − P_ask)) × (Confianza / 100)
+ */
+export function computeSignalUtility(analysis = {}) {
+  const netEdgeCents = Number(analysis.edge_pct) || 0;
+  const ask = Math.max(0.05, Math.min(0.95, Number(analysis.executable_ask) || 0.5));
+  const conf = Math.max(0, Math.min(100, Number(analysis.confidence) || 0));
+  return Number(((netEdgeCents / Math.sqrt(ask * (1 - ask))) * (conf / 100)).toFixed(4));
+}
+
+/**
+ * 9. Selección de Posición Estancada para Rotación (OPPORTUNITY_COST_SWAP)
+ * Zombie = >= 6h en cartera, precio estancado (|px − entrada| <= 0.8¢), sin Break-Even armado,
+ * y la señal nueva supera su NetEdge en >= +4.5¢. Devuelve el zombie con mayor brecha o null.
+ */
+export function findZombieTradeForSwap(openTrades = [], candidateNetEdgeCents = 0, nowMs = Date.now()) {
+  let best = null;
+  let bestGap = -Infinity;
+  for (const t of openTrades) {
+    if (t.status !== "OPEN" && t.status !== "PARTIAL") continue;
+    if (t.breakEvenArmed || t.forceCloseReason) continue;
+    const openedRaw = t.ts || t.openedAt;
+    const openedMs = openedRaw ? new Date(openedRaw).getTime() : NaN;
+    if (!Number.isFinite(openedMs)) continue;
+    const hoursHeld = (nowMs - openedMs) / 3600_000;
+    if (hoursHeld < 6.0) continue;
+    const px = Number(t.currentPrice);
+    const entry = Number(t.entryPrice);
+    if (!Number.isFinite(px) || !Number.isFinite(entry) || Math.abs(px - entry) > 0.008) continue;
+    const gap = Number(candidateNetEdgeCents) - (Number(t.edge_pct) || 0);
+    if (gap >= 4.5 && gap > bestGap) {
+      best = t;
+      bestGap = gap;
+    }
+  }
+  return best;
+}
+
+/**
+ * 10. Autocalibración Bayesiana en Vivo (ψ_emp ∈ [0.68, 0.92])
+ * ψ = clamp(0.68, 0.92, 0.82 + 0.35·(Ȳ_realizado − P̄_predicho)), con medias ponderadas por decaimiento
+ * exponencial (vida media 15 trades) sobre los últimos 40 cierres. Exige >= 10 cierres; si hay >= 8 del
+ * mismo lado usa la muestra del lado. Sin muestra suficiente devuelve el valor base 0.82.
+ */
+export function computeEmpiricalCalibrationFeedback(trades = [], side = null) {
+  const BASE_PSI = 0.82;
+  const closed = (Array.isArray(trades) ? trades : [])
+    .filter(t => String(t?.status || "").toUpperCase() === "CLOSED")
+    .sort((a, b) => new Date(b.closedAt || b.ts || 0).getTime() - new Date(a.closedAt || a.ts || 0).getTime())
+    .slice(0, 40);
+
+  if (closed.length < 10) return { psi: BASE_PSI, n: closed.length, yBar: null, pBar: null, scope: "INSUFFICIENT" };
+
+  const stats = (sample) => {
+    let wSum = 0, ySum = 0, pSum = 0;
+    sample.forEach((t, idx) => {
+      const w = Math.exp(-Math.LN2 * idx / 15);
+      const net = Number(t.netPnlAfterFriction ?? t.pnl ?? 0);
+      const y = net > 0.005 ? 1 : 0;
+      const entry = Number(t.entryPrice);
+      const fallbackP = Number.isFinite(entry) ? entry + (Number(t.edge_pct) || 0) / 100 : 0.5;
+      const p = Math.max(0.02, Math.min(0.98, Number(t.predictedProb ?? fallbackP)));
+      wSum += w; ySum += w * y; pSum += w * p;
+    });
+    return wSum > 0 ? { yBar: ySum / wSum, pBar: pSum / wSum } : null;
+  };
+
+  const sideSample = side ? closed.filter(t => String(t.side || "").toUpperCase() === String(side).toUpperCase()) : [];
+  const useSide = sideSample.length >= 8;
+  const s = stats(useSide ? sideSample : closed);
+  if (!s) return { psi: BASE_PSI, n: closed.length, yBar: null, pBar: null, scope: "INSUFFICIENT" };
+
+  const psi = Math.max(0.68, Math.min(0.92, BASE_PSI + 0.35 * (s.yBar - s.pBar)));
+  return {
+    psi: Number(psi.toFixed(4)),
+    n: useSide ? sideSample.length : closed.length,
+    yBar: Number(s.yBar.toFixed(3)),
+    pBar: Number(s.pBar.toFixed(3)),
+    scope: useSide ? `SIDE_${String(side).toUpperCase()}` : "GLOBAL",
+  };
 }
 
 async function getCryptoSpotContext(question, daysLeft) {
@@ -2619,8 +2803,9 @@ Return JSON with this exact schema:
     const logit   = (p) => Math.log(clampP(p) / (1 - clampP(p)));
     const sigmoid = (z) => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, z))));
 
-    // Contracción de Platt (0.82) sobre el logit crudo del LLM para mitigar alucinación de certeza
-    const rawLogitShrunk     = 0.82 * logit(rawSideProb);
+    // Contracción de Platt AUTOCALIBRADA (ψ_emp ∈ [0.68, 0.92], base 0.82) según la tasa de acierto real vs la probabilidad predicha
+    const calibFeedback      = computeEmpiricalCalibrationFeedback(botState.trades, selectedSide);
+    const rawLogitShrunk     = calibFeedback.psi * logit(rawSideProb);
     const microLogit         = logit(marketMicro);
     const combinedLogit      = (aiWeight * rawLogitShrunk) + ((1 - aiWeight) * microLogit);
     const calibratedFairProb = clampP(sigmoid(combinedLogit));
@@ -2777,6 +2962,8 @@ Return JSON with this exact schema:
     result.reachable_fair_prob_24h = Number(reachableFairProb24h.toFixed(4));
     result.kappa_24h = Number(kappa24h.toFixed(3));
     result.price_absorption_ratio = tetlockGuard.par;
+    result.platt_psi = calibFeedback.psi;
+    result.platt_psi_scope = calibFeedback.scope;
     result.fair_value_yes = Number(fairYesProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.vwap_ask = bookWalk.vwapAsk;
@@ -2901,6 +3088,7 @@ export async function runFullScan() {
         const viable = await selectOrderBookVerifiedCandidates(scored, targetAiCount);
         addLog(`✅ Filtros + OrderBook CLOB superados: ${viable.length}/${scored.length} mercados pasan a IA Profunda`, "FILTER");
 
+        const approvedQueue = [];
         for (let i = 0; i < viable.length; i++) {
           const { m, pre } = viable[i];
           botState.scanStatus.phase = `IA Analizando: ${m.question.slice(0, 30)}...`;
@@ -2932,7 +3120,24 @@ export async function runFullScan() {
             addLog(`✨ [SEÑAL IA] ${analysis.action} | Score: ${scoreNum}/100 | Conf: ${confNum}% | Edge Neto: ${analysis.edge_pct}% | Merc: ${m.question.slice(0, 50)}`, "AI");
 
             await insertAiSignalSafe(sig, m, pre, analysis);
+            approvedQueue.push({ m, pre, analysis, sig, scoreNum, confNum });
+          } catch (error) {
+            addLog(`❌ [SCAN] Error analizando mercado: ${error.message}`, "ERROR");
+          }
 
+          await new Promise(res => setTimeout(res, 200));
+        }
+
+        // ── FASE 2 (v2.7.0): TORNEO DE CAPITAL ──
+        // Las señales aprobadas compiten por los slots por Utilidad Binaria U = NetEdge¢ / sqrt(P(1-P)) × Conf/100,
+        // en lugar de abrirse por orden de iteración.
+        approvedQueue.sort((a, b) => computeSignalUtility(b.analysis) - computeSignalUtility(a.analysis));
+        if (approvedQueue.length > 1) {
+          addLog(`🏆 [TORNEO] Ranking de señales por U: ${approvedQueue.map(q => `${q.m.question.slice(0, 22)}…(${computeSignalUtility(q.analysis).toFixed(2)})`).join(" > ")}`, "AI");
+        }
+
+        for (const { m, pre, analysis, sig } of approvedQueue) {
+          try {
             if (botState.goalReached) {
               addLog("🛑 META DIARIA ALCANZADA: inversión en espera.", "SYSTEM");
               continue;
@@ -2992,7 +3197,26 @@ export async function runFullScan() {
               }
             }
 
-            const tradePlan = await buildTradePlan();
+            let tradePlan = await buildTradePlan();
+
+            // ── v2.7.0: Rotación por Costo de Oportunidad (Zombie Trade Swap) ──
+            // Con los slots llenos, liquida una posición estancada si la nueva señal supera su NetEdge en >= +4.5¢.
+            const slotsFull = getOpenTrades().length >= Math.max(1, asNumber(botState.config.maxOpenTrades, 3));
+            if (!tradePlan.allowed && slotsFull) {
+              const zombie = findZombieTradeForSwap(getOpenTrades(), asNumber(analysis.edge_pct, 0));
+              if (zombie) {
+                addLog(`♻️ [OPPORTUNITY SWAP] Rotando ${zombie.id} (estancado, edge ${asNumber(zombie.edge_pct, 0).toFixed(1)}¢) → ${m.question.slice(0, 50)} (edge ${asNumber(analysis.edge_pct, 0).toFixed(1)}¢)`, "TRADE");
+                const zIdx = botState.trades.findIndex(x => x.id === zombie.id);
+                if (zIdx >= 0) botState.trades[zIdx].forceCloseReason = "OPPORTUNITY_COST_SWAP";
+                await fastSyncTrades();
+                if (zIdx >= 0 && botState.trades[zIdx].status !== "CLOSED") {
+                  botState.trades[zIdx].forceCloseReason = null; // la salida no se completó: no dejar la marca pendiente
+                } else {
+                  tradePlan = await buildTradePlan();
+                }
+              }
+            }
+
             if (!tradePlan.allowed) {
               addLog(`⛔ [TRADE BLOQUEADO] ${tradePlan.reason}`, "WARN");
               continue;
@@ -3074,6 +3298,7 @@ export async function runFullScan() {
               frictionDeducted: true,
               confidence: analysis.confidence,
               edge_pct: analysis.edge_pct,
+              predictedProb: Number.isFinite(Number(analysis.fair_prob)) ? Number(analysis.fair_prob) : null,
               score: analysis.score,
               risk: analysis.risk,
               signal_types: analysis.signal_types || [],
@@ -3161,9 +3386,12 @@ export async function fastSyncTrades() {
         for (const trade of openTrades) {
           let livePx = null;
 
-          // Fetch live CLOB VWAP Bid for the actual position shares in BOTH Simulation and Real mode
+          // Cotización dual (v2.6.1): bestBid = precio de GATILLO (SL/BE/Trailing/TP); vwapBid = precio de LIQUIDACIÓN / PnL
+          let exitVwapBid = null;
           if (trade.tokenId) {
-            livePx = await getTokenSellPrice(trade.tokenId, asNumber(trade.shares, 1));
+            const exitQuote = await getTokenExitQuote(trade.tokenId, asNumber(trade.shares, 1));
+            livePx = exitQuote.bestBid;
+            exitVwapBid = exitQuote.vwapBid;
           }
 
           if ((!Number.isFinite(livePx) || livePx <= 0.001 || livePx >= 0.999) && Number.isFinite(trade.currentPrice)) {
@@ -3271,9 +3499,11 @@ export async function fastSyncTrades() {
             // Anti-Wick en polling de 3 min: esperar 1.5s y verificar segundo snapshot rápido del CLOB
             if (trade.tokenId) {
               await new Promise(res => setTimeout(res, 1500));
-              const secondCheckPx = await getTokenSellPrice(trade.tokenId, shares);
+              const secondQuote = await getTokenExitQuote(trade.tokenId, shares);
+              const secondCheckPx = secondQuote.bestBid;
               if (Number.isFinite(secondCheckPx) && secondCheckPx > 0.001 && secondCheckPx < 0.999) {
                 livePx = secondCheckPx;
+                exitVwapBid = secondQuote.vwapBid;
                 openTrade.currentPrice = livePx;
               }
             }
@@ -3288,6 +3518,11 @@ export async function fastSyncTrades() {
             }
           } else if (maxHoldReached) {
             closeReason = "MAX_HOLD";
+          }
+
+          // ─── 3a. Cierre forzado por rotación de capital (v2.7.0 OPPORTUNITY_COST_SWAP) ──
+          if (!closeReason && openTrade.forceCloseReason) {
+            closeReason = openTrade.forceCloseReason;
           }
 
           // ─── 3b. Salida Anticipada por Invalidación de Microestructura (v2.5.1) ──
@@ -3426,7 +3661,13 @@ export async function fastSyncTrades() {
             const exitSlippage = closeReason === "STOP_LOSS"
               ? 0.0020
               : (closeReason === "TRAILING_STOP" || closeReason === "BREAK_EVEN" ? 0.0015 : 0.0010);
-            closePrice = parseFloat(Math.max(0.005, livePx - exitSlippage).toFixed(4));
+            // v2.6.1: el vwapBid ya incorpora el slippage REAL de barrer bids[] → no se descuenta dos veces.
+            // El deslizamiento fijo actúa solo como piso de latencia: se cobra el MAYOR de ambos, nunca la suma.
+            const latencyFloorPx = livePx - exitSlippage;
+            const executableExitPx = Number.isFinite(exitVwapBid) && exitVwapBid > 0.001
+              ? Math.min(exitVwapBid, latencyFloorPx)
+              : latencyFloorPx;
+            closePrice = parseFloat(Math.max(0.005, executableExitPx).toFixed(4));
             const grossProceeds = asNumber(openTrade.shares, 0) * closePrice;
             const exitFeeRate = closeReason === "STOP_LOSS" ? 0.0050 : 0.0035;
             const exitFeeUsd = parseFloat(((grossProceeds * exitFeeRate) + 0.004).toFixed(4));
