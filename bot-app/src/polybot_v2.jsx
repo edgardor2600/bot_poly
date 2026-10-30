@@ -174,7 +174,10 @@ async function fetchAllMarkets(onProgress) {
 // ─── PRELIMINARY SCORING (Usa _prelim del backend o cálculo cuantitativo) ───
 function preliminaryScore(m, prevSnapshot) {
   if (m?._prelim && !m._prelim.skip && Number.isFinite(m._prelim.score)) {
-    return m._prelim;
+    return {
+      ...m._prelim,
+      signals: Array.isArray(m._prelim.signals) ? m._prelim.signals : [],
+    };
   }
   let p = [0.5, 0.5];
   try { p = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || [0.5, 0.5]); } catch(e){}
@@ -670,6 +673,7 @@ export default function PolyBotV2() {
   const ties = closedTrades.filter(t => t.pnl === 0).length;
   const decidedCount = wins + losses;
   const winRate = decidedCount > 0 ? (wins / decidedCount * 100).toFixed(1) : "—";
+  const activeSignals = validSignals;
   const pendingSignals = validSignals.filter(s => !s.executed);
   const displayedSignals = signalFilter === "PENDING"
     ? pendingSignals
@@ -1032,7 +1036,7 @@ export default function PolyBotV2() {
                         ["Valor justo YES", Number.isFinite(a.fair_value_yes) ? fmtPct(a.fair_value_yes) : "—", S.cyan],
                         ["Prob. Justa Lado", Number.isFinite(a.fair_prob) ? fmtPct(a.fair_prob) : "—", S.cyan],
                         ["Edge Neto IA", Number.isFinite(a.edge_pct) ? `+${a.edge_pct.toFixed(1)}%` : "—", S.amber],
-                        ["Vol 24h", fmtMoney(prelim?.vol24h || m.volume24hr || 0), S.white],
+                        ["Vol 24h", fmtMoney(prelim?.vol24 || m.volume24hr || 0), S.white],
                         ["Vol Total", fmtMoney(prelim?.vol || m.volumeNum || 0), S.text],
                         ["Liquidez", fmtMoney(prelim?.liq || m.liquidityNum || 0), S.text],
                         ["Sum YES+NO", fmtPct(prelim?.sum || 1), Math.abs((prelim?.sum || 1) - 1) > 0.03 ? S.amber : S.muted2],
