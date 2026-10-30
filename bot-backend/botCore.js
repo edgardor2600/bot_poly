@@ -17,6 +17,10 @@ const API_POLY = "https://gamma-api.polymarket.com/markets";
 const API_GROQ = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = getEnv("GROQ_MODEL", "openai/gpt-oss-120b");
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const API_CEREBRAS = "https://api.cerebras.ai/v1/chat/completions";
+const CEREBRAS_MODEL = getEnv("CEREBRAS_MODEL", "gpt-oss-120b");
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
+const LLM_PRIMARY_PROVIDER = getEnv("LLM_PRIMARY_PROVIDER", "AUTO").toUpperCase();
 const API_TAVILY = "https://api.tavily.com/search";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 export const BASE_CAPITAL = getNumberEnv("BASE_CAPITAL", 15);
@@ -2373,43 +2377,169 @@ async function getCryptoSpotContext(question, daysLeft) {
   }
 }
 
-async function callGroqResilient(body) {
-  // Intento 1: Modelo primario con json_object y 2048 tokens (para que el razonamiento nunca se trunque con 400)
-  const primaryBody = { ...body, max_tokens: 2048 };
-  let r = await fetch(API_GROQ, {
+// Estado de enfriamiento en memoria para failover automático entre Cerebras y Groq
+const llmProviderState = {
+  CEREBRAS: { cooldownUntilMs: 0, lastError: null, callsOk: 0 },
+  GROQ: { cooldownUntilMs: 0, lastError: null, callsOk: 0 },
+  activeProvider: null,
+};
+
+export function getLlmProviderStatus() {
+  const now = Date.now();
+  return {
+    activeProvider: llmProviderState.activeProvider || (getEnv("CEREBRAS_API_KEY") ? "CEREBRAS" : "GROQ"),
+    cerebrasConfigured: Boolean(getEnv("CEREBRAS_API_KEY")),
+    groqConfigured: Boolean(getEnv("GROQ_API_KEY")),
+    cerebrasReady: Boolean(getEnv("CEREBRAS_API_KEY")) && now >= llmProviderState.CEREBRAS.cooldownUntilMs,
+    groqReady: Boolean(getEnv("GROQ_API_KEY")) && now >= llmProviderState.GROQ.cooldownUntilMs,
+    cerebrasCallsOk: llmProviderState.CEREBRAS.callsOk,
+    groqCallsOk: llmProviderState.GROQ.callsOk,
+  };
+}
+
+async function tryProviderCompletion(provider, baseBody) {
+  const isCerebras = provider === "CEREBRAS";
+  const apiKey = isCerebras ? getEnv("CEREBRAS_API_KEY") : getEnv("GROQ_API_KEY");
+  if (!apiKey) {
+    return { ok: false, skipped: true, reason: `${provider}_NO_KEY` };
+  }
+
+  const endpoint = isCerebras ? API_CEREBRAS : API_GROQ;
+  const primaryModel = isCerebras
+    ? getEnv("CEREBRAS_MODEL", CEREBRAS_MODEL)
+    : getEnv("GROQ_MODEL", GROQ_MODEL);
+  const backupModel = isCerebras ? "qwen-3-32b" : "openai/gpt-oss-20b";
+
+  // Intento 1: Modelo primario (120B) con json_object y 2048 tokens
+  const primaryPayload = { ...baseBody, model: primaryModel, max_tokens: 2048 };
+  let r = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-    body: JSON.stringify(primaryBody),
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(primaryPayload),
   });
 
   if (r.ok) {
-    return await r.json();
+    const json = await r.json();
+    json._provider = provider;
+    json._model = primaryModel;
+    return { ok: true, data: json };
   }
 
-  // Intento 2: Si Groq devuelve 400 (json_validate_failed por reasoning), reintentar sin response_format estricto
-  if (r.status === 400) {
-    const fallbackBody = { ...primaryBody };
-    delete fallbackBody.response_format;
-    r = await fetch(API_GROQ, {
+  // Intento 2: Si devuelve 400 o 422 (ej. json_validate_failed por bloques de razonamiento), reintentar sin response_format estricto
+  if (r.status === 400 || r.status === 422) {
+    const fallbackPayload = { ...primaryPayload };
+    delete fallbackPayload.response_format;
+    r = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-      body: JSON.stringify(fallbackBody),
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(fallbackPayload),
     });
     if (r.ok) {
-      return await r.json();
+      const json = await r.json();
+      json._provider = provider;
+      json._model = primaryModel;
+      return { ok: true, data: json };
     }
   }
 
-  // Intento 3: Modelo rápido de respaldo (openai/gpt-oss-20b)
-  const backupBody = { ...primaryBody, model: "openai/gpt-oss-20b" };
-  delete backupBody.response_format;
-  r = await fetch(API_GROQ, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_API_KEY}` },
-    body: JSON.stringify(backupBody),
-  });
-  if (!r.ok) throw new Error(`Groq error: ${r.status}`);
-  return await r.json();
+  const errText = await r.text().catch(() => "");
+  const isDailyOrCreditExhausted =
+    r.status === 402 ||
+    /tokens per day|tpd|daily|insufficient_quota|credit|exceeded your current quota|balance/i.test(errText);
+
+  // Intento 3: Si es un 429 por modelo o 404/503 en el modelo 120B (y no es falta total de saldo de cuenta), probar modelo secundario del mismo proveedor
+  if ((r.status === 429 || r.status === 404 || r.status >= 500) && r.status !== 402) {
+    const backupPayload = { ...primaryPayload, model: backupModel };
+    delete backupPayload.response_format;
+    const rBackup = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(backupPayload),
+    });
+    if (rBackup.ok) {
+      const json = await rBackup.json();
+      json._provider = provider;
+      json._model = backupModel;
+      return { ok: true, data: json };
+    }
+  }
+
+  return {
+    ok: false,
+    status: r.status,
+    errText: errText.slice(0, 220),
+    isDailyOrCreditExhausted,
+  };
+}
+
+async function callGroqResilient(body) {
+  const hasCerebras = Boolean(getEnv("CEREBRAS_API_KEY"));
+  const hasGroq = Boolean(getEnv("GROQ_API_KEY"));
+
+  // Orden de prioridad: si CEREBRAS_API_KEY está configurada (y LLM_PRIMARY_PROVIDER !== "GROQ"),
+  // Cerebras va primero (aprovechando tus $5 de crédito + 1M tokens/día gratis en gpt-oss-120b) y Groq actúa como respaldo automático (y viceversa).
+  let providerOrder = [];
+  if (LLM_PRIMARY_PROVIDER === "GROQ") {
+    providerOrder = ["GROQ", "CEREBRAS"];
+  } else if (LLM_PRIMARY_PROVIDER === "CEREBRAS") {
+    providerOrder = ["CEREBRAS", "GROQ"];
+  } else {
+    providerOrder = hasCerebras ? ["CEREBRAS", "GROQ"] : ["GROQ", "CEREBRAS"];
+  }
+
+  // Colocar al principio los proveedores que NO estén en enfriamiento por cuota agotada
+  const now = Date.now();
+  const activeFirst = [
+    ...providerOrder.filter(p => now >= llmProviderState[p].cooldownUntilMs),
+    ...providerOrder.filter(p => now < llmProviderState[p].cooldownUntilMs),
+  ];
+
+  const errors = [];
+
+  for (const provider of activeFirst) {
+    const attempt = await tryProviderCompletion(provider, body);
+    if (attempt.skipped) continue;
+
+    if (attempt.ok) {
+      const prevProvider = llmProviderState.activeProvider;
+      llmProviderState.activeProvider = provider;
+      llmProviderState[provider].callsOk += 1;
+      llmProviderState[provider].cooldownUntilMs = 0;
+      botState.activeLlmProvider = `${provider} (${attempt.data._model})`;
+      if (prevProvider && prevProvider !== provider) {
+        addLog(`🧠 [LLM ROUTER] Motor activo conmutado a ${provider} (${attempt.data._model})`, "SYSTEM");
+      }
+      return attempt.data;
+    }
+
+    // Si falló por límite de cuota (429 / 402), poner este proveedor en pausa temporal y saltar de inmediato al otro
+    if (attempt.status === 429 || attempt.status === 402 || attempt.isDailyOrCreditExhausted) {
+      const cooldownMinutes = attempt.isDailyOrCreditExhausted ? 90 : 10;
+      llmProviderState[provider].cooldownUntilMs = Date.now() + cooldownMinutes * 60_000;
+      llmProviderState[provider].lastError = `HTTP ${attempt.status}`;
+      addLog(
+        `⚡ [LLM FAILOVER] ${provider} alcanzó límite (HTTP ${attempt.status}) -> pausado ${cooldownMinutes}m. Conmutando al motor de respaldo...`,
+        "WARN"
+      );
+    }
+
+    errors.push(`${provider}: HTTP ${attempt.status} ${attempt.errText || ""}`);
+  }
+
+  if (!hasCerebras && !hasGroq) {
+    throw new Error("Ninguna API Key de IA configurada (define CEREBRAS_API_KEY o GROQ_API_KEY en .env)");
+  }
+
+  throw new Error(`LLM failover agotado (${errors.join(" | ")})`);
 }
 
 // ── MOTOR GRATUITO E ILIMITADO DE NOTICIAS EN TIEMPO REAL (Google News RSS) ──

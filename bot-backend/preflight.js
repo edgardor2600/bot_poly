@@ -56,7 +56,6 @@ async function run() {
   const required = [
     "SUPABASE_URL",
     "SUPABASE_KEY",
-    "GROQ_API_KEY",
     "TAVILY_API_KEY",
     "CRON_SECRET",
   ];
@@ -65,6 +64,15 @@ async function run() {
   let allOk = true;
   for (const key of required) {
     allOk = checkRequired(key) && allOk;
+  }
+
+  const hasCerebras = !!getEnv("CEREBRAS_API_KEY");
+  const hasGroq = !!getEnv("GROQ_API_KEY");
+  console.log(`${hasCerebras ? "OK  " : "INFO"} CEREBRAS_API_KEY: ${hasCerebras ? "SET" : "NOT SET"}`);
+  console.log(`${hasGroq ? "OK  " : "INFO"} GROQ_API_KEY: ${hasGroq ? "SET" : "NOT SET"}`);
+  if (!hasCerebras && !hasGroq) {
+    console.log("MISS LLM_API_KEY: Define at least CEREBRAS_API_KEY or GROQ_API_KEY");
+    allOk = false;
   }
 
   const realTrading = getEnv("REAL_TRADING_ENABLED", "false").toLowerCase() === "true";
