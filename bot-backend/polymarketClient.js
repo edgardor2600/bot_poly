@@ -520,12 +520,91 @@ export async function getMarketTradeFlow(conditionId) {
   }
 }
 
-export async function getTokenSellPrice(tokenId) {
+export function computeExecutableBookWalk({
+  bids = [],
+  asks = [],
+  targetBuyUsdc = 2.0,
+  targetSellShares = 4.0,
+}) {
+  // --- A. Simulación exacta de compra (Barrido de Asks) ---
+  const bestAsk = asks.length > 0 ? Number(asks[0].price) : 1.0;
+  let remainingUsdc = Math.max(0.5, Number(targetBuyUsdc));
+  let acquiredShares = 0;
+  let spentUsdc = 0;
+  let depthWithin1CentUsdc = 0;
+
+  for (const level of asks) {
+    const px = Number(level.price);
+    const sz = Number(level.size);
+    if (px <= 0 || sz <= 0) continue;
+
+    const levelNotionalUsd = px * sz;
+    if (px <= bestAsk + 0.0101) {
+      depthWithin1CentUsdc += levelNotionalUsd;
+    }
+
+    if (remainingUsdc > 0) {
+      const takeUsdc = Math.min(remainingUsdc, levelNotionalUsd);
+      acquiredShares += takeUsdc / px;
+      spentUsdc += takeUsdc;
+      remainingUsdc -= takeUsdc;
+    }
+  }
+
+  const isBuyFullyExecutable = remainingUsdc <= 0.01 && depthWithin1CentUsdc >= targetBuyUsdc * 1.35;
+  const vwapAsk = acquiredShares > 0 ? (spentUsdc / acquiredShares) : bestAsk;
+  const realBuySlippage = Math.max(0, vwapAsk - bestAsk);
+
+  // --- B. Simulación exacta de venta (Barrido de Bids) ---
+  const bestBid = bids.length > 0 ? Number(bids[0].price) : 0.0;
+  let remainingShares = Math.max(0.1, Number(targetSellShares));
+  let totalProceedsUsd = 0;
+  let soldShares = 0;
+
+  for (const level of bids) {
+    const px = Number(level.price);
+    const sz = Number(level.size);
+    if (px <= 0 || sz <= 0) continue;
+
+    if (remainingShares > 0) {
+      const takeShares = Math.min(remainingShares, sz);
+      totalProceedsUsd += takeShares * px;
+      soldShares += takeShares;
+      remainingShares -= takeShares;
+    }
+  }
+
+  const vwapBid = soldShares > 0 ? (totalProceedsUsd / soldShares) : bestBid;
+  const realSellSlippage = Math.max(0, bestBid - vwapBid);
+
+  return {
+    bestAsk,
+    vwapAsk: Number(vwapAsk.toFixed(4)),
+    realBuySlippage: Number(realBuySlippage.toFixed(4)),
+    depthWithin1CentUsdc: Number(depthWithin1CentUsdc.toFixed(2)),
+    isBuyFullyExecutable,
+    bestBid,
+    vwapBid: Number(vwapBid.toFixed(4)),
+    realSellSlippage: Number(realSellSlippage.toFixed(4)),
+  };
+}
+
+export async function getTokenSellPrice(tokenId, targetShares = null) {
   if (!tokenId) return null;
 
-  // 1. Primary source (works in BOTH simulation and real trading): real CLOB bestBid
+  // 1. Primary source (works in BOTH simulation and real trading): real CLOB L2 VWAP Bid / bestBid
   const book = await getOrderBookSnapshot(tokenId);
   if (book && Number.isFinite(book.bestBid) && book.bestBid > 0.001 && book.bestBid < 0.999) {
+    if (Number.isFinite(Number(targetShares)) && Number(targetShares) > 0 && Array.isArray(book.bids) && book.bids.length > 0) {
+      const walk = computeExecutableBookWalk({
+        bids: book.bids,
+        asks: book.asks || [],
+        targetSellShares: Number(targetShares),
+      });
+      if (Number.isFinite(walk.vwapBid) && walk.vwapBid > 0.001 && walk.vwapBid < 0.999) {
+        return walk.vwapBid;
+      }
+    }
     return book.bestBid;
   }
 

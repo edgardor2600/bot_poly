@@ -1326,16 +1326,31 @@ export default function PolyBotV2() {
                 const currPx  = Math.max(0.001, Number(t.currentPrice || entryPx));
                 const shares  = Math.max(0.000001, Number(t.shares || 1));
                 const cost    = Math.max(0.01, Number(t.cost || (shares * entryPx) || 1));
-                const tpPx    = Number(t.takeProfit || Math.min(0.97, entryPx * 1.10));
+                const staticTpPx = Number(t.takeProfit || Math.min(0.97, entryPx * 1.10));
                 const slPx    = Number(t.stopLoss || Math.max(0.02, entryPx * 0.94));
 
-                // Fórmulas exactas del motor v2.5.0 ajustadas a los precios y acciones reales de este trade
+                // Fórmulas exactas del motor v2.6.0 ajustadas a los precios, acciones y envejecimiento real de este trade
+                const openedAtMs = (t.ts || t.openedAt) ? new Date(t.ts || t.openedAt).getTime() : Date.now();
+                const hoursHeld  = Math.max(0, (Date.now() - openedAtMs) / 3600_000);
+                const maxHoldHrs = Math.max(6, Number(config.maxHoldHours || 24));
+                const lifeRatio  = Math.min(1.0, hoursHeld / maxHoldHrs);
+
                 const binarySigma = Math.sqrt(Math.max(0.04, entryPx * (1 - entryPx)));
                 const exactBreakEvenPx = ((entryPx * 1.0035) + ((0.008 + 0.005) / shares)) / (1 - 0.0035) + 0.002;
                 const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPx + 0.009).toFixed(4));
-                const beNoiseCushion = Math.max(0.024, 0.065 * binarySigma);
+                const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
+                const beNoiseCushion = Math.max(0.016, 0.065 * binarySigma * timeDecayBeFactor);
                 const beTriggerPx = parseFloat(
-                  Math.max(exactBreakEvenPx + beNoiseCushion, entryPx + Math.max(0.030, 0.070 * binarySigma)).toFixed(4)
+                  Math.max(exactBreakEvenPx + beNoiseCushion, entryPx + Math.max(0.022, 0.070 * binarySigma * timeDecayBeFactor)).toFixed(4)
+                );
+
+                // Compresión continua de Take-Profit TP(tau) a partir de tau >= 0.35 (8.4h)
+                const minHarvestTarget = Math.min(staticTpPx, exactBreakEvenPx + 0.012);
+                const tpPx = Number(
+                  t.effectiveTakeProfit ??
+                  (lifeRatio < 0.35
+                    ? staticTpPx
+                    : (minHarvestTarget + (staticTpPx - minHarvestTarget) * Math.pow(1.0 - (lifeRatio - 0.35) / 0.65, 1.35)).toFixed(4))
                 );
 
                 // P&L Vivo Real si se liquida ahora mismo en el CLOB (incluye fricción de entrada + salida + gas + slippage)
@@ -1480,15 +1495,17 @@ export default function PolyBotV2() {
                         {closedTrades.map((t, i) => {
                           const reasonBadge = t.closeReason === "TAKE_PROFIT"
                             ? { txt: "🎯 TAKE PROFIT", c: S.green }
-                            : t.closeReason === "TRAILING_STOP"
-                              ? { txt: "📈 TRAILING SL", c: S.green }
-                              : (t.closeReason === "BREAK_EVEN" || t.pnl === 0)
-                                ? { txt: "🛡 BREAK EVEN", c: S.cyan }
-                                : t.closeReason === "MAX_HOLD"
-                                  ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
-                                  : t.closeReason === "THESIS_INVALIDATED"
-                                    ? { txt: "⚡ TESIS INVALIDADA", c: S.amber }
-                                    : { txt: "🛑 STOP LOSS", c: S.red };
+                            : t.closeReason === "TIME_DECAY_PROFIT_HARVEST"
+                              ? { txt: "🌾 COSECHA TEMPORAL", c: S.green }
+                              : t.closeReason === "TRAILING_STOP"
+                                ? { txt: "📈 TRAILING SL", c: S.green }
+                                : (t.closeReason === "BREAK_EVEN" || t.pnl === 0)
+                                  ? { txt: "🛡 BREAK EVEN", c: S.cyan }
+                                  : t.closeReason === "MAX_HOLD"
+                                    ? { txt: "⏰ MAX HOLD 24H", c: S.amber }
+                                    : t.closeReason === "THESIS_INVALIDATED"
+                                      ? { txt: "⚡ TESIS INVALIDADA", c: S.amber }
+                                      : { txt: "🛑 STOP LOSS", c: S.red };
                           const netReal = t.netPnlAfterFriction ?? (t.pnl - (t.frictionUsd || 0.015));
                           return (
                             <tr key={t.id} style={{ background: i % 2 === 0 ? `${S.border}22` : "transparent", borderBottom: `1px solid ${S.border}` }}>

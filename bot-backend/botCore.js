@@ -1,7 +1,8 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+import { computeExecutableBookWalk, getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+export { computeExecutableBookWalk };
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
 import { createRuntimeOwner, withRuntimeLock } from './runtimeLocks.js';
@@ -1493,6 +1494,17 @@ function isSideMicrostructureTradable(book) {
   if (book.askDepthUsd < MIN_BOOK_DEPTH_USD || book.bidDepthUsd < MIN_BOOK_DEPTH_USD) return false;
   // Evitar comprar contra un muro institucional de venta (Order Book Imbalance < -0.65)
   if (Number.isFinite(book.obi) && book.obi < -0.65) return false;
+  // Veto H (Pre-Groq Book-Walk): verificar que el primer +1.0¢ del libro tenga liquidez real >= 1.35x del trade objetivo
+  if (Array.isArray(book.asks) && book.asks.length > 0) {
+    const refTradeUsdc = Math.max(1.50, (asNumber(botState.config?.minTradeUsdc, 1.50) + asNumber(botState.config?.maxTradeUsdc, 2.50)) / 2);
+    const walk = computeExecutableBookWalk({
+      bids: book.bids || [],
+      asks: book.asks,
+      targetBuyUsdc: refTradeUsdc,
+      targetSellShares: refTradeUsdc / Math.max(0.15, book.bestAsk),
+    });
+    if (!walk.isBuyFullyExecutable) return false;
+  }
   return true;
 }
 
@@ -1510,6 +1522,9 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     // Diversificación de eventos y Cooldown Anti-Overtrading (6h tras cierre / máx 2 trades en 24h)
     const eventKey = pre.eventSlug || m.id;
     if (eventKey && seenEvents.has(eventKey)) continue;
+
+    // Guardia Anti-Correlación Temática (v2.6.0): no analizar mercados correlacionados con posiciones ya abiertas
+    if (hasCorrelatedOpenPosition(m, botState.trades)) continue;
 
     const cooldownCheck = isMarketInCooldown(m.id, m.conditionId, m.question);
     if (cooldownCheck.blocked) continue;
@@ -1980,6 +1995,104 @@ export function computeDualCryptoOracleProb({
     contractType: "AMERICAN_BARRIER_TOUCH",
     pMath: Number(probTouch.toFixed(4)),
   };
+}
+
+/**
+ * 5. Deriva Estocástica de Supervivencia (Poisson Theta Adjustment — v2.6.0)
+ * Penaliza compras de YES en mercados tipo "¿Ocurrirá X antes de T?" donde cada hora
+ * sin evento erosiona el precio, y bonifica compras de NO que cobran ese decaimiento.
+ */
+export function computeThetaAdjustedFairProb24h({
+  questionText = "",
+  selectedSide = "YES",
+  marketMicro,
+  calibratedFairProb,
+  kappa24h,
+  hoursToResolution = 72,
+  hasFreshNews = false,
+}) {
+  const clampProb = (p) => Math.max(0.01, Math.min(0.99, Number(p)));
+  const baseReachable = marketMicro + kappa24h * (calibratedFairProb - marketMicro);
+  const qLower = String(questionText).toLowerCase();
+
+  // Detectar mercados de ocurrencia de evento discreto (Hazard-Rate Markets)
+  const isDiscreteHazardMarket =
+    /\b(before|by |will .* strike|will .* invade|will .* resign|will .* fire|will .* announce|will .* reach|will .* hit|in [a-z]+ 2026)\b/i.test(qLower) &&
+    !/\b(vs\.?|win the|match|election winner)\b/i.test(qLower);
+
+  if (!isDiscreteHazardMarket || hoursToResolution > 336) {
+    return Number(clampProb(baseReachable).toFixed(4));
+  }
+
+  // Tasa de erosión en 24h cuando no ocurre el evento discreto
+  const timeFraction24h = Math.min(0.50, 24.0 / Math.max(24.0, hoursToResolution));
+  const yesMicro = selectedSide === "YES" ? marketMicro : (1.0 - marketMicro);
+
+  // Si hay noticia fresca hoy, el decaimiento pasivo de YES se reduce a la mitad
+  const hazardDecayRate = hasFreshNews ? 0.06 : 0.14;
+  const thetaShiftMag = Math.min(0.028, yesMicro * (1.0 - yesMicro) * timeFraction24h * hazardDecayRate * 4.0);
+
+  // Para YES, el paso del tiempo sin evento resta valor (-thetaShiftMag).
+  // Para NO, el paso del tiempo sin evento suma valor (+thetaShiftMag).
+  const directionalTheta = selectedSide === "YES" ? -thetaShiftMag : +thetaShiftMag;
+
+  return Number(clampProb(baseReachable + directionalTheta).toFixed(4));
+}
+
+/**
+ * 6. Bloqueo de Concentración Temática entre las 3 Posiciones Abiertas (v2.6.0)
+ * Impide abrir dos trades del mismo evento, mismo activo cripto o alta superposición léxica (Jaccard >= 0.34).
+ */
+export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
+  if (!Array.isArray(openTrades) || openTrades.length === 0) return false;
+
+  const tokenize = (str) => {
+    const stopWords = new Set([
+      "will", "the", "be", "in", "on", "of", "to", "by", "before", "after",
+      "above", "below", "reach", "hit", "win", "2026", "2025", "yes", "no", "and", "or"
+    ]);
+    return new Set(
+      String(str || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length >= 3 && !stopWords.has(w))
+    );
+  };
+
+  const candEventId =
+    candidateMarket?.eventId ||
+    candidateMarket?.event_id ||
+    candidateMarket?.groupSlug ||
+    candidateMarket?.events?.[0]?.id ||
+    candidateMarket?.events?.[0]?.slug;
+  const candTokens = tokenize(candidateMarket?.question);
+
+  for (const trade of openTrades) {
+    if (trade.status !== "OPEN" && trade.status !== "PARTIAL") continue;
+
+    // 1. Mismo evento padre o groupSlug
+    const openEventId = trade.eventId || trade.event_id || trade.groupSlug;
+    if (candEventId && openEventId && String(candEventId) === String(openEventId)) {
+      return true;
+    }
+
+    // 2. Superposición léxica de Jaccard >= 0.34 (ej. dos mercados distintos sobre Bitcoin o Trump)
+    const openTokens = tokenize(trade.question);
+    if (candTokens.size > 0 && openTokens.size > 0) {
+      let intersection = 0;
+      for (const t of candTokens) {
+        if (openTokens.has(t)) intersection += 1;
+      }
+      const union = candTokens.size + openTokens.size - intersection;
+      const jaccardSim = union > 0 ? intersection / union : 0;
+      if (jaccardSim >= 0.34) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 async function getCryptoSpotContext(question, daysLeft) {
@@ -2523,12 +2636,18 @@ Return JSON with this exact schema:
     const orderflowBoost      = (effectiveObi >= 0.25 && sideTapeImbalance >= 0.20) ? 0.20 : 0.0;
     const kappa24h            = Math.max(0.25, Math.min(1.0, timeConvergenceBase + catalystBoost + orderflowBoost));
 
-    // Valor justo alcanzable dentro de la ventana operativa de 24h
-    const reachableFairProb24h = clampP(
-      marketMicro + kappa24h * (calibratedFairProb - marketMicro)
-    );
+    // Valor justo alcanzable dentro de la ventana operativa de 24h incluyendo la deriva asimétrica de Theta (v2.6.0)
+    const reachableFairProb24h = computeThetaAdjustedFairProb24h({
+      questionText: m.question,
+      selectedSide,
+      marketMicro,
+      calibratedFairProb,
+      kappa24h,
+      hoursToResolution,
+      hasFreshNews,
+    });
 
-    // 6. Descuento de Fricción Exacto (Sin doble conteo de spread y sin feeCost = 0)
+    // 6. Descuento de Fricción Exacto + Barrido Real del Libro L2 (VWAP Book-Walk v2.6.0)
     const bestBidPx      = asNumber(selectedBook.bestBid, executableAsk - selectedBook.spreadAbs);
     const exitHalfSpread = Math.max(0.002, marketMicro - bestBidPx);
 
@@ -2541,11 +2660,24 @@ Return JSON with this exact schema:
     const entryFeePerShare = Math.max(executableAsk * 0.0035, apiQuadraticFee);
     const exitFeePerShare  = reachableFairProb24h * 0.0035;
 
-    // Impacto de gas ($0.004 entrada + $0.004 salida) + slippage expresado por acción
+    // Impacto de gas ($0.004 entrada + $0.004 salida) + slippage medido por Book-Walk real en L2
     const refTradeUsdc = Math.max(1.50, (asNumber(botState.config.minTradeUsdc, 1.50) + asNumber(botState.config.maxTradeUsdc, 2.50)) / 2);
     const gasPerShare  = (0.004 * executableAsk) / refTradeUsdc;
-    const entryDepthSlippage   = Math.max(0.001, Math.min(0.004, (refTradeUsdc / Math.max(500, liq)) * 0.15));
-    const exitSlippageExpected = 0.0015;
+    const hasL2Asks    = Array.isArray(selectedBook.asks) && selectedBook.asks.length > 0;
+    const hasL2Bids    = Array.isArray(selectedBook.bids) && selectedBook.bids.length > 0;
+    const bookWalk     = computeExecutableBookWalk({
+      bids: hasL2Bids ? selectedBook.bids : [],
+      asks: hasL2Asks ? selectedBook.asks : [],
+      targetBuyUsdc: refTradeUsdc,
+      targetSellShares: refTradeUsdc / Math.max(0.15, executableAsk),
+    });
+
+    const entryDepthSlippage = hasL2Asks
+      ? Math.max(0.001, bookWalk.realBuySlippage)
+      : Math.max(0.001, Math.min(0.004, (refTradeUsdc / Math.max(500, liq)) * 0.15));
+    const exitSlippageExpected = hasL2Bids
+      ? Math.max(0.0015, bookWalk.realSellSlippage)
+      : 0.0015;
 
     const totalEntryFriction = entryFeePerShare + gasPerShare + entryDepthSlippage;
     const totalExitFriction  = exitProbInClob * (exitHalfSpread + exitFeePerShare + gasPerShare + exitSlippageExpected);
@@ -2570,7 +2702,7 @@ Return JSON with this exact schema:
       : 0;
 
     const pillars = {
-      bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && effectiveObi >= -0.05,
+      bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && effectiveObi >= -0.05 && (!hasL2Asks || bookWalk.isBuyFullyExecutable),
       orderflowAlignment: (effectiveObi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
       catalystOrMath: (hasFreshNews && !lacksCatalyst && !tetlockGuard.vetoD_PricedIn) || (effectiveObi >= 0.35 && sideTapeImbalance >= 0.20),
       positiveExpectancy: netEdgePct >= MIN_NET_EDGE_PCT && conf >= 70 && rewardToRisk >= 1.75,
@@ -2619,14 +2751,19 @@ Return JSON with this exact schema:
       hardVetoes.push(`VETO_E_SPORTS_LIVE_LATENCY_RISK (${hoursToResolution.toFixed(1)}h <= 3.5h)`);
     }
 
-    // Veto Duro F (NUEVO v2.5.1): Escudo Anti-Cuchillo Cayendo ("Falling Knife" / Flujo Informado Adverso no indexado en RSS)
+    // Veto Duro F (v2.5.1): Escudo Anti-Cuchillo Cayendo ("Falling Knife" / Flujo Informado Adverso no indexado en RSS)
     if (tetlockGuard.vetoF_FallingKnife) {
       hardVetoes.push(`VETO_F_INFORMED_ADVERSE_DUMP (Move=${(tetlockGuard.directionalMoveDown * 100).toFixed(1)}¢, WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)})`);
     }
 
-    // Veto Duro G (NUEVO v2.5.1): Divergencia Ciega Extrema sin Noticia de Última Hora (<= 3h)
+    // Veto Duro G (v2.5.1): Divergencia Ciega Extrema sin Noticia de Última Hora (<= 3h)
     if (tetlockGuard.vetoG_BlindHallucination) {
       hardVetoes.push(`VETO_G_BLIND_LLM_DIVERGENCE (Diff=${(tetlockGuard.blindDivergenceAbs * 100).toFixed(1)}¢ sin noticia <=3h)`);
+    }
+
+    // Veto Duro H (NUEVO v2.6.0): Profundidad Ejecutable en Tope de Libro (+1.0¢) Insuficiente para FAK completo
+    if (hasL2Asks && !bookWalk.isBuyFullyExecutable) {
+      hardVetoes.push(`VETO_H_INSUFFICIENT_TOP_BOOK_DEPTH (Depth1c=$${bookWalk.depthWithin1CentUsdc} < $${(refTradeUsdc * 1.35).toFixed(2)})`);
     }
 
     const confluenceScore = Object.values(pillars).filter(Boolean).length;
@@ -2642,6 +2779,9 @@ Return JSON with this exact schema:
     result.price_absorption_ratio = tetlockGuard.par;
     result.fair_value_yes = Number(fairYesProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
+    result.vwap_ask = bookWalk.vwapAsk;
+    result.real_buy_slippage = bookWalk.realBuySlippage;
+    result.depth_1c_usd = bookWalk.depthWithin1CentUsdc;
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
     result.micro_price = Number(marketMicro.toFixed(4));
     result.obi = Number(effectiveObi.toFixed(3));
@@ -2833,6 +2973,11 @@ export async function runFullScan() {
               continue;
             }
 
+            if (hasCorrelatedOpenPosition(m, botState.trades)) {
+              addLog(`🛡 [CORRELATION GUARD] Bloqueado por concentración temática con otra posición abierta: ${m.question.slice(0, 60)}`, "FILTER");
+              continue;
+            }
+
             const persistedDuplicate = await findPersistedOpenTradeForMarket(marketId, conditionId);
             if (persistedDuplicate) {
               addLog(`⚠️ [TRADE BLOQUEADO] Ya existe posición persistida (${persistedDuplicate.trade_id}) para: ${m.question.slice(0, 60)}`, "WARN");
@@ -2858,11 +3003,21 @@ export async function runFullScan() {
             const rawAsk = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
             const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, rawAsk - 0.01).toFixed(4));
 
-            // Modelo de Ejecución Realista (Slippage de Pool + Comisión Taker + Gas/Relayer Polygon + Redondeo CTF)
+            // Modelo de Ejecución Realista v2.6.0 (Barrido Exacto VWAP L2 + Comisión Taker + Gas Polygon + Redondeo CTF)
             const askDepthUsd = Math.max(10, asNumber(sideBook?.askDepthUsd, 25));
-            const depthImpact = (amt / askDepthUsd) > 0.12
-              ? Math.min(0.012, (amt / askDepthUsd) * asNumber(sideBook?.spreadAbs, 0.01))
-              : 0.001;
+            const simBookWalk = (Array.isArray(sideBook?.asks) && sideBook.asks.length > 0)
+              ? computeExecutableBookWalk({
+                  bids: sideBook.bids || [],
+                  asks: sideBook.asks,
+                  targetBuyUsdc: amt,
+                  targetSellShares: amt / Math.max(0.15, rawAsk),
+                })
+              : null;
+            const depthImpact = simBookWalk
+              ? Math.max(0.001, simBookWalk.realBuySlippage)
+              : ((amt / askDepthUsd) > 0.12
+                ? Math.min(0.012, (amt / askDepthUsd) * asNumber(sideBook?.spreadAbs, 0.01))
+                : 0.001);
             const effectiveSimEntry = parseFloat(Math.min(0.98, rawAsk + depthImpact).toFixed(4));
             const takerFeeRate = Math.max(0.0035, asNumber(m.takerBaseFee, 0) > 0 ? (rawAsk * (1 - rawAsk) * 0.015) : 0.0035);
             const entryFeeUsd = parseFloat(((amt * takerFeeRate) + 0.004).toFixed(4));
@@ -2901,8 +3056,11 @@ export async function runFullScan() {
               id: `T-${uid().toUpperCase()}`,
               signalId: sig.id,
               ts: openedAt,
+              openedAt,
               question: m.question,
               marketId,
+              eventId: m?.events?.[0]?.id || m?.eventId || null,
+              groupSlug: m?.events?.[0]?.slug || pre?.eventSlug || null,
               category: m._cat,
               action: analysis.action,
               side: isYes ? "YES" : "NO",
@@ -3003,9 +3161,9 @@ export async function fastSyncTrades() {
         for (const trade of openTrades) {
           let livePx = null;
 
-          // Fetch live CLOB bestBid in BOTH Simulation and Real mode
+          // Fetch live CLOB VWAP Bid for the actual position shares in BOTH Simulation and Real mode
           if (trade.tokenId) {
-            livePx = await getTokenSellPrice(trade.tokenId);
+            livePx = await getTokenSellPrice(trade.tokenId, asNumber(trade.shares, 1));
           }
 
           if ((!Number.isFinite(livePx) || livePx <= 0.001 || livePx >= 0.999) && Number.isFinite(trade.currentPrice)) {
@@ -3036,17 +3194,25 @@ export async function fastSyncTrades() {
           // Reemplaza la distorsión de entryPrice * 1.08 que asfixiaba precios altos
           const binarySigma = Math.sqrt(Math.max(0.04, entryPrice * (1 - entryPrice)));
 
-          // ─── 1. Break-Even Exacto Libre de Pérdidas ───────────────────────────
+          // ─── Envejecimiento de la Posición (Fracción de las 24h consumidas — v2.6.0) ──
+          const openedRaw   = openTrade.ts || openTrade.openedAt;
+          const openedAtMs  = openedRaw ? new Date(openedRaw).getTime() : Date.now();
+          const hoursHeld   = Math.max(0, (Date.now() - openedAtMs) / 3600_000);
+          const maxHoldHrs  = Math.max(6, asNumber(botState.config.maxHoldHours, 24));
+          const lifeRatio   = Math.min(1.0, hoursHeld / maxHoldHrs); // tau en [0, 1]
+
+          // ─── 1. Break-Even Exacto Libre de Pérdidas (con Compresión Temporal >= 12h) ─
           // Cubre entryFee (0.35%), exitFee (0.35%), gas ida/vuelta ($0.008), slippage (0.2¢) + $0.005 de ganancia neta mínima
           const exactBreakEvenPx =
             ((entryPrice * 1.0035) + ((0.008 + 0.005) / shares)) / (1 - 0.0035) + 0.002;
           const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.009).toFixed(4));
 
-          // El trigger exige cubrir el Break-Even exacto + un colchón anti-ruido de 2.4¢ a 3.2¢ según σ_bin
-          const beNoiseCushion = Math.max(0.024, 0.065 * binarySigma);
-          const triggerPrice   = Math.max(
+          // Si el trade supera las 12h (lifeRatio >= 0.50), reducir el colchón exigido para armar el Break-Even hasta en un 35%
+          const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
+          const beNoiseCushion    = Math.max(0.016, 0.065 * binarySigma * timeDecayBeFactor);
+          const triggerPrice      = Math.max(
             exactBreakEvenPx + beNoiseCushion,
-            entryPrice + Math.max(0.030, 0.070 * binarySigma)
+            entryPrice + Math.max(0.022, 0.070 * binarySigma * timeDecayBeFactor)
           );
 
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0 && livePx >= triggerPrice) {
@@ -3074,19 +3240,38 @@ export async function fastSyncTrades() {
           }
 
           const stopLoss = asNumber(openTrade.stopLoss, 0);
-          const takeProfit = asNumber(openTrade.takeProfit, 0);
+          const staticTakeProfit = asNumber(openTrade.takeProfit, 0.98);
+          const minHarvestTarget = Math.min(staticTakeProfit, exactBreakEvenPx + 0.012);
+
+          // ─── 2b. Curva de Compresión Continua de Take-Profit TP(tau) (v2.6.0) ──
+          // A partir del 35% de vida (8.4h), el TP baja progresivamente hacia (exactBreakEvenPx + 1.2¢)
+          const effectiveTakeProfit = lifeRatio < 0.35
+            ? staticTakeProfit
+            : Number(
+                (
+                  minHarvestTarget +
+                  (staticTakeProfit - minHarvestTarget) *
+                    Math.pow(1.0 - (lifeRatio - 0.35) / 0.65, 1.35)
+                ).toFixed(4)
+              );
+
+          openTrade.effectiveTakeProfit = effectiveTakeProfit;
+          openTrade.lifeRatio = Number(lifeRatio.toFixed(3));
+
           const maxHoldAtMs = openTrade.maxHoldAt ? new Date(openTrade.maxHoldAt).getTime() : NaN;
           const maxHoldReached = Number.isFinite(maxHoldAtMs) && Date.now() >= maxHoldAtMs;
 
-          // ─── 3. Decisión de Cierre (Con separación de estados y filtro anti-mecha) ─
+          // ─── 3. Decisión de Cierre (Con compresión de TP, separación de estados y filtro anti-mecha) ─
           let closeReason = null;
-          if (takeProfit > 0 && livePx >= takeProfit) {
-            closeReason = "TAKE_PROFIT";
+          if (effectiveTakeProfit > 0 && livePx >= effectiveTakeProfit) {
+            closeReason = (lifeRatio >= 0.55 && livePx < staticTakeProfit)
+              ? "TIME_DECAY_PROFIT_HARVEST"
+              : "TAKE_PROFIT";
           } else if (stopLoss > 0 && livePx <= stopLoss) {
             // Anti-Wick en polling de 3 min: esperar 1.5s y verificar segundo snapshot rápido del CLOB
             if (trade.tokenId) {
               await new Promise(res => setTimeout(res, 1500));
-              const secondCheckPx = await getTokenSellPrice(trade.tokenId);
+              const secondCheckPx = await getTokenSellPrice(trade.tokenId, shares);
               if (Number.isFinite(secondCheckPx) && secondCheckPx > 0.001 && secondCheckPx < 0.999) {
                 livePx = secondCheckPx;
                 openTrade.currentPrice = livePx;
