@@ -362,12 +362,43 @@ export async function getOrderBookSnapshot(tokenId) {
       : 0;
 
     const totalDepthUsd = bidDepthUsd + askDepthUsd;
-    const obi = totalDepthUsd > 0
+    const rawObi = totalDepthUsd > 0
       ? roundAmount((bidDepthUsd - askDepthUsd) / totalDepthUsd, 3)
       : 0;
-    const microPrice = (bestBid !== null && bestAsk !== null && totalDepthUsd > 0)
-      ? roundAmount(((bestBid * askDepthUsd) + (bestAsk * bidDepthUsd)) / totalDepthUsd, 4)
-      : midPrice;
+
+    // WOBI (Weighted Order Book Imbalance) Anti-Spoofing con decaimiento exponencial gamma = 115
+    const GAMMA = 115.0;
+    let weightedBidVol = 0;
+    let weightedAskVol = 0;
+
+    if (bestBid !== null) {
+      for (const b of bids) {
+        const dist = bestBid - b.price;
+        if (dist <= 0.025 && b.price > 0 && b.size > 0) {
+          weightedBidVol += (b.price * b.size) * Math.exp(-GAMMA * Math.max(0, dist));
+        }
+      }
+    }
+    if (bestAsk !== null) {
+      for (const a of asks) {
+        const dist = a.price - bestAsk;
+        if (dist <= 0.025 && a.price > 0 && a.size > 0) {
+          weightedAskVol += (a.price * a.size) * Math.exp(-GAMMA * Math.max(0, dist));
+        }
+      }
+    }
+
+    const totalWeightedVol = weightedBidVol + weightedAskVol;
+    const wObi = totalWeightedVol > 0
+      ? roundAmount((weightedBidVol - weightedAskVol) / totalWeightedVol, 4)
+      : rawObi;
+
+    const pMicroWeighted = (bestBid !== null && bestAsk !== null && totalWeightedVol > 0)
+      ? roundAmount(((bestBid * weightedAskVol) + (bestAsk * weightedBidVol)) / totalWeightedVol, 4)
+      : ((bestBid !== null && bestAsk !== null && totalDepthUsd > 0)
+        ? roundAmount(((bestBid * askDepthUsd) + (bestAsk * bidDepthUsd)) / totalDepthUsd, 4)
+        : midPrice);
+
     const isValid = (
       bestBid !== null &&
       bestAsk !== null &&
@@ -382,12 +413,18 @@ export async function getOrderBookSnapshot(tokenId) {
       bestBid,
       bestAsk,
       midPrice,
-      microPrice,
+      microPrice: pMicroWeighted,
+      pMicroWeighted,
       spreadAbs,
       spreadPct,
       askDepthUsd,
       bidDepthUsd,
-      obi,
+      topLiquidityUsd: roundAmount(totalWeightedVol, 2),
+      obi: wObi,
+      wObi,
+      rawObi,
+      bids: bids.slice(0, 20),
+      asks: asks.slice(0, 20),
       tickSize: asNumber(book?.minimum_tick_size) || 0.01,
       minOrderSize: asNumber(book?.min_order_size) || 1,
       negRisk: Boolean(book?.neg_risk),
@@ -400,7 +437,7 @@ export async function getOrderBookSnapshot(tokenId) {
 export async function getMarketTradeFlow(conditionId) {
   if (!conditionId) return null;
   try {
-    const url = `https://data-api.polymarket.com/trades?market=${encodeURIComponent(conditionId)}&limit=40`;
+    const url = `https://data-api.polymarket.com/trades?market=${encodeURIComponent(conditionId)}&limit=50`;
     const res = await fetch(url, {
       method: "GET",
       headers: { Accept: "application/json" },
@@ -409,18 +446,44 @@ export async function getMarketTradeFlow(conditionId) {
     const trades = await res.json();
     if (!Array.isArray(trades) || trades.length === 0) return null;
 
+    const nowMs = Date.now();
+    const HALF_LIFE_HOURS = 1.5;
+    const LAMBDA_TIME = Math.LN2 / HALF_LIFE_HOURS;
+
     let yesBullUsd = 0;
     let noBullUsd = 0;
+    let yesWeightedBull = 0;
+    let noWeightedBull = 0;
     let whaleYesCount = 0;
     let whaleNoCount = 0;
 
-    for (const t of trades) {
+    const parseTsMs = (tr) => {
+      const raw = tr?.timestamp ?? tr?.match_time ?? tr?.created_at;
+      if (raw === null || raw === undefined) return nowMs;
+      const num = Number(raw);
+      if (Number.isFinite(num) && num > 0) return num < 1e12 ? num * 1000 : num;
+      const parsed = new Date(raw).getTime();
+      return Number.isFinite(parsed) ? parsed : nowMs;
+    };
+
+    const sorted = [...trades].sort((a, b) => parseTsMs(a) - parseTsMs(b));
+    let prevPrice = asNumber(sorted[0]?.price) || 0.5;
+
+    for (const t of sorted) {
       const side = String(t?.side || "").toUpperCase();
       const outcome = String(t?.outcome || "").toUpperCase();
-      const size = asNumber(t?.size);
+      const size = asNumber(t?.size ?? t?.amount);
       const price = asNumber(t?.price);
       if (size <= 0 || price <= 0 || price >= 1) continue;
       const usdVal = size * price;
+
+      const ageHours = Math.max(0, (nowMs - parseTsMs(t)) / 3600_000);
+      const timeWeight = Math.exp(-LAMBDA_TIME * ageHours);
+      const priceDelta = Math.abs(price - prevPrice);
+      const kyleImpactMultiplier = 1.0 + Math.min(1.5, priceDelta * 50.0);
+      prevPrice = price;
+
+      const effectiveWeight = usdVal * timeWeight * kyleImpactMultiplier;
 
       // Buying YES or Selling NO = bullish on YES
       const isYesBullish = (outcome === "YES" && side === "BUY") || (outcome === "NO" && side === "SELL");
@@ -428,17 +491,20 @@ export async function getMarketTradeFlow(conditionId) {
 
       if (isYesBullish) {
         yesBullUsd += usdVal;
-        if (usdVal >= 100) whaleYesCount++;
+        yesWeightedBull += effectiveWeight;
+        if (usdVal >= 150 && ageHours <= 4.0) whaleYesCount++;
       } else if (isNoBullish) {
         noBullUsd += usdVal;
-        if (usdVal >= 100) whaleNoCount++;
+        noWeightedBull += effectiveWeight;
+        if (usdVal >= 150 && ageHours <= 4.0) whaleNoCount++;
       }
     }
 
+    const totalWeightedFlow = yesWeightedBull + noWeightedBull;
     const totalFlowUsd = yesBullUsd + noBullUsd;
-    const tapeImbalance = totalFlowUsd > 0
-      ? roundAmount((yesBullUsd - noBullUsd) / totalFlowUsd, 3)
-      : 0;
+    const tapeImbalance = totalWeightedFlow > 0
+      ? roundAmount((yesWeightedBull - noWeightedBull) / totalWeightedFlow, 4)
+      : (totalFlowUsd > 0 ? roundAmount((yesBullUsd - noBullUsd) / totalFlowUsd, 3) : 0);
 
     return {
       sampleCount: trades.length,
@@ -447,6 +513,7 @@ export async function getMarketTradeFlow(conditionId) {
       whaleYesCount,
       whaleNoCount,
       tapeImbalance,
+      rawTrades: trades.slice(0, 50),
     };
   } catch {
     return null;

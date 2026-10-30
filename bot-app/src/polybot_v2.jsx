@@ -1322,9 +1322,51 @@ export default function PolyBotV2() {
               </div>
             ) : (
               openTrades.map(t => {
-                const liveGrossPnl = ((t.currentPrice || t.entryPrice) - t.entryPrice) * (t.shares || 0);
-                const liveNetPnl = liveGrossPnl - (t.frictionUsd || 0.008);
-                const liveRoiPct = (((t.currentPrice || t.entryPrice) - t.entryPrice) / (t.entryPrice || 1)) * 100;
+                const entryPx = Math.max(0.001, Number(t.entryPrice || t.price || 0.5));
+                const currPx  = Math.max(0.001, Number(t.currentPrice || entryPx));
+                const shares  = Math.max(0.000001, Number(t.shares || 1));
+                const cost    = Math.max(0.01, Number(t.cost || (shares * entryPx) || 1));
+                const tpPx    = Number(t.takeProfit || Math.min(0.97, entryPx * 1.10));
+                const slPx    = Number(t.stopLoss || Math.max(0.02, entryPx * 0.94));
+
+                // Fórmulas exactas del motor v2.5.0 ajustadas a los precios y acciones reales de este trade
+                const binarySigma = Math.sqrt(Math.max(0.04, entryPx * (1 - entryPx)));
+                const exactBreakEvenPx = ((entryPx * 1.0035) + ((0.008 + 0.005) / shares)) / (1 - 0.0035) + 0.002;
+                const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPx + 0.009).toFixed(4));
+                const beNoiseCushion = Math.max(0.024, 0.065 * binarySigma);
+                const beTriggerPx = parseFloat(
+                  Math.max(exactBreakEvenPx + beNoiseCushion, entryPx + Math.max(0.030, 0.070 * binarySigma)).toFixed(4)
+                );
+
+                // P&L Vivo Real si se liquida ahora mismo en el CLOB (incluye fricción de entrada + salida + gas + slippage)
+                const liveGrossPnl = (currPx - entryPx) * shares;
+                const liveExitClosePx = Math.max(0.005, currPx - 0.0015);
+                const liveGrossProceeds = shares * liveExitClosePx;
+                const liveExitFee = (liveGrossProceeds * 0.0035) + 0.004;
+                const totalRoundTripFriction = Number(t.entryFeeUsd || ((cost * 0.0035) + 0.004)) + liveExitFee;
+                const liveNetPnl = (liveGrossProceeds - liveExitFee) - cost;
+                const liveRoiPct = (liveNetPnl / cost) * 100;
+
+                // Proyección Real en Take Profit (WIN @ TP)
+                const tpExecPx = Math.max(0.005, tpPx - 0.0010);
+                const tpGrossProceeds = shares * tpExecPx;
+                const tpExitFee = (tpGrossProceeds * 0.0035) + 0.004;
+                const tpNetPnl = (tpGrossProceeds - tpExitFee) - cost;
+                const tpNetRoiPct = (tpNetPnl / cost) * 100;
+
+                // Proyección Real en Stop Loss / Trailing actual (LOSS / PROTECTED @ SL)
+                const slSlippage = t.breakEvenArmed ? 0.0015 : 0.0020;
+                const slFeeRate  = t.breakEvenArmed ? 0.0035 : 0.0050;
+                const slExecPx   = Math.max(0.005, slPx - slSlippage);
+                const slGrossProceeds = shares * slExecPx;
+                const slExitFee  = (slGrossProceeds * slFeeRate) + 0.004;
+                const slNetPnl   = (slGrossProceeds - slExitFee) - cost;
+                const slNetRoiPct = (slNetPnl / cost) * 100;
+
+                // Distancia en centavos al Trigger de Break-Even o al TP
+                const centsToBeTrigger = ((beTriggerPx - currPx) * 100).toFixed(1);
+                const centsToTp        = ((tpPx - currPx) * 100).toFixed(1);
+
                 return (
                 <div key={t.id} style={{
                   background: S.panel, border: `1px solid ${S.border2}`,
@@ -1358,14 +1400,15 @@ export default function PolyBotV2() {
 
                   <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" }}>
                     {[
-                      ["ENTRADA", fmtPct(t.entryPrice || t.price || 0), S.white],
-                      ["COSTO", `$${Number(t.cost || 0).toFixed(2)}`, S.white],
-                      ["SHARES", (t.shares || 0).toFixed(5), S.text],
-                      ["SL (-)", fmtPct(t.stopLoss || 0), S.red],
-                      ["TP (+)", fmtPct(t.takeProfit || 0), S.green],
+                      ["ENTRADA", fmtPct(entryPx), S.white],
+                      ["COSTO", `$${cost.toFixed(2)}`, S.white],
+                      ["SHARES", shares.toFixed(5), S.text],
+                      ["SL (-)", fmtPct(slPx), t.breakEvenArmed ? S.cyan : S.red],
+                      ["TP (+)", fmtPct(tpPx), S.green],
+                      ["BE EXACTO", fmtPct(exactBreakEvenFloor), S.cyan],
                       ["SCORE IA", `${t.score || 70}/100`, S.cyan],
                       ["CONF IA", `${t.confidence || 68}%`, S.amber],
-                      ["EDGE IA", `+${Number(t.edge_pct || 0).toFixed(1)}%`, S.amber],
+                      ["EDGE 24H", `+${Number(t.edge_pct || 0).toFixed(1)}%`, S.amber],
                       ["RIESGO", (t.risk || 'MEDIUM'), t.risk === "LOW" ? S.green : t.risk === "HIGH" ? S.red : S.amber],
                     ].map(([l, v, c]) => (
                       <div key={l} style={{ background: "#0005", border: `1px solid ${S.border}`, padding: "3px 8px", borderRadius: "3px" }}>
@@ -1377,11 +1420,11 @@ export default function PolyBotV2() {
 
                   <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "12px", borderTop: `1px solid ${S.border}`, paddingTop: "12px" }}>
                     {[
-                      ["PRECIO ACTUAL", fmtPct(t.currentPrice || t.entryPrice || 0), S.cyan],
+                      ["PRECIO ACTUAL (BID)", fmtPct(currPx), S.cyan],
                       ["P&L VIVO (LIBRO)", fmtDlr(liveGrossPnl), liveGrossPnl >= 0 ? S.green : S.red],
-                      ["POOL+GAS EST.", `-$${Number(t.frictionUsd || 0.008).toFixed(3)}`, S.amber],
+                      ["POOL+GAS IDA/VUELTA", `-$${totalRoundTripFriction.toFixed(3)}`, S.amber],
                       ["P&L VIVO NETO REAL", fmtDlr(liveNetPnl), liveNetPnl >= 0 ? S.green : S.red],
-                      ["ROI AUTONOMO", `${liveRoiPct >= 0 ? "+" : ""}${liveRoiPct.toFixed(1)}%`, liveRoiPct >= 0 ? S.green : S.red],
+                      ["ROI NETO REAL", `${liveRoiPct >= 0 ? "+" : ""}${liveRoiPct.toFixed(1)}%`, liveRoiPct >= 0 ? S.green : S.red],
                     ].map(([l, v, c]) => (
                       <div key={l} style={{ background: `${c}15`, border: `1px solid ${c}33`, padding: "6px 12px", borderRadius: "6px" }}>
                         <span style={{ color: S.muted, fontSize: "8px", letterSpacing: "1px" }}>{l} </span>
@@ -1399,20 +1442,17 @@ export default function PolyBotV2() {
                     <div style={{ color: S.purple, fontSize: "9px", fontStyle: "italic", marginBottom: "10px" }}>🤖 {t.reasoning}</div>
                   )}
 
-                  <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-                    <Btn label="WIN 0.95¢" color={S.green} onClick={() => closeTrade(t.id, 0.95)} filled sm />
-                    <Btn label="LOSS 0.05¢" color={S.red} onClick={() => closeTrade(t.id, 0.05)} filled sm />
-                    <Btn label="BREAK EVEN" color={S.amber} onClick={() => closeTrade(t.id, t.entryPrice)} sm />
-                    <input
-                      type="number" min="0" max="1" step="0.01" placeholder="Precio (0-1)"
-                      value={closeInputs[t.id] || ""}
-                      onChange={e => setCloseInputs(p => ({ ...p, [t.id]: e.target.value }))}
-                      style={{
-                        background: S.panelB, border: `1px solid ${S.border2}`, color: S.white,
-                        padding: "4px 8px", borderRadius: "3px", fontFamily: mono, fontSize: "10px", width: "110px",
-                      }}
-                    />
-                    <Btn label="CERRAR" color={S.muted2} onClick={() => closeTrade(t.id, closeInputs[t.id])} sm />
+                  {/* Escenarios Reales Dinámicos ajustados a las shares, entrada, TP, SL y Break-Even de este trade */}
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", background: "#00000035", border: `1px solid ${S.border}`, padding: "8px 10px", borderRadius: "5px" }}>
+                    <div style={{ background: `${S.green}18`, border: `1px solid ${S.green}44`, padding: "4px 9px", borderRadius: "4px", fontFamily: mono, fontSize: "9.5px", color: S.green, fontWeight: 700 }}>
+                      🎯 WIN TP ({fmtPct(tpPx)}): {tpNetPnl >= 0 ? "+" : ""}${tpNetPnl.toFixed(2)} ({tpNetRoiPct >= 0 ? "+" : ""}{tpNetRoiPct.toFixed(1)}%) · Faltan {Number(centsToTp) > 0 ? `+${centsToTp}¢` : "0.0¢"}
+                    </div>
+                    <div style={{ background: `${slNetPnl >= 0 ? S.cyan : S.red}18`, border: `1px solid ${slNetPnl >= 0 ? S.cyan : S.red}44`, padding: "4px 9px", borderRadius: "4px", fontFamily: mono, fontSize: "9.5px", color: slNetPnl >= 0 ? S.cyan : S.red, fontWeight: 700 }}>
+                      {t.breakEvenArmed ? "🛡 SL PROTEGIDO" : "🛑 LOSS SL"} ({fmtPct(slPx)}): {slNetPnl >= 0 ? "+" : ""}${slNetPnl.toFixed(2)} ({slNetRoiPct >= 0 ? "+" : ""}{slNetRoiPct.toFixed(1)}%)
+                    </div>
+                    <div style={{ background: `${S.amber}18`, border: `1px solid ${S.amber}44`, padding: "4px 9px", borderRadius: "4px", fontFamily: mono, fontSize: "9.5px", color: S.amber, fontWeight: 700 }}>
+                      ⚖️ BE REAL ({fmtPct(exactBreakEvenFloor)}): {t.breakEvenArmed ? "✅ ARMADO (Riesgo $0)" : (Number(centsToBeTrigger) > 0 ? `Trigger @ ${fmtPct(beTriggerPx)} (+${centsToBeTrigger}¢)` : `Listo @ ${fmtPct(beTriggerPx)}`)}
+                    </div>
                   </div>
                 </div>
                 );

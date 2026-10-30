@@ -1565,7 +1565,10 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
   return verified;
 }
 
-// ── ORÁCULO CRIPTO GRATUITO EN TIEMPO REAL + MODELO DE BARRERA BROWNIANA (Parkinson Vol) ──
+// ═══════════════════════════════════════════════════════════════════════════
+// POLYBOT v2.5.0 — MOTOR DE REFINAMIENTO PREDICTIVO Y ANTI-SELECCIÓN ADVERSA
+// ═══════════════════════════════════════════════════════════════════════════
+
 let cryptoTickerCache = { ts: 0, data: null };
 
 function normCdf(x) {
@@ -1573,6 +1576,290 @@ function normCdf(x) {
   const d = 0.3989423 * Math.exp((-x * x) / 2);
   const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   return x > 0 ? 1 - p : p;
+}
+
+/**
+ * 1. WOBI (Weighted Order Book Imbalance) Anti-Spoofing
+ * Pondera exponencialmente los niveles del libro L2 para que los muros falsos
+ * colocados a 1.5¢ - 2.0¢ del spread no manipulen la lectura de presión real.
+ */
+export function computeWeightedBookMetrics(bids = [], asks = []) {
+  if (!bids.length || !asks.length) {
+    return { bestBid: 0, bestAsk: 1, spreadAbs: 1, wObi: 0, pMicroWeighted: 0.5, topLiquidityUsd: 0 };
+  }
+
+  const bestBid = Number(bids[0].price);
+  const bestAsk = Number(asks[0].price);
+  const spreadAbs = Math.max(0.001, bestAsk - bestBid);
+
+  // Constante de decaimiento gamma = 115:
+  // A 0.0¢ -> peso 1.00 | A 1.0¢ -> peso 0.316 | A 2.0¢ -> peso 0.100
+  const GAMMA = 115.0;
+
+  let weightedBidVol = 0;
+  let weightedAskVol = 0;
+
+  for (const b of bids) {
+    const px = Number(b.price);
+    const sz = Number(b.size);
+    const dist = bestBid - px;
+    if (dist <= 0.025 && px > 0 && sz > 0) {
+      const weight = Math.exp(-GAMMA * Math.max(0, dist));
+      weightedBidVol += (px * sz) * weight;
+    }
+  }
+
+  for (const a of asks) {
+    const px = Number(a.price);
+    const sz = Number(a.size);
+    const dist = px - bestAsk;
+    if (dist <= 0.025 && px > 0 && sz > 0) {
+      const weight = Math.exp(-GAMMA * Math.max(0, dist));
+      weightedAskVol += (px * sz) * weight;
+    }
+  }
+
+  const totalWeightedVol = weightedBidVol + weightedAskVol;
+  const wObi = totalWeightedVol > 0
+    ? (weightedBidVol - weightedAskVol) / totalWeightedVol
+    : 0;
+
+  // MicroPrice ponderado por liquidez de tope de libro (inmune a spoofing profundo)
+  const pMicroWeighted = totalWeightedVol > 0
+    ? (bestBid * weightedAskVol + bestAsk * weightedBidVol) / totalWeightedVol
+    : (bestBid + bestAsk) / 2;
+
+  return {
+    bestBid,
+    bestAsk,
+    spreadAbs,
+    wObi: Number(wObi.toFixed(4)),
+    pMicroWeighted: Number(pMicroWeighted.toFixed(4)),
+    topLiquidityUsd: Number(totalWeightedVol.toFixed(2)),
+  };
+}
+
+/**
+ * 2. ETI (Exponential Time-Decayed & Kyle-Impact Tape Imbalance)
+ * Pondera los últimos 50 trades dando prioridad exponencial a la última hora (half-life = 1.5h)
+ * y multiplicando el peso de los trades que desplazaron el precio (flujo informado real).
+ */
+export function computeTimeDecayedTapeMetrics(trades = [], targetSide = "YES") {
+  if (!Array.isArray(trades) || trades.length === 0) {
+    return { etiImbalance: 0, informedWhalesCount: 0, priceVelocity6h: 0, oldestPrice6h: null };
+  }
+
+  const nowMs = Date.now();
+  const HALF_LIFE_HOURS = 1.5;
+  const LAMBDA_TIME = Math.LN2 / HALF_LIFE_HOURS;
+
+  const parseTsMs = (tr) => {
+    const raw = tr?.timestamp ?? tr?.match_time ?? tr?.created_at;
+    if (raw === null || raw === undefined) return nowMs;
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > 0) return num < 1e12 ? num * 1000 : num;
+    const parsed = new Date(raw).getTime();
+    return Number.isFinite(parsed) ? parsed : nowMs;
+  };
+
+  let bullWeight = 0;
+  let bearWeight = 0;
+  let informedWhalesCount = 0;
+
+  // Ordenar cronológicamente (más antiguo a más reciente) para medir impacto de precio e impulso 6h
+  const sorted = [...trades].sort((a, b) => parseTsMs(a) - parseTsMs(b));
+
+  const toTargetSidePrice = (tr) => {
+    const rawPx = Number(tr?.price || 0.5);
+    const out = String(tr?.outcome || "YES").toUpperCase();
+    return out === targetSide ? rawPx : (1 - rawPx);
+  };
+
+  let prevPrice = toTargetSidePrice(sorted[0]);
+  let oldestPriceWithin6h = null;
+  const latestPrice = toTargetSidePrice(sorted[sorted.length - 1]);
+
+  for (const tr of sorted) {
+    const px = Number(tr.price || 0.5);
+    const sidePx = toTargetSidePrice(tr);
+    const sizeShares = Number(tr.size || tr.amount || 0);
+    const notionalUsd = px * sizeShares;
+    if (notionalUsd <= 0) continue;
+
+    const tradeTimeMs = parseTsMs(tr);
+    const ageHours = Math.max(0, (nowMs - tradeTimeMs) / 3600_000);
+
+    if (ageHours <= 6.0 && oldestPriceWithin6h === null) {
+      oldestPriceWithin6h = sidePx;
+    }
+
+    // Factor de decaimiento temporal exponencial
+    const timeWeight = Math.exp(-LAMBDA_TIME * ageHours);
+
+    // Impacto de Kyle: los trades que mueven el precio >= 0.5¢ reciben hasta 2.5x más peso
+    const priceDelta = Math.abs(sidePx - prevPrice);
+    const kyleImpactMultiplier = 1.0 + Math.min(1.5, priceDelta * 50.0);
+    prevPrice = sidePx;
+
+    const effectiveWeight = notionalUsd * timeWeight * kyleImpactMultiplier;
+
+    // Determinar si el trade apoya nuestro lado (targetSide)
+    const isBuySide = String(tr.side || "BUY").toUpperCase() === "BUY";
+    const tradeOutcome = String(tr.outcome || "YES").toUpperCase();
+    const supportsTarget =
+      (tradeOutcome === targetSide && isBuySide) ||
+      (tradeOutcome !== targetSide && !isBuySide);
+
+    if (supportsTarget) {
+      bullWeight += effectiveWeight;
+      if (notionalUsd >= 150 && ageHours <= 4.0) {
+        informedWhalesCount += 1;
+      }
+    } else {
+      bearWeight += effectiveWeight;
+    }
+  }
+
+  const totalWeight = bullWeight + bearWeight;
+  const etiImbalance = totalWeight > 0 ? (bullWeight - bearWeight) / totalWeight : 0;
+  const priceVelocity6h = oldestPriceWithin6h !== null ? (latestPrice - oldestPriceWithin6h) : 0;
+
+  return {
+    etiImbalance: Number(etiImbalance.toFixed(4)),
+    informedWhalesCount,
+    priceVelocity6h: Number(priceVelocity6h.toFixed(4)),
+    oldestPrice6h: oldestPriceWithin6h,
+  };
+}
+
+/**
+ * 3. Detector de Catalizador Ya Descontado ("Priced-In Veto")
+ * Bloquea compras tardías cuando la noticia tiene > 1.5h y el precio ya subió
+ * gran parte del recorrido proyectado por la IA.
+ */
+export function evaluateCatalystPricedIn({
+  hasFreshNews,
+  newsAgeHours = 6.0,
+  marketMicro,
+  rawSideProb,
+  priceVelocity6h = 0,
+}) {
+  const projectedRemainingMove = Math.max(0.001, rawSideProb - marketMicro);
+
+  // Si en las últimas 6h el precio ya avanzó en nuestra dirección:
+  if (priceVelocity6h > 0.02) {
+    const totalImpliedMoveFromBase = priceVelocity6h + projectedRemainingMove;
+    const priceAbsorptionRatio = priceVelocity6h / totalImpliedMoveFromBase; // PAR en [0, 1]
+
+    // Veto Duro: Si la noticia tiene más de 1.5 horas y el mercado ya absorbió >= 65%
+    // del movimiento total, o si ya subió +11¢ en las últimas 6h sin flujo fresco nuevo:
+    const isAlreadyPricedIn =
+      (hasFreshNews && newsAgeHours > 1.5 && priceAbsorptionRatio >= 0.65) ||
+      priceVelocity6h >= 0.11;
+
+    // Penalización progresiva sobre el peso de la IA a medida que el precio ya corrió
+    const freshnessDecay = hasFreshNews
+      ? Math.exp(-0.18 * Math.max(0, newsAgeHours - 0.5)) * (1.0 - 0.60 * priceAbsorptionRatio)
+      : 0.0;
+
+    return {
+      isAlreadyPricedIn,
+      priceAbsorptionRatio: Number(priceAbsorptionRatio.toFixed(3)),
+      effectiveCatalystWeightBoost: Number((0.12 * Math.max(0, freshnessDecay)).toFixed(4)),
+    };
+  }
+
+  const freshnessDecay = hasFreshNews ? Math.exp(-0.15 * Math.max(0, newsAgeHours - 0.5)) : 0.0;
+  return {
+    isAlreadyPricedIn: false,
+    priceAbsorptionRatio: 0,
+    effectiveCatalystWeightBoost: Number((0.12 * freshnessDecay).toFixed(4)),
+  };
+}
+
+/**
+ * 4. Clasificador y Oráculo Cripto Dual:
+ * Distingue entre Barrera Americana ("reach / hit / touch / dip") -> Inverse Gaussian Touch
+ * y Contrato Digital Europeo ("be above / be below / on [Date]") -> Black-Scholes N(d2)
+ */
+export function computeDualCryptoOracleProb({
+  questionText = "",
+  spotPrice,
+  barrierPrice,
+  sigmaDaily,
+  daysToExpiry,
+  itoDriftDaily = 0,
+  normalCDFFn = normCdf,
+}) {
+  if (!spotPrice || !barrierPrice || !sigmaDaily || daysToExpiry <= 0) return null;
+
+  const qLower = questionText.toLowerCase();
+  const isTouchBarrier = /\b(reach|hit|touch|dip|drop|fall|cross|before)\b/i.test(qLower) &&
+                         !/\b(be above|be below|close above|close below|price on|be over|be under)\b/i.test(qLower);
+
+  const sigmaT = Math.max(0.005, sigmaDaily * Math.sqrt(daysToExpiry));
+  const b = Math.log(barrierPrice / spotPrice);
+  const absB = Math.abs(b);
+  const direction = b >= 0 ? 1.0 : -1.0;
+
+  if (!isTouchBarrier) {
+    // CONTRATO DIGITAL EUROPEO AL VENCIMIENTO: P(S_T >= B) o P(S_T <= B) — SIN multiplicar por 2
+    const isBelowExpiry = /\b(below|under|less than|lower than)\b/i.test(qLower);
+    const signedLogDist = isBelowExpiry
+      ? Math.log(barrierPrice / spotPrice) - (itoDriftDaily * daysToExpiry)
+      : Math.log(spotPrice / barrierPrice) + (itoDriftDaily * daysToExpiry);
+    const d2 = signedLogDist / sigmaT;
+    const probTerminal = Math.min(0.99, Math.max(0.01, normalCDFFn(d2)));
+    return {
+      contractType: "EUROPEAN_DIGITAL_EXPIRY",
+      pMath: Number(probTerminal.toFixed(4)),
+    };
+  }
+
+  // CONTRATO DE BARRERA AMERICANA (ONE-TOUCH): P(max/min S_t >= B en t <= T)
+  const d1 = (-absB + direction * itoDriftDaily * daysToExpiry) / sigmaT;
+  const d2 = (-absB - direction * itoDriftDaily * daysToExpiry) / sigmaT;
+  const expArg = Math.min(40.0, (2.0 * direction * absB * itoDriftDaily) / (sigmaDaily ** 2));
+  const probTouch = Math.min(
+    0.99,
+    Math.max(0.01, normalCDFFn(d1) + Math.exp(expArg) * normalCDFFn(d2))
+  );
+
+  return {
+    contractType: "AMERICAN_BARRIER_TOUCH",
+    pMath: Number(probTouch.toFixed(4)),
+  };
+}
+
+/**
+ * 5. Consistencia Combinatoria en Eventos Multi-Resultado (Normalización de Kolmogorov)
+ * Si el mercado pertenece a un evento con múltiples candidatos mutuamente excluyentes,
+ * descuenta el overround (Suma P_j > 1.0) sobre el MicroPrice.
+ */
+function computeSiblingNormalizedMicro(m, rawMicro, isYesSide) {
+  const eventKey = String(m?.events?.[0]?.slug || m?.events?.[0]?.id || "");
+  if (!eventKey || !Array.isArray(botState.allMarkets) || botState.allMarkets.length < 2) {
+    return rawMicro;
+  }
+
+  const siblings = botState.allMarkets.filter(cand => {
+    const cKey = String(cand?.events?.[0]?.slug || cand?.events?.[0]?.id || "");
+    return cKey === eventKey && cand?.negRisk === true;
+  });
+
+  if (siblings.length < 2) return rawMicro;
+
+  const sumYesP = siblings.reduce((sum, s) => sum + asNumber(s?._prelim?.yesP, 0), 0);
+  if (sumYesP <= 1.03 || sumYesP > 1.40) return rawMicro;
+
+  // Normalizar probabilidad implícita de YES dividiendo por la suma del grupo
+  if (isYesSide) {
+    return Math.max(0.01, Math.min(0.99, rawMicro / sumYesP));
+  }
+  const impliedYes = 1 - rawMicro;
+  const normalizedYes = impliedYes / sumYesP;
+  // Para BUY_NO, el overround de YES inflaba artificialmente el precio de YES; mantenemos ancla conservadora
+  return Math.max(0.01, Math.min(0.99, (rawMicro + (1 - normalizedYes)) / 2));
 }
 
 async function getCryptoSpotContext(question, daysLeft) {
@@ -1630,29 +1917,21 @@ async function getCryptoSpotContext(question, daysLeft) {
     let mathYesProb = null;
     let modelType = "SPOT_ONLY";
     const tDays = Math.max(0.15, Number.isFinite(daysLeft) ? daysLeft : 3);
-    const periodStd = dailyVol * Math.sqrt(tDays);
+    const itoDriftDaily = -0.5 * (dailyVol ** 2);
 
     if (targetPrice && targetPrice > spot * 0.2 && targetPrice < spot * 3.0) {
-      const isDipTouch = /\b(dip|drop|fall|low|touch|reach|hit)\b/i.test(q) && targetPrice < spot;
-      const isRallyTouch = /\b(reach|hit|touch|high|surge|pump)\b/i.test(q) && targetPrice > spot;
-      const isBelowTerminal = /\b(below|under|less than)\b/i.test(q);
-      const isAboveTerminal = /\b(above|over|greater than|higher than)\b/i.test(q);
-
-      const logDist = Math.abs(Math.log(targetPrice / spot));
-      const z = logDist / periodStd;
-
-      if (isDipTouch || isRallyTouch) {
-        modelType = "BARRIER_TOUCH";
-        // Principio de reflexión para movimiento browniano sin deriva
-        mathYesProb = Math.max(0.02, Math.min(0.96, 2 * normCdf(-z)));
-      } else if (isAboveTerminal) {
-        modelType = "TERMINAL_ABOVE";
-        const zSigned = Math.log(spot / targetPrice) / periodStd;
-        mathYesProb = Math.max(0.02, Math.min(0.96, normCdf(zSigned)));
-      } else if (isBelowTerminal) {
-        modelType = "TERMINAL_BELOW";
-        const zSigned = Math.log(targetPrice / spot) / periodStd;
-        mathYesProb = Math.max(0.02, Math.min(0.96, normCdf(zSigned)));
+      const dualOracle = computeDualCryptoOracleProb({
+        questionText: q,
+        spotPrice: spot,
+        barrierPrice: targetPrice,
+        sigmaDaily: dailyVol,
+        daysToExpiry: tDays,
+        itoDriftDaily,
+        normalCDFFn: normCdf,
+      });
+      if (dualOracle) {
+        modelType = dualOracle.contractType;
+        mathYesProb = dualOracle.pMath;
       }
     }
 
@@ -1826,6 +2105,7 @@ async function deepAnalyze(m, prelim) {
   let topSnippet = "none";
   let usedCache = false;
   let hasFreshNews = false;
+  let minNewsAgeHours = 8.0;
 
   const [cryptoQuant, cachedNews] = await Promise.all([
     getCryptoSpotContext(m.question, daysLeft),
@@ -1837,15 +2117,20 @@ async function deepAnalyze(m, prelim) {
     topSource = cachedNews.source;
     topSnippet = cachedNews.snippet;
     hasFreshNews = Boolean(cachedNews.hasFreshNews);
+    minNewsAgeHours = asNumber(cachedNews.minAgeHours, 6.0);
     usedCache = true;
   } else {
     const combinedLines = [];
+    let bestAge = 24.0;
 
     // 1. Fuente Primaria Gratuita e Ilimitada: Google News RSS (con antigüedad exacta en horas)
     const rssArticles = await fetchGoogleNewsRss(m.question);
     for (const art of rssArticles) {
       const ageNum = parseFloat(art.ageHours);
-      if (Number.isFinite(ageNum) && ageNum <= 12) hasFreshNews = true;
+      if (Number.isFinite(ageNum)) {
+        if (ageNum < bestAge) bestAge = ageNum;
+        if (ageNum <= 12) hasFreshNews = true;
+      }
       combinedLines.push(`[RSS ${art.ageHours}h ago | ${art.source}] ${art.title}`);
       if (topSource === "none" && art.url) topSource = art.url;
       if (topSnippet === "none") topSnippet = `[${art.source}] ${art.title.slice(0, 140)}`;
@@ -1870,6 +2155,7 @@ async function deepAnalyze(m, prelim) {
           const tData = await tRes.json();
           if (tData.results && tData.results.length > 0) {
             hasFreshNews = true;
+            if (bestAge > 4.0) bestAge = 3.5;
             for (const r of tData.results) {
               combinedLines.push(`[WEB ${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 240)}`);
             }
@@ -1882,6 +2168,7 @@ async function deepAnalyze(m, prelim) {
       }
     }
 
+    minNewsAgeHours = bestAge;
     if (combinedLines.length > 0) {
       newsContext = combinedLines.slice(0, 7).join("\n");
       botState.newsCache[marketId] = {
@@ -1890,6 +2177,7 @@ async function deepAnalyze(m, prelim) {
         source: topSource,
         snippet: topSnippet,
         hasFreshNews,
+        minAgeHours: minNewsAgeHours,
         news: newsContext,
       };
     }
@@ -1900,15 +2188,18 @@ async function deepAnalyze(m, prelim) {
   const fmtDelta = (v) => `${v >= 0 ? "+" : ""}${(asNumber(v, 0) * 100).toFixed(1)}%`;
   const priceActionStr = `1h=${fmtDelta(change1h)} | 24h=${fmtDelta(change24h)} | 7d=${fmtDelta(change7d)}`;
 
-  const yesBookStr = yesBook?.isValid
-    ? `Bid=${(yesBook.bestBid * 100).toFixed(1)}c Ask=${(yesBook.bestAsk * 100).toFixed(1)}c MicroPrice=${((yesBook.microPrice ?? yesBook.midPrice) * 100).toFixed(1)}c Spread=${yesBook.spreadPct.toFixed(2)}% BidDepth=$${yesBook.bidDepthUsd.toFixed(0)} AskDepth=$${yesBook.askDepthUsd.toFixed(0)} OBI=${yesBook.obi >= 0 ? "+" : ""}${yesBook.obi.toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
+  // PROTOCOLO ANTI-ANCLAJE DE TETLOCK:
+  // Ocultamos el nivel de precio actual (Bid/Ask/MicroPrice) al LLM para evitar que sume +10% por inercia al precio actual.
+  // Le entregamos únicamente la microestructura de presión (SpreadPct, WOBI, Profundidad y Flujo ETI).
+  const yesBookStructureStr = yesBook?.isValid
+    ? `Spread=${yesBook.spreadPct.toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (yesBook.bidDepthUsd + yesBook.askDepthUsd)).toFixed(0)} WOBI=${yesBook.obi >= 0 ? "+" : ""}${yesBook.obi.toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
-  const noBookStr = noBook?.isValid
-    ? `Bid=${(noBook.bestBid * 100).toFixed(1)}c Ask=${(noBook.bestAsk * 100).toFixed(1)}c MicroPrice=${((noBook.microPrice ?? noBook.midPrice) * 100).toFixed(1)}c Spread=${noBook.spreadPct.toFixed(2)}% BidDepth=$${noBook.bidDepthUsd.toFixed(0)} AskDepth=$${noBook.askDepthUsd.toFixed(0)} OBI=${noBook.obi >= 0 ? "+" : ""}${noBook.obi.toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
+  const noBookStructureStr = noBook?.isValid
+    ? `Spread=${noBook.spreadPct.toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (noBook.bidDepthUsd + noBook.askDepthUsd)).toFixed(0)} WOBI=${noBook.obi >= 0 ? "+" : ""}${noBook.obi.toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
   const tapeFlowStr = tradeFlow
-    ? `Last_${tradeFlow.sampleCount}_Trades: BullishYES=$${tradeFlow.yesBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleYesCount}) | BullishNO=$${tradeFlow.noBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleNoCount}) | TapeImbalance=${tradeFlow.tapeImbalance >= 0 ? "+" : ""}${tradeFlow.tapeImbalance.toFixed(2)}`
+    ? `Last_${tradeFlow.sampleCount}_Trades: BullishYES=$${tradeFlow.yesBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleYesCount}) | BullishNO=$${tradeFlow.noBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleNoCount}) | ETI_TapeImbalance=${tradeFlow.tapeImbalance >= 0 ? "+" : ""}${tradeFlow.tapeImbalance.toFixed(2)}`
     : "UNAVAILABLE";
 
   const cryptoLine = cryptoQuant ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary}` : "";
@@ -1918,14 +2209,16 @@ async function deepAnalyze(m, prelim) {
     messages: [
       {
         role: "system",
-        content: `You are a senior quantitative prediction-market trader managing real capital on Polymarket CLOB.
-Your job is to estimate the true probability of the YES outcome (estimated_yes_prob between 0.01 and 0.99) based strictly on verifiable news, base rates, time-to-resolution, price action, order book imbalance (OBI), real trade tape flow, live crypto spot oracle (if present), and the exact market resolution rules.
+        content: `You are a senior quantitative superforecaster (Tetlock protocol) managing real capital on Polymarket CLOB.
+You are intentionally BLIND to the current market price so you cannot anchor to it.
+Your job is to estimate from first principles:
+1. base_rate_prob (0.01 to 0.99): The historical outside-view base rate probability of YES ignoring today's news.
+2. evidence_likelihood_ratio (0.50 to 2.00): The diagnostic strength of RECENT_NEWS & orderflow (1.00 = no fresh catalyst or noise; >1.00 = confirms YES; <1.00 = contradicts YES / confirms NO).
+3. estimated_yes_prob (0.01 to 0.99): Your final fundamental probability of the YES outcome.
 CRITICAL RULES:
-1. Anchor your prior to the market's MicroPrice — only deviate significantly when supported by fresh verifiable news, mathematical barrier models (LIVE_CRYPTO_ORACLE), or strong orderflow (OBI & TapeImbalance).
-2. Never recommend a side marked Tradable=NO.
-3. Check PRICE_ACTION (1h/24h/7d) vs news age: if a market already moved >20% in 24h because of old news, that catalyst is ALREADY PRICED IN — return action="SKIP".
-4. Avoid the Longshot Bias: be extra skeptical of buying outcomes priced below 18c unless mathematical or hard-news evidence is overwhelming.
-5. SPORTS & ESPORTS WARNING: If the live CLOB price is between 15c and 85c, the match HAS NOT BEEN PLAYED YET. Any final score in RECENT_NEWS is from a PAST game earlier in the season — NEVER treat a past game score as the result of the upcoming match. If there is no fresh injury/lineup catalyst ("no recent catalyst"), return action="SKIP".
+1. Never recommend a side marked Tradable=NO.
+2. Check PRICE_MOMENTUM (1h/24h/7d) vs news age: if a market already moved >15% in 24h because of news older than 2 hours, that catalyst is ALREADY PRICED IN — return action="SKIP".
+3. SPORTS & ESPORTS WARNING: Any final score in RECENT_NEWS is from a PAST game earlier in the season — NEVER treat a past game score as the result of the upcoming match. If there is no fresh injury/lineup catalyst ("no recent catalyst"), return action="SKIP".
 Return ONLY raw valid JSON.`
       },
       {
@@ -1933,17 +2226,17 @@ Return ONLY raw valid JSON.`
         content: `TODAY: ${new Date().toISOString().slice(0, 10)} | CLOSES_IN: ${daysLeftStr} days
 QUESTION: "${m.question}"
 RESOLUTION_RULES: "${resolutionRules}"
-GAMMA_MID: YES=${fmtPct(yesP)} NO=${fmtPct(noP)} | VOL_24H=$${Math.round(vol24)} | LIQ=$${Math.round(liq)}
-PRICE_ACTION_YES: ${priceActionStr}
-CLOB_YES_BOOK: ${yesBookStr}
-CLOB_NO_BOOK: ${noBookStr}
+MARKET_ACTIVITY: VOL_24H=$${Math.round(vol24)} | LIQ=$${Math.round(liq)}
+PRICE_MOMENTUM_YES: ${priceActionStr}
+CLOB_YES_STRUCTURE: ${yesBookStructureStr}
+CLOB_NO_STRUCTURE: ${noBookStructureStr}
 CLOB_TAPE_FLOW: ${tapeFlowStr}${cryptoLine}
 QUANT_SIGNALS: ${prelim.signals.join(",") || "none"}
 RECENT_NEWS ${usedCache ? "(cached)" : "(live RSS + Web)"}:
 ${newsContext.slice(0, 1200)}
 
 Return JSON with this exact schema:
-{"action":"BUY_YES"|"BUY_NO"|"SKIP","estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing probability vs ask price, news age, and order book","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
+{"action":"BUY_YES"|"BUY_NO"|"SKIP","base_rate_prob":0.01-0.99,"evidence_likelihood_ratio":0.50-2.00,"estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing base rate, news age, and orderflow","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
       }
     ],
     temperature: 0.1,
@@ -1958,15 +2251,40 @@ Return JSON with this exact schema:
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
 
-  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA ──
-  let estYesProb = parseFloat(result.estimated_yes_prob);
-  if (Number.isFinite(estYesProb)) {
-    if (estYesProb > 1 && estYesProb <= 100) estYesProb = estYesProb / 100;
+  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA (v2.5.0) ──
+  const normalizeProb = (v) => {
+    const n = parseFloat(v);
+    if (!Number.isFinite(n)) return null;
+    return n > 1 && n <= 100 ? n / 100 : n;
+  };
+
+  let estYesProb = normalizeProb(result.estimated_yes_prob);
+  const baseRateYes = normalizeProb(result.base_rate_prob) ?? estYesProb;
+  const rawLikelihoodRatio = Math.max(0.25, Math.min(4.0, asNumber(result.evidence_likelihood_ratio, 1.0)));
+
+  if (Number.isFinite(baseRateYes) && Number.isFinite(estYesProb)) {
+    const safeBase = Math.max(0.02, Math.min(0.98, baseRateYes));
+    const decayedLR = 1.0 + (rawLikelihoodRatio - 1.0) * Math.exp(-0.15 * Math.max(0, minNewsAgeHours - 0.5));
+    const priorOdds = safeBase / (1 - safeBase);
+    const postOdds  = priorOdds * Math.max(0.25, decayedLR);
+    const bayesianYesProb = postOdds / (1 + postOdds);
+    estYesProb = (0.55 * estYesProb) + (0.45 * bayesianYesProb);
   }
 
-  // Si es un mercado cripto con modelo matemático de barrera (Parkinson + Brownian Motion), anclar el estimado de la IA con la probabilidad matemática real
+  // Si es un mercado cripto con Oráculo Dual (Digital Europeo vs Barrera Americana), anclar con la probabilidad estocástica exacta
   if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb) && Number.isFinite(estYesProb)) {
-    estYesProb = (0.55 * estYesProb) + (0.45 * cryptoQuant.mathYesProb);
+    estYesProb = (0.45 * estYesProb) + (0.55 * cryptoQuant.mathYesProb);
+  }
+
+  // Como el LLM estimó a ciegas sin ver el Ask del CLOB, seleccionamos/validamos el lado donde estYesProb supera al Ask real
+  if (Number.isFinite(estYesProb) && result.action !== "SKIP") {
+    const yesEdgeBlind = (yesTradable && yesBook?.isValid) ? (estYesProb - yesBook.bestAsk) : -1;
+    const noEdgeBlind  = (noTradable && noBook?.isValid) ? ((1 - estYesProb) - noBook.bestAsk) : -1;
+    if (result.action === "BUY_YES" && yesEdgeBlind <= 0.01 && noEdgeBlind >= 0.05) {
+      result.action = "BUY_NO";
+    } else if (result.action === "BUY_NO" && noEdgeBlind <= 0.01 && yesEdgeBlind >= 0.05) {
+      result.action = "BUY_YES";
+    }
   }
 
   let selectedBook = null;
@@ -1977,7 +2295,7 @@ Return JSON with this exact schema:
     isYesSide = true;
     if (!yesTradable || !yesBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO CLOB] Lado YES bloqueado por spread/liquidez/WOBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = yesBook;
       rawSideProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -1986,7 +2304,7 @@ Return JSON with this exact schema:
     isYesSide = false;
     if (!noTradable || !noBook?.isValid) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez/OBI. ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO CLOB] Lado NO bloqueado por spread/liquidez/WOBI. ${result.reasoning || ""}`;
     } else {
       selectedBook = noBook;
       rawSideProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
@@ -1996,18 +2314,64 @@ Return JSON with this exact schema:
   if (selectedBook && (result.action === "BUY_YES" || result.action === "BUY_NO")) {
     rawSideProb = Math.max(0.01, Math.min(0.99, rawSideProb));
     const executableAsk = selectedBook.bestAsk;
-    const marketMicro = selectedBook.microPrice ?? selectedBook.midPrice ?? executableAsk;
-    const sideTapeImbalance = tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0;
+    const selectedSide  = isYesSide ? "YES" : "NO";
+
+    // 1. Microestructura de 2ª Generación: WOBI (Anti-Spoofing) y ETI (Tape con Decaimiento Temporal + Impacto de Kyle)
+    const wBook = (Array.isArray(selectedBook.bids) && selectedBook.bids.length > 0 && Array.isArray(selectedBook.asks) && selectedBook.asks.length > 0)
+      ? computeWeightedBookMetrics(selectedBook.bids, selectedBook.asks)
+      : {
+          bestBid: selectedBook.bestBid,
+          bestAsk: selectedBook.bestAsk,
+          spreadAbs: selectedBook.spreadAbs,
+          wObi: asNumber(selectedBook.wObi ?? selectedBook.obi, 0),
+          pMicroWeighted: asNumber(selectedBook.pMicroWeighted ?? selectedBook.microPrice ?? selectedBook.midPrice, executableAsk),
+          topLiquidityUsd: asNumber(selectedBook.bidDepthUsd, 0) + asNumber(selectedBook.askDepthUsd, 0),
+        };
+
+    const eTape = computeTimeDecayedTapeMetrics(tradeFlow?.rawTrades || [], selectedSide);
+    const effectiveObi = wBook.wObi;
+    const sideTapeImbalance = (Array.isArray(tradeFlow?.rawTrades) && tradeFlow.rawTrades.length > 0)
+      ? eTape.etiImbalance
+      : (tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0);
+
+    // Consistencia Combinatoria entre hermanos (descuenta overround en eventos multi-resultado)
+    const marketMicro = computeSiblingNormalizedMicro(m, wBook.pMicroWeighted, isYesSide);
+
+    // Velocidad de precio en 6h combinando la cinta de trades y los deltas de Gamma
+    const sideChange1h  = isYesSide ? asNumber(change1h, 0) : -asNumber(change1h, 0);
+    const sideChange24h = isYesSide ? asNumber(change24h, 0) : -asNumber(change24h, 0);
+    const effectivePriceVelocity6h = Math.max(eTape.priceVelocity6h, sideChange1h, sideChange24h * 0.65);
+
+    // 2. Detector de Catalizador Ya Descontado (Priced-In Detector / PAR)
+    const catalystAudit = evaluateCatalystPricedIn({
+      hasFreshNews,
+      newsAgeHours: minNewsAgeHours,
+      marketMicro,
+      rawSideProb,
+      priceVelocity6h: effectivePriceVelocity6h,
+    });
+
+    // Si hay base_rate_prob y LR, penalizar LR también por PAR (1 - 0.75 * PAR)
+    if (Number.isFinite(baseRateYes) && catalystAudit.priceAbsorptionRatio > 0) {
+      const safeBase = Math.max(0.02, Math.min(0.98, isYesSide ? baseRateYes : (1 - baseRateYes)));
+      const sideRawLR = isYesSide ? rawLikelihoodRatio : (1 / Math.max(0.25, rawLikelihoodRatio));
+      const lrEffective = 1.0 + (sideRawLR - 1.0)
+        * Math.exp(-0.15 * Math.max(0, minNewsAgeHours - 0.5))
+        * Math.max(0, 1.0 - 0.75 * catalystAudit.priceAbsorptionRatio);
+      const pOdds = (safeBase / (1 - safeBase)) * Math.max(0.25, lrEffective);
+      const pPostPar = pOdds / (1 + pOdds);
+      rawSideProb = Math.max(0.01, Math.min(0.99, (0.50 * rawSideProb) + (0.50 * pPostPar)));
+    }
 
     // Protección dura contra mercados deportivos donde la IA confunde marcadores pasados o no tiene catalizador nuevo
-    const isSportsMatch = m._cat === "SPORTS" || /\b(vs\.?|handicap|esports|nba|nfl|mlb|nhl|ufc)\b/i.test(m.question || "");
+    const isSportsMatch = m._cat === "SPORTS" || /\b(vs\.?|handicap|esports|nba|nfl|mlb|nhl|ufc|match|game|atp|premier league|champions)\b/i.test(m.question || "");
     const lacksCatalyst = /no recent catalyst|no new info|older news|no recent news|sin noticias recientes/i.test(
       `${result.news_found || ""} ${result.reasoning || ""}`
     );
 
-    if (lacksCatalyst && (selectedBook.obi < 0.45 || sideTapeImbalance < 0.25)) {
+    if (lacksCatalyst && (effectiveObi < 0.45 || sideTapeImbalance < 0.25)) {
       result.action = "SKIP";
-      result.reasoning = `[FILTRO CATALIZADOR] Sin noticia nueva ni flujo institucional fuerte (OBI=${selectedBook.obi.toFixed(2)}, Tape=${sideTapeImbalance.toFixed(2)}). ${result.reasoning || ""}`;
+      result.reasoning = `[FILTRO CATALIZADOR] Sin noticia nueva ni flujo institucional fuerte (WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)}). ${result.reasoning || ""}`;
     }
 
     if (isSportsMatch && executableAsk >= 0.20 && executableAsk <= 0.80) {
@@ -2015,17 +2379,16 @@ Return JSON with this exact schema:
       rawSideProb = Math.min(rawSideProb, marketMicro + 0.14);
     }
 
-    // 1. Peso adaptativo de la IA frente al MicroPrice del mercado
-    let aiWeight = 0.52;
-    if (hasFreshNews && !lacksCatalyst) aiWeight += 0.10;
-    if (selectedBook.obi >= 0.15)       aiWeight += 0.06;
-    else if (selectedBook.obi <= -0.15) aiWeight -= 0.10;
-    if (sideTapeImbalance >= 0.15)      aiWeight += 0.06;
+    // 3. Peso adaptativo de la IA usando el decaimiento continuo de frescura (catalystAudit.effectiveCatalystWeightBoost)
+    let aiWeight = 0.50 + (lacksCatalyst ? 0 : catalystAudit.effectiveCatalystWeightBoost);
+    if (effectiveObi >= 0.18)          aiWeight += 0.06;
+    else if (effectiveObi <= -0.15)    aiWeight -= 0.10;
+    if (sideTapeImbalance >= 0.18)     aiWeight += 0.06;
     else if (sideTapeImbalance <= -0.20) aiWeight -= 0.10;
-    if (liq > 50000)                    aiWeight -= 0.08;
+    if (liq > 50000)                   aiWeight -= 0.08;
     aiWeight = Math.max(0.35, Math.min(0.72, aiWeight));
 
-    // 2. Pooling en espacio Log-Odds (corrige sobreconfianza del LLM en extremos)
+    // 4. Pooling en espacio Log-Odds (corrige sobreconfianza del LLM en extremos)
     const clampP  = (p) => Math.max(0.01, Math.min(0.99, Number(p)));
     const logit   = (p) => Math.log(clampP(p) / (1 - clampP(p)));
     const sigmoid = (z) => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, z))));
@@ -2036,15 +2399,15 @@ Return JSON with this exact schema:
     const combinedLogit      = (aiWeight * rawLogitShrunk) + ((1 - aiWeight) * microLogit);
     const calibratedFairProb = clampP(sigmoid(combinedLogit));
 
-    // 3. Factor de Convergencia Finita a 24h (Kappa_24h) coherente con MAX_HOLD = 24h
+    // 5. Factor de Convergencia Finita a 24h (Kappa_24h) coherente con MAX_HOLD = 24h
     const endDateRaw = m?.endDate || m?.endDateIso;
     const endDateMs  = endDateRaw ? new Date(endDateRaw).getTime() : (Date.now() + 7 * 86400_000);
     const hoursToResolution = Math.max(1, (endDateMs - Date.now()) / 3600_000);
     const daysToResolution  = hoursToResolution / 24;
 
     const timeConvergenceBase = Math.pow(24 / Math.max(24, hoursToResolution), 0.45);
-    const catalystBoost       = (hasFreshNews && !lacksCatalyst) ? 0.35 : 0.0;
-    const orderflowBoost      = (selectedBook.obi >= 0.25 && sideTapeImbalance >= 0.20) ? 0.20 : 0.0;
+    const catalystBoost       = (hasFreshNews && !lacksCatalyst && !catalystAudit.isAlreadyPricedIn) ? 0.35 : 0.0;
+    const orderflowBoost      = (effectiveObi >= 0.25 && sideTapeImbalance >= 0.20) ? 0.20 : 0.0;
     const kappa24h            = Math.max(0.25, Math.min(1.0, timeConvergenceBase + catalystBoost + orderflowBoost));
 
     // Valor justo alcanzable dentro de la ventana operativa de 24h
@@ -2052,9 +2415,7 @@ Return JSON with this exact schema:
       marketMicro + kappa24h * (calibratedFairProb - marketMicro)
     );
 
-    // 4. Descuento de Fricción Exacto (Sin doble conteo de spread y sin feeCost = 0)
-    // executableAsk ya incluye el semiespacio superior (executableAsk - marketMicro).
-    // Al salir al Bid solo pagamos el semiespacio inferior: (marketMicro - bestBid).
+    // 6. Descuento de Fricción Exacto (Sin doble conteo de spread y sin feeCost = 0)
     const bestBidPx      = asNumber(selectedBook.bestBid, executableAsk - selectedBook.spreadAbs);
     const exitHalfSpread = Math.max(0.002, marketMicro - bestBidPx);
 
@@ -2082,10 +2443,13 @@ Return JSON with this exact schema:
     const rawEdgePct = (rawSideProb - executableAsk) * 100;
     const netEdgePct = (reachableFairProb24h - executableAsk - totalEntryFriction - totalExitFriction - longshotPenalty) * 100;
 
-    // 5. SISTEMA INSTITUCIONAL DE CONFLUENCIA DE 4 PILARES (Confluence Gate)
+    // 7. SISTEMA INSTITUCIONAL DE CONFLUENCIA DE 4 PILARES (Confluence Gate)
     const conf = parseFloat(result.confidence || 0);
     const risk = String(result.risk || "MEDIUM").toUpperCase();
-    const whaleSideCount = tradeFlow ? (isYesSide ? tradeFlow.whaleYesCount : tradeFlow.whaleNoCount) : 0;
+    const whaleSideCount = Math.max(
+      eTape.informedWhalesCount || 0,
+      tradeFlow ? (isYesSide ? tradeFlow.whaleYesCount : tradeFlow.whaleNoCount) : 0
+    );
     const estStopLoss   = calcStopLoss(executableAsk, selectedBook.bestBid);
     const estTakeProfit = calcTakeProfit(executableAsk, reachableFairProb24h);
     const rewardToRisk  = (executableAsk - estStopLoss) > 0
@@ -2093,9 +2457,9 @@ Return JSON with this exact schema:
       : 0;
 
     const pillars = {
-      bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && selectedBook.obi >= -0.05,
-      orderflowAlignment: (selectedBook.obi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
-      catalystOrMath: (hasFreshNews && !lacksCatalyst) || (selectedBook.obi >= 0.35 && sideTapeImbalance >= 0.20),
+      bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && effectiveObi >= -0.05,
+      orderflowAlignment: (effectiveObi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
+      catalystOrMath: (hasFreshNews && !lacksCatalyst && !catalystAudit.isAlreadyPricedIn) || (effectiveObi >= 0.35 && sideTapeImbalance >= 0.20),
       positiveExpectancy: netEdgePct >= MIN_NET_EDGE_PCT && conf >= 70 && rewardToRisk >= 1.75,
     };
 
@@ -2111,25 +2475,35 @@ Return JSON with this exact schema:
       hardVetoes.push(`Horizonte > 14d (${daysToResolution.toFixed(1)}d) sin catalizador fresco del día`);
     }
 
-    // Veto Duro A: Prohibido comprar contra el flujo del Order Book y de la Cinta simultáneamente
-    if (selectedBook.obi < -0.05 && sideTapeImbalance <= 0.05) {
-      hardVetoes.push(`Flujo en contra (OBI=${selectedBook.obi.toFixed(2)}, Tape=${sideTapeImbalance.toFixed(2)})`);
+    // Veto Duro A: Prohibido comprar contra el flujo del Order Book (WOBI) y de la Cinta (ETI) simultáneamente
+    if (effectiveObi < -0.05 && sideTapeImbalance <= 0.05) {
+      hardVetoes.push(`Flujo en contra (WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)})`);
     }
 
-    // Veto Duro B: En Cripto con modelo de barrera, la probabilidad matemática de Parkinson no puede contradecir la compra
+    // Veto Duro B: En Cripto con Oráculo Dual (Digital Europeo vs Barrera Americana), la probabilidad estocástica no puede contradecir la compra
     if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
       const mathSideProb = isYesSide ? cryptoQuant.mathYesProb : (1 - cryptoQuant.mathYesProb);
       pillars.catalystOrMath = mathSideProb >= (executableAsk + 0.03);
       if (mathSideProb < executableAsk) {
-        hardVetoes.push(`Modelo Parkinson contradice compra (MathProb=${(mathSideProb * 100).toFixed(1)}% < Ask=${(executableAsk * 100).toFixed(1)}%)`);
+        hardVetoes.push(`Oráculo Cripto (${cryptoQuant.modelType}) contradice compra (MathProb=${(mathSideProb * 100).toFixed(1)}% < Ask=${(executableAsk * 100).toFixed(1)}%)`);
       }
     }
 
-    // Veto Duro C: En Deportes/Esports exigir confluencia extrema (evitar apuestas 50/50 o en vivo sin ventaja institucional)
+    // Veto Duro C: En Deportes/Esports exigir confluencia extrema
     if (isSportsMatch) {
-      if (conf < 80 || lacksCatalyst || !hasFreshNews || selectedBook.obi < 0.20 || sideTapeImbalance < 0.15) {
+      if (conf < 80 || lacksCatalyst || !hasFreshNews || effectiveObi < 0.20 || sideTapeImbalance < 0.15) {
         hardVetoes.push(`Deportes bloqueado sin catalizador + flujo institucional unánime`);
       }
+    }
+
+    // Veto Duro D (NUEVO v2.5.0): Catalizador Ya Descontado / Chasing Veto (PAR >= 65% o salto >= +11¢ en 6h)
+    if (catalystAudit.isAlreadyPricedIn) {
+      hardVetoes.push(`VETO_D_CATALYST_ALREADY_PRICED_IN (PAR=${(catalystAudit.priceAbsorptionRatio * 100).toFixed(0)}%, Vel6h=+${(effectivePriceVelocity6h * 100).toFixed(1)}¢, NewsAge=${minNewsAgeHours.toFixed(1)}h)`);
+    }
+
+    // Veto Duro E (NUEVO v2.5.0): Latencia Deportiva In-Play (<= 3.5h para resolución)
+    if (isSportsMatch && hoursToResolution <= 3.5) {
+      hardVetoes.push(`VETO_E_SPORTS_LIVE_LATENCY_RISK (${hoursToResolution.toFixed(1)}h <= 3.5h)`);
     }
 
     const confluenceScore = Object.values(pillars).filter(Boolean).length;
@@ -2142,11 +2516,12 @@ Return JSON with this exact schema:
     result.fair_prob = Number(calibratedFairProb.toFixed(4));
     result.reachable_fair_prob_24h = Number(reachableFairProb24h.toFixed(4));
     result.kappa_24h = Number(kappa24h.toFixed(3));
+    result.price_absorption_ratio = catalystAudit.priceAbsorptionRatio;
     result.fair_value_yes = Number(fairYesProb.toFixed(4));
     result.executable_ask = Number(executableAsk.toFixed(4));
     result.executable_bid = Number(selectedBook.bestBid.toFixed(4));
     result.micro_price = Number(marketMicro.toFixed(4));
-    result.obi = Number((selectedBook.obi ?? 0).toFixed(3));
+    result.obi = Number(effectiveObi.toFixed(3));
     result.tape_imbalance = Number(sideTapeImbalance.toFixed(3));
     result.spread_pct = Number(selectedBook.spreadPct.toFixed(2));
     result.reward_to_risk = Number(rewardToRisk.toFixed(2));
