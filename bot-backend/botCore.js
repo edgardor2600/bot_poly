@@ -42,7 +42,7 @@ const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINE
 const AUTO_WITHDRAW_ENABLED = getBooleanEnv("AUTO_WITHDRAW_ENABLED", true);
 const WITHDRAWAL_TARGET_ADDRESS = getEnv("WITHDRAWAL_TARGET_ADDRESS", "");
 const WITHDRAWAL_OPERATING_CAPITAL_USDC = getNumberEnv("WITHDRAWAL_OPERATING_CAPITAL_USDC", BASE_CAPITAL);
-const WITHDRAWAL_MIN_EXCESS_USDC = getNumberEnv("WITHDRAWAL_MIN_EXCESS_USDC", 3);
+const WITHDRAWAL_MIN_EXCESS_USDC = getNumberEnv("WITHDRAWAL_MIN_EXCESS_USDC", 5);
 const WITHDRAWAL_EXCESS_PCT_RAW = getNumberEnv("WITHDRAWAL_EXCESS_PCT", 60);
 const WITHDRAWAL_COOLDOWN_HOURS = getNumberEnv("WITHDRAWAL_COOLDOWN_HOURS", 24);
 const WITHDRAWAL_MIN_POL_BALANCE = getNumberEnv("WITHDRAWAL_MIN_POL_BALANCE", 2);
@@ -2029,9 +2029,9 @@ export function computeDualCryptoOracleProb({
 export function detectHazardPolarity(questionText = "") {
   const q = String(questionText).toLowerCase();
   const isStatusQuoRetention =
-    /\b(remain|remains|remaining|stay|stays|staying|keep|keeps|retain|retains|survive|survives|maintain|maintains|still)\b/.test(q) ||
+    /\b(remain|remains|remaining|stay|stays|staying|keep|keeps|retain|retains|survive|survives|maintain|maintains|still|continue|continues|continuing|ongoing|extend|extends|extension|intact|unbroken)\b/.test(q) ||
     /\b(will not|won't|wont|not\s+(?:strike|invade|attack|resign|raise|cut|cross|fall|drop|announce|launch|fire|hit|reach|default|end|collapse)|no\s+(?:new|more|further)|fail to|without)\b/.test(q) ||
-    /\b(ceasefire|cease-fire|truce|peace|deal|agreement|ban|lockdown)\b[^?]*\b(hold|holds|last|lasts|survive|survives|remain|remains)\b/.test(q);
+    /\b(ceasefire|cease-fire|truce|peace|deal|agreement|treaty|ban|lockdown)\b[^?]*\b(hold|holds|last|lasts|survive|survives|remain|remains|continue|continues|continuing|ongoing|extend|extends|stand|stands)\b/.test(q);
   return isStatusQuoRetention ? -1 : 1;
 }
 
@@ -2283,7 +2283,7 @@ export function computeEmpiricalCalibrationFeedback(trades = [], side = null) {
   };
 }
 
-async function getCryptoSpotContext(question, daysLeft) {
+export async function getCryptoSpotContext(question, daysLeft) {
   const q = String(question || "");
   let assetKey = null;
   let assetName = null;
@@ -2298,14 +2298,21 @@ async function getCryptoSpotContext(question, daysLeft) {
 
   try {
     if (!cryptoTickerCache.data || (Date.now() - cryptoTickerCache.ts) > 60000) {
-      const res = await fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD,ETHUSD,SOLUSD,XRPUSD,DOGEUSD", {
-        method: "GET",
-        headers: { Accept: "application/json" },
-      });
-      if (res.ok) {
-        const json = await res.json();
-        if (json?.result) {
-          cryptoTickerCache = { ts: Date.now(), data: json.result };
+      try {
+        const res = await fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD,ETHUSD,SOLUSD,XRPUSD,DOGEUSD", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json?.result) {
+            cryptoTickerCache = { ts: Date.now(), data: json.result };
+          }
+        }
+      } catch (fetchErr) {
+        // Si el fetch falla pero la caché es menor a 5 min, tolerar; de lo contrario abortar
+        if (!cryptoTickerCache.data || (Date.now() - cryptoTickerCache.ts) > 300000) {
+          return null;
         }
       }
     }
@@ -2318,11 +2325,30 @@ async function getCryptoSpotContext(question, daysLeft) {
     const low24h = parseFloat(ticker?.l?.[1] || ticker?.l?.[0]);
     if (!Number.isFinite(spot) || spot <= 0) return null;
 
-    // Estimador de Volatilidad Diaria de Parkinson usando el rango High/Low de 24h
+    // Estimador de Volatilidad Diaria Amortiguada (v2.7.0):
+    // El estimador puro de Parkinson de 24h asume difusión browniana continua sin saltos. Durante caídas
+    // o mechas abruptas, el rango 24h infla la volatilidad hasta 2.7x (tratando un shock puntual como régimen persistente).
+    // Para calibrarlo cuantitativamente:
+    // 1) Asignamos volatilidad de régimen estacionario por activo (BTC ~2.2%, ETH ~2.8%, SOL ~3.8%, etc.).
+    // 2) Amortiguamos la volatilidad con mezcla 50/50 entre el Parkinson observado y el baseline estacionario.
+    // 3) Imponemos un techo superior realista (BTC max 4.0%, ETH max 5.0%, otros max 6.5%) para evitar
+    //    sobreestimar probabilidades de toque en horizontes de varios días.
+    const assetBaselineVol = {
+      BTC: 0.022,
+      ETH: 0.028,
+      SOL: 0.038,
+      XRP: 0.032,
+      DOGE: 0.042,
+    }[assetName] || 0.028;
+
     const rawParkinson = (Number.isFinite(high24h) && Number.isFinite(low24h) && high24h > low24h && low24h > 0)
       ? Math.log(high24h / low24h) / (2 * Math.sqrt(Math.LN2))
-      : 0.032;
-    const dailyVol = Math.max(0.018, Math.min(0.12, rawParkinson));
+      : assetBaselineVol;
+
+    const maxVolCap = assetName === "BTC" ? 0.040 : (assetName === "ETH" ? 0.050 : 0.065);
+    const minVolFloor = 0.015;
+    const blendedVol = (0.50 * rawParkinson) + (0.50 * assetBaselineVol);
+    const dailyVol = Math.max(minVolFloor, Math.min(maxVolCap, blendedVol));
 
     // Detectar precio objetivo ($78,000 o $85k) en la pregunta
     const priceMatch = q.match(/\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)\s*(k)?/i);
@@ -2408,7 +2434,7 @@ async function tryProviderCompletion(provider, baseBody) {
   const primaryModel = isCerebras
     ? getEnv("CEREBRAS_MODEL", CEREBRAS_MODEL)
     : getEnv("GROQ_MODEL", GROQ_MODEL);
-  const backupModel = isCerebras ? "qwen-3-32b" : "openai/gpt-oss-20b";
+  const backupModel = isCerebras ? "qwen-3.8-27b" : "openai/gpt-oss-20b";
 
   // Intento 1: Modelo primario (120B) con json_object y 2048 tokens
   const primaryPayload = { ...baseBody, model: primaryModel, max_tokens: 2048 };
@@ -2642,7 +2668,7 @@ function computeQuantPositionSize(maxAllowedAmount, analysis, sideBook) {
 }
 
 // ── IA PROFUNDA CUANTITATIVA (Groq + Google News RSS + Tavily + CLOB Flow + Crypto Spot Oracle + Bayesian Calibration) ──
-async function deepAnalyze(m, prelim) {
+export async function deepAnalyze(m, prelim) {
   const { yesP, noP, vol, vol24, liq, daysLeft, change1h, change24h, change7d, yesBook, noBook, tradeFlow, yesTradable, noTradable } = prelim;
   const marketId = m.id || m.conditionId;
   const SIX_HOURS = 6 * 60 * 60 * 1000;
@@ -2739,10 +2765,10 @@ async function deepAnalyze(m, prelim) {
   // Ocultamos el nivel de precio actual (Bid/Ask/MicroPrice) al LLM para evitar que sume +10% por inercia al precio actual.
   // Le entregamos únicamente la microestructura de presión (SpreadPct, WOBI, Profundidad y Flujo ETI).
   const yesBookStructureStr = yesBook?.isValid
-    ? `Spread=${yesBook.spreadPct.toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (yesBook.bidDepthUsd + yesBook.askDepthUsd)).toFixed(0)} WOBI=${yesBook.obi >= 0 ? "+" : ""}${yesBook.obi.toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
+    ? `Spread=${asNumber(yesBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (asNumber(yesBook.bidDepthUsd, 0) + asNumber(yesBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(yesBook.obi, 0) >= 0 ? "+" : ""}${asNumber(yesBook.obi, 0).toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
   const noBookStructureStr = noBook?.isValid
-    ? `Spread=${noBook.spreadPct.toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (noBook.bidDepthUsd + noBook.askDepthUsd)).toFixed(0)} WOBI=${noBook.obi >= 0 ? "+" : ""}${noBook.obi.toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
+    ? `Spread=${asNumber(noBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (asNumber(noBook.bidDepthUsd, 0) + asNumber(noBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(noBook.obi, 0) >= 0 ? "+" : ""}${asNumber(noBook.obi, 0).toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
   const tapeFlowStr = tradeFlow
@@ -2814,9 +2840,32 @@ Return JSON with this exact schema:
   const baseRateYes = normalizeProb(result.base_rate_prob) ?? estYesProb;
   const rawLikelihoodRatio = Math.max(0.25, Math.min(4.0, asNumber(result.evidence_likelihood_ratio, 1.0)));
 
-  // Si es un mercado cripto con Oráculo Dual (Digital Europeo vs Barrera Americana), anclar con la probabilidad estocástica exacta
+  // ── INTEGRACIÓN CALIBRADA DEL ORÁCULO CRIPTO DUAL (v2.7.0) ──
+  // El oráculo estocástico continuo (Brownian Motion / Black-Scholes) modela difusión ideal sin fricción.
+  // Para evitar que shocks transitorios de volatilidad inyecten "alpha sintético" o trampas de volatilidad:
+  // 1) Si el modelo cuantitativo demuestra que el lado que la IA desea comprar está sobrevaluado
+  //    (MathProb < Ask), el oráculo actúa como TECHO DEFENSIVO / VETO.
+  // 2) Si no hay noticias frescas y el oráculo diverge fuertemente del Ask (>12¢), se acota su contribución
+  //    para no crear un edge fantasma que el mercado ya descontó o rechaza por soporte/resistencia.
+  // 3) En lugar de sobreescribir el 55% de la decisión, aporta una ponderación moderada (20%) anclada.
   if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb) && Number.isFinite(estYesProb)) {
-    estYesProb = (0.45 * estYesProb) + (0.55 * cryptoQuant.mathYesProb);
+    const mathYes = cryptoQuant.mathYesProb;
+    const askYes = (yesTradable && yesBook?.isValid) ? yesBook.bestAsk : 0.50;
+    const askNo = (noTradable && noBook?.isValid) ? noBook.bestAsk : 0.50;
+
+    if (estYesProb > mathYes && mathYes < askYes) {
+      // Veto/techo defensivo: el modelo cuantitativo demuestra que YES está sobrevaluado
+      estYesProb = Math.min(estYesProb, mathYes);
+    } else if ((1 - estYesProb) > (1 - mathYes) && (1 - mathYes) < askNo) {
+      // Veto/techo defensivo: el modelo demuestra que NO está sobrevaluado
+      estYesProb = Math.max(estYesProb, mathYes);
+    } else {
+      // Contribución moderada (80% estimación calibrada / 20% oráculo continuo acotado a Ask + 10¢)
+      const boundedMathYes = !hasFreshNews
+        ? Math.min(mathYes, Math.max(1 - (askNo + 0.10), askYes + 0.10))
+        : mathYes;
+      estYesProb = (0.80 * estYesProb) + (0.20 * boundedMathYes);
+    }
   }
 
   // Como el LLM estimó a ciegas sin ver el Ask del CLOB, seleccionamos/validamos el lado donde estYesProb supera al Ask real
@@ -3056,12 +3105,27 @@ Return JSON with this exact schema:
       hardVetoes.push(`Flujo en contra (WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)})`);
     }
 
-    // Veto Duro B: En Cripto con Oráculo Dual (Digital Europeo vs Barrera Americana), la probabilidad estocástica no puede contradecir la compra
+    // Veto Duro B0 (v2.7.1): En contratos cripto con precio objetivo, si Kraken falla o está desconectado, pausar por seguridad
+    const isCryptoTargetMarket =
+      /\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge)\b/i.test(m.question || "") &&
+      /\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)\s*(k)?/i.test(m.question || "");
+
+    if (isCryptoTargetMarket && (!cryptoQuant || !Number.isFinite(cryptoQuant.spot) || !Number.isFinite(cryptoQuant.mathYesProb))) {
+      hardVetoes.push("Oráculo Cripto desconectado (sin datos spot o cálculo de barrera en Kraken): operativa pausada por seguridad");
+    }
+
+    // Veto Duro B (v2.7.0): En Cripto con Oráculo Dual (Digital Europeo vs Barrera Americana)
+    // 1. La probabilidad estocástica no puede contradecir la compra (MathProb < Ask).
+    // 2. Escudo Anti-Divergencia / "Demasiado bueno para ser verdad":
+    //    Si el modelo estocástico supera el Ask por >= 22¢ sin un catalizador fresco (<= 3h),
+    //    se trata de una trampa de volatilidad de difusión continua vs soporte/resistencia real en el libro de órdenes.
     if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
       const mathSideProb = isYesSide ? cryptoQuant.mathYesProb : (1 - cryptoQuant.mathYesProb);
       pillars.catalystOrMath = mathSideProb >= (executableAsk + 0.03);
       if (mathSideProb < executableAsk) {
         hardVetoes.push(`Oráculo Cripto (${cryptoQuant.modelType}) contradice compra (MathProb=${(mathSideProb * 100).toFixed(1)}% < Ask=${(executableAsk * 100).toFixed(1)}%)`);
+      } else if (!hasFreshNews && (mathSideProb - executableAsk) >= 0.22) {
+        hardVetoes.push(`VETO_B2_IMPLAUSIBLE_CRYPTO_DIVERGENCE (MathProb=${(mathSideProb * 100).toFixed(1)}% supera Ask=${(executableAsk * 100).toFixed(1)}% por +${((mathSideProb - executableAsk) * 100).toFixed(0)}¢ sin catalizador nuevo)`);
       }
     }
 
