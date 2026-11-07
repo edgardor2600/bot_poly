@@ -105,6 +105,8 @@ app.get('/api/status', async (req, res) => {
     walletActivity: botState.walletActivity.slice(0, 100),
     trades: botState.trades,
     signals: botState.signals,
+    strategyVersion: botState.strategyVersion,
+    decisionLog: (botState.decisionLog || []).slice(0, 100),
     newsCache: botState.newsCache || {},
     scanStatus: botState.scanStatus,
     quantMetrics: computeQuantMetrics(),

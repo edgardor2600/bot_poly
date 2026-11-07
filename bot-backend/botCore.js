@@ -1,8 +1,8 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { getBooleanEnv, getEnv, getNumberEnv, requireEnv } from './env.js';
-import { computeExecutableBookWalk, getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenExitQuote, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
-export { computeExecutableBookWalk };
+import { computeExecutableBookWalk, computePolymarketTakerFeeUsd, getConditionalTokenSnapshot, getLiveWalletSnapshot, getMarketTradeFlow, getOrderBookSnapshot, getTokenExitQuote, getTokenFeeRateBps, getTokenSellPrice, getTradingWalletAddress, isRealTradingEnabled, transferUsdc } from './polymarketClient.js';
+export { computeExecutableBookWalk, computePolymarketTakerFeeUsd };
 import { executeBuyOrder, executeSellOrder } from './tradeExecutor.js';
 import { REAL_TRADING_RULES, computeRealTradePlan, isSameAddress, sumOpenExposure } from './riskGuards.js';
 import { createRuntimeOwner, withRuntimeLock } from './runtimeLocks.js';
@@ -36,6 +36,8 @@ const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
 const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
 const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 70);
 const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 5.5);
+export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.0.0-crypto-oracle");
+export const ALLOWED_TRADING_CATEGORIES = ["CRYPTO"];
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
 
@@ -87,9 +89,11 @@ function getWithdrawalPolicySnapshot() {
 
 // â”€â”€ ESTADO DEL SISTEMA (En memoria del servidor) â”€â”€
 export const botState = {
+  strategyVersion: STRATEGY_VERSION,
   capital: BASE_CAPITAL,
   trades: [],
   signals: [],
+  decisionLog: [],
   allMarkets: [],
   marketSnapshots: {},
   newsCache: {},
@@ -433,10 +437,10 @@ function hydrateCapitalFromLocalState() {
 
 function calcStopLoss(entryPrice, entryBid = null) {
   const pctStop = entryPrice * (1 - botState.config.stopLoss / 100);
-  // Guarantee at least 2.5c below entryBid (or 3c below entryPrice) so normal 1c tick/spread noise never causes instant stop-outs
+  // Guarantee at least 3.5c below entryBid (or 4.0c below entryPrice) so normal 1c-2c CLOB spread bounce never triggers premature stop-outs
   const tickFloor = (Number.isFinite(entryBid) && entryBid > 0)
-    ? (entryBid - 0.025)
-    : (entryPrice - 0.03);
+    ? (entryBid - 0.035)
+    : (entryPrice - 0.040);
   const stop = Math.min(pctStop, tickFloor);
   return parseFloat(Math.max(0.02, stop).toFixed(4));
 }
@@ -687,14 +691,14 @@ export async function initializeStateFromDB() {
 
     await loadWithdrawalStateFromDB();
 
-    // Limpiar en segundo plano filas corruptas o SKIP con confianza 0 en ai_signals
-    const invalidSignalIds = signalsDb
-      .filter(s => (s.action !== "BUY_YES" && s.action !== "BUY_NO") || asNumber(s.confidence, 0) <= 0)
+    // Preservar señales SKIP en la base de datos para auditoría contra sesgo de selección (Fase 1)
+    const corruptSignalIds = signalsDb
+      .filter(s => !s.question || !s.action)
       .map(s => s.signal_id)
       .filter(Boolean);
 
-    if (invalidSignalIds.length > 0) {
-      supabase.from('ai_signals').delete().in('signal_id', invalidSignalIds).then(() => {}).catch(() => {});
+    if (corruptSignalIds.length > 0) {
+      supabase.from('ai_signals').delete().in('signal_id', corruptSignalIds).then(() => {}).catch(() => {});
     }
 
     // Indexar señales válidas para enriquecer trades y pestaña de Noticias
@@ -870,6 +874,12 @@ export async function initializeStateFromDB() {
         takeProfit: persistedTakeProfit > 0 ? persistedTakeProfit : calcTakeProfit(entryPrice),
         breakEvenArmed: Boolean(t.break_even_armed ?? integrityPatch.break_even_armed),
         maxHoldAt: t.max_hold_at || integrityPatch.max_hold_at || calcMaxHoldAt(tradeTs),
+        strategyVersion: t.strategy_version || "legacy-pre-v3",
+        mfePrice: asNumber(t.mfe_price, Math.max(entryPrice, persistedCurrentPrice)),
+        maePrice: asNumber(t.mae_price, Math.min(entryPrice, persistedCurrentPrice > 0 ? persistedCurrentPrice : entryPrice)),
+        feeRateBps: asNumber(t.fee_rate_bps, 0),
+        entryFeeUsd: asNumber(t.entry_fee_usd, 0),
+        exitFeeUsd: asNumber(t.exit_fee_usd, 0),
         frictionDeducted: true,
       };
 
@@ -1023,27 +1033,55 @@ function computeSignalScore(prelimScore = 0, conf = 0, edgePct = 0, confluenceSc
   return (llmScore >= 45 && llmScore <= 100) ? Math.round((llmScore * 0.45) + (calc * 0.55)) : calc;
 }
 
+export function isCryptoTargetPriceMarket(question = "") {
+  const q = String(question || "");
+  const hasSupportedSpotAsset = /\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge)\b/i.test(q);
+  const hasExplicitDollarTarget = /\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)\s*(k)?\b/i.test(q);
+  const isUpOrDownNoTarget = /\bup or down\b/i.test(q) && !hasExplicitDollarTarget;
+  return hasSupportedSpotAsset && hasExplicitDollarTarget && !isUpOrDownNoTarget;
+}
+
 function computeTradeEconomics(trade) {
   const shares       = Math.max(0, asNumber(trade.shares, 0));
   const entryPrice   = Math.max(0.001, asNumber(trade.entryPrice, 0.5));
   const cost         = Math.max(0, asNumber(trade.cost, shares * entryPrice));
   const currentPrice = Math.max(0.001, asNumber(trade.currentPrice ?? trade.closePrice ?? trade.entryPrice, entryPrice));
   const isClosed     = trade.status === "CLOSED";
+  const feeRateBps   = Math.max(0, asNumber(trade.feeRateBps, 0));
 
-  // 1. Entry Fee: 0.35% sobre el nocional + $0.004 gas Polygon
+  // 1. Entry Fee: usa la fórmula cuadrática oficial de Polymarket CLOB si feeRateBps > 0, con piso conservador de 0.35% + $0.004 gas
   const entryFeeUsd = asNumber(trade.entryFeeUsd, 0) > 0
     ? asNumber(trade.entryFeeUsd, 0)
-    : Number(((cost * 0.0035) + 0.004).toFixed(4));
+    : computePolymarketTakerFeeUsd({
+        shares: shares > 0 ? shares : (cost / entryPrice),
+        price: entryPrice,
+        feeRateBps,
+        minSimRate: 0.0035,
+        gasUsd: 0.004,
+      });
 
-  // 2. Exit Fee: distingue claramente entre STOP_LOSS (0.50%) y salidas controladas (BREAK_EVEN, TRAILING_STOP, TAKE_PROFIT: 0.35%)
+  // 2. Exit Fee: distingue entre STOP_LOSS (0.50% piso) y salidas controladas (0.35% piso) + fórmula cuadrática CLOB
   const exitPx          = isClosed ? asNumber(trade.closePrice ?? trade.currentPrice, currentPrice) : currentPrice;
-  const exitNotional    = shares * exitPx;
   const isEmergencyStop = trade.closeReason === "STOP_LOSS";
   const exitFeeRate     = isEmergencyStop ? 0.0050 : 0.0035;
 
   const exitFeeUsd = isClosed
-    ? (asNumber(trade.exitFeeUsd, 0) > 0 ? asNumber(trade.exitFeeUsd, 0) : Number(((exitNotional * exitFeeRate) + 0.004).toFixed(4)))
-    : Number(((exitNotional * 0.0035) + 0.004).toFixed(4));
+    ? (asNumber(trade.exitFeeUsd, 0) > 0
+        ? asNumber(trade.exitFeeUsd, 0)
+        : computePolymarketTakerFeeUsd({
+            shares,
+            price: exitPx,
+            feeRateBps,
+            minSimRate: exitFeeRate,
+            gasUsd: 0.004,
+          }))
+    : computePolymarketTakerFeeUsd({
+        shares,
+        price: exitPx,
+        feeRateBps,
+        minSimRate: 0.0035,
+        gasUsd: 0.004,
+      });
 
   const totalFrictionUsd = Number((entryFeeUsd + (isClosed ? exitFeeUsd : 0)).toFixed(3));
 
@@ -1075,6 +1113,46 @@ export function addLog(msg, type = "INFO") {
   console.log(`[${type}] ${msg}`);
 }
 
+async function insertDecisionLogSafe(m, pre, analysis) {
+  const yesBook = pre?.yesBook || pre?.clob?.yes || null;
+  const noBook  = pre?.noBook || pre?.clob?.no || null;
+  const entry = {
+    decision_id: `DEC-${uid().toUpperCase()}`,
+    market_id: String(m?.id || m?.conditionId || ""),
+    condition_id: String(m?.conditionId || m?.condition_id || m?.id || ""),
+    question: m?.question || "",
+    category: m?._cat || detectCategory(m?.question || ""),
+    strategy_version: STRATEGY_VERSION,
+    action: analysis?.action || "SKIP",
+    considered_side: analysis?.considered_side || null,
+    skip_reason: analysis?.skip_reason || null,
+    yes_bid: yesBook?.bestBid ?? null,
+    yes_ask: yesBook?.bestAsk ?? pre?.yesP ?? null,
+    no_bid: noBook?.bestBid ?? null,
+    no_ask: noBook?.bestAsk ?? pre?.noP ?? null,
+    spread_pct: analysis?.spread_pct ?? yesBook?.spreadPct ?? noBook?.spreadPct ?? null,
+    w_obi: analysis?.obi ?? yesBook?.wObi ?? null,
+    eti_imbalance: analysis?.tape_imbalance ?? pre?.tradeFlow?.tapeImbalance ?? null,
+    spot_price: analysis?.spot_price ?? null,
+    target_price: analysis?.target_price ?? null,
+    math_yes_prob: analysis?.math_yes_prob ?? null,
+    fair_prob: analysis?.fair_prob ?? null,
+    net_edge_pct: analysis?.edge_pct ?? 0,
+    fee_rate_bps: analysis?.fee_rate_bps ?? yesBook?.feeRateBps ?? noBook?.feeRateBps ?? 0,
+    confidence: analysis?.confidence ?? 0,
+    evaluated_at: new Date().toISOString(),
+  };
+
+  botState.decisionLog.unshift(entry);
+  if (botState.decisionLog.length > 500) botState.decisionLog.length = 500;
+
+  try {
+    await supabase.from('decision_log').insert(entry);
+  } catch {
+    // Non-blocking if decision_log migration has not been applied yet
+  }
+}
+
 async function insertAiSignalSafe(sig, m, pre, analysis) {
   try {
     const payload = {
@@ -1091,7 +1169,8 @@ async function insertAiSignalSafe(sig, m, pre, analysis) {
       yes_price: pre.yesP,
       no_price: pre.noP,
       news_found: analysis.news_found,
-      reasoning: analysis.reasoning,
+      reasoning: `[${STRATEGY_VERSION}] ${analysis.reasoning || ""}`.trim(),
+      strategy_version: STRATEGY_VERSION,
       detected_at: sig.detectedAt,
     };
 
@@ -1138,6 +1217,11 @@ async function insertTradeSafe(t, signalId) {
       take_profit: t.takeProfit ?? null,
       break_even_armed: Boolean(t.breakEvenArmed),
       max_hold_at: t.maxHoldAt || null,
+      strategy_version: t.strategyVersion || STRATEGY_VERSION,
+      mfe_price: t.mfePrice ?? t.currentPrice ?? t.entryPrice,
+      mae_price: t.maePrice ?? t.currentPrice ?? t.entryPrice,
+      entry_fee_usd: t.entryFeeUsd ?? null,
+      fee_rate_bps: t.feeRateBps ?? 0,
       buy_order_id: t.buyOrderId || null,
       buy_order_status: t.buyOrderStatus || null,
       buy_tx_hashes: t.buyTxHashes || null,
@@ -1146,6 +1230,32 @@ async function insertTradeSafe(t, signalId) {
 
     const { error } = await supabase.from('user_trades').insert(payload);
     if (!error) return;
+
+    const fallbackWithSlTp = {
+      trade_id: t.id,
+      signal_id: signalId,
+      market_id: t.marketId,
+      condition_id: t.conditionId || t.marketId,
+      token_id: t.tokenId || null,
+      question: t.question,
+      side: t.side,
+      entry_price: t.entryPrice,
+      current_price: t.currentPrice,
+      shares: t.shares,
+      cost: t.cost,
+      status: t.status,
+      execution_mode: t.executionMode || "SIMULATED",
+      stop_loss: t.stopLoss ?? null,
+      take_profit: t.takeProfit ?? null,
+      break_even_armed: Boolean(t.breakEvenArmed),
+      max_hold_at: t.maxHoldAt || null,
+      buy_order_id: t.buyOrderId || null,
+      buy_order_status: t.buyOrderStatus || null,
+      buy_tx_hashes: t.buyTxHashes || null,
+      executed_at: t.ts,
+    };
+    const { error: err2 } = await supabase.from('user_trades').insert(fallbackWithSlTp);
+    if (!err2) return;
 
     const fallback = {
       trade_id: t.id,
@@ -1364,7 +1474,15 @@ async function fetchAllMarkets(onProgress) {
 }
 
 // ── SCORING PRELIMINAR CUANTITATIVO ──
-function preliminaryScore(m, prevSnapshot) {
+export function preliminaryScore(m, prevSnapshot) {
+  // 0. ESTRATEGIA v3.0.0-crypto-oracle (Fase 0 y Fase 3A):
+  // Bloquear categorías sin ventaja cuantitativa (POLITICS, SPORTS, ENTERTAINMENT, OTHER, etc.)
+  // y restringir únicamente a mercados CRYPTO con precio objetivo explícito ($ target) verificable en oráculo Spot Kraken.
+  const cat = m._cat || detectCategory(m.question || "");
+  if (!ALLOWED_TRADING_CATEGORIES.includes(cat) || !isCryptoTargetPriceMarket(m.question || "")) {
+    return { score: 0, signals: [], skip: true, skipReason: "NON_CRYPTO_TARGET_MARKET" };
+  }
+
   // 1. Validar que el mercado tenga Order Book activo en CLOB
   if (m.enableOrderBook === false || m.acceptingOrders === false) {
     return { score: 0, signals: [], skip: true };
@@ -1400,17 +1518,18 @@ function preliminaryScore(m, prevSnapshot) {
   if (liq < botState.config.minLiq) return { score: 0, signals: [], skip: true };
   if (vol24 < 500) return { score: 0, signals: [], skip: true }; // Evitar mercados muertos sin flujo diario
 
-  // 4. Filtro estricto de horizonte temporal (Catalizador cercano <= 30 días)
+  // 4. Filtro estricto de horizonte temporal Fase 3A (entre 12 horas y 7.5 días):
+  // Evita mercados de 5m/15m (con fee dinámico alto y latencia de oráculo) y mercados >7.5d que inmovilizan capital.
   let daysLeft = null;
   if (m.endDateIso || m.endDate) {
     const closes = new Date(m.endDateIso || m.endDate);
     daysLeft = (closes - Date.now()) / 86400000;
-    if (!Number.isFinite(daysLeft) || daysLeft <= 0.08) {
-      // Menos de ~2 horas o ya expirado: alto riesgo de latencia de oráculo
+    if (!Number.isFinite(daysLeft) || daysLeft < 0.50) {
+      // Menos de 12 horas o ya expirado: evitar mercados intradía cortos con Taker fee cuadrático alto y latencia
       return { score: 0, signals: [], skip: true };
     }
-    if (daysLeft > MAX_MARKET_DAYS) {
-      // Bloquear mercados a meses/años vista (ej. Senado Nov 2026) que atrapan capital y mueren por MAX_HOLD
+    if (daysLeft > Math.min(7.5, MAX_MARKET_DAYS)) {
+      // Bloquear mercados a >7.5 días (universo Fase 3A: 1 a 7 días)
       return { score: 0, signals: [], skip: true };
     }
 
@@ -1492,15 +1611,15 @@ function preliminaryScore(m, prevSnapshot) {
 
 function isSideMicrostructureTradable(book) {
   if (!book || !book.isValid) return false;
-  // Banda Operativa Taker estricta [0.20, 0.82]: evita longshots devorados por spread (<20c) y asimetría negativa (>82c)
-  if (book.bestAsk < 0.20 || book.bestAsk > 0.82) return false;
-  if (book.spreadPct > MAX_SPREAD_PCT || book.spreadAbs > MAX_SPREAD_CENTS) return false;
+  // Universo Fase 3A: Banda Operativa estricta [0.20, 0.80] y Spread máximo de 2.0¢ (0.02)
+  if (book.bestAsk < 0.20 || book.bestAsk > 0.80) return false;
+  if (book.spreadPct > MAX_SPREAD_PCT || book.spreadAbs > Math.min(0.02, MAX_SPREAD_CENTS)) return false;
   if (book.askDepthUsd < MIN_BOOK_DEPTH_USD || book.bidDepthUsd < MIN_BOOK_DEPTH_USD) return false;
   // Evitar comprar contra un muro institucional de venta (Order Book Imbalance < -0.65)
   if (Number.isFinite(book.obi) && book.obi < -0.65) return false;
-  // Veto H (Pre-Groq Book-Walk): verificar que el primer +1.0¢ del libro tenga liquidez real >= 1.35x del trade objetivo
+  // Veto H (Book-Walk): verificar que el primer +1.0¢ del libro tenga liquidez real >= 1.35x del trade objetivo
   if (Array.isArray(book.asks) && book.asks.length > 0) {
-    const refTradeUsdc = Math.max(1.50, (asNumber(botState.config?.minTradeUsdc, 1.50) + asNumber(botState.config?.maxTradeUsdc, 2.50)) / 2);
+    const refTradeUsdc = Math.max(1.00, (asNumber(botState.config?.minTradeUsdc, 1.00) + asNumber(botState.config?.maxTradeUsdc, 1.00)) / 2);
     const walk = computeExecutableBookWalk({
       bids: book.bids || [],
       asks: book.asks,
@@ -2283,16 +2402,63 @@ export function computeEmpiricalCalibrationFeedback(trades = [], side = null) {
   };
 }
 
+const krakenHourlyVolCache = new Map();
+const KRAKEN_OHLC_TTL_MS = 15 * 60 * 1000;
+
+async function fetchKrakenHourlyRealizedVol(ohlcPair) {
+  if (!ohlcPair) return null;
+  const now = Date.now();
+  const cached = krakenHourlyVolCache.get(ohlcPair);
+  if (cached && (now - cached.ts) < KRAKEN_OHLC_TTL_MS) {
+    return cached.dailyRealizedVol;
+  }
+
+  try {
+    const res = await fetch(`https://api.kraken.com/0/public/OHLC?pair=${encodeURIComponent(ohlcPair)}&interval=60`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return cached ? cached.dailyRealizedVol : null;
+    const json = await res.json();
+    const resultObj = json?.result || {};
+    const candleKey = Object.keys(resultObj).find(k => k !== "last" && Array.isArray(resultObj[k]));
+    const candles = candleKey ? resultObj[candleKey] : [];
+    // Tomar las últimas 48 velas de 1 hora (2 días de muestra horaria realizada)
+    const recent = candles.slice(-49);
+    if (recent.length < 12) return cached ? cached.dailyRealizedVol : null;
+
+    const logReturns = [];
+    for (let i = 1; i < recent.length; i++) {
+      const prevClose = parseFloat(recent[i - 1]?.[4]);
+      const currClose = parseFloat(recent[i]?.[4]);
+      if (Number.isFinite(prevClose) && Number.isFinite(currClose) && prevClose > 0 && currClose > 0) {
+        logReturns.push(Math.log(currClose / prevClose));
+      }
+    }
+    if (logReturns.length < 10) return cached ? cached.dailyRealizedVol : null;
+
+    const mean = logReturns.reduce((s, x) => s + x, 0) / logReturns.length;
+    const variance = logReturns.reduce((s, x) => s + ((x - mean) ** 2), 0) / (logReturns.length - 1);
+    const hourlySigma = Math.sqrt(Math.max(0, variance));
+    const dailyRealizedVol = hourlySigma * Math.sqrt(24);
+    krakenHourlyVolCache.set(ohlcPair, { ts: now, dailyRealizedVol });
+    return dailyRealizedVol;
+  } catch {
+    return cached ? cached.dailyRealizedVol : null;
+  }
+}
+
 export async function getCryptoSpotContext(question, daysLeft) {
   const q = String(question || "");
   let assetKey = null;
+  let ohlcPair = null;
   let assetName = null;
 
-  if (/\b(bitcoin|btc)\b/i.test(q)) { assetKey = "XXBTZUSD"; assetName = "BTC"; }
-  else if (/\b(ethereum|eth)\b/i.test(q)) { assetKey = "XETHZUSD"; assetName = "ETH"; }
-  else if (/\b(solana|sol)\b/i.test(q)) { assetKey = "SOLUSD"; assetName = "SOL"; }
-  else if (/\b(xrp|ripple)\b/i.test(q)) { assetKey = "XXRPZUSD"; assetName = "XRP"; }
-  else if (/\b(dogecoin|doge)\b/i.test(q)) { assetKey = "XDGUSD"; assetName = "DOGE"; }
+  if (/\b(bitcoin|btc)\b/i.test(q)) { assetKey = "XXBTZUSD"; ohlcPair = "XBTUSD"; assetName = "BTC"; }
+  else if (/\b(ethereum|eth)\b/i.test(q)) { assetKey = "XETHZUSD"; ohlcPair = "ETHUSD"; assetName = "ETH"; }
+  else if (/\b(solana|sol)\b/i.test(q)) { assetKey = "SOLUSD"; ohlcPair = "SOLUSD"; assetName = "SOL"; }
+  else if (/\b(xrp|ripple)\b/i.test(q)) { assetKey = "XXRPZUSD"; ohlcPair = "XRPUSD"; assetName = "XRP"; }
+  else if (/\b(dogecoin|doge)\b/i.test(q)) { assetKey = "XDGUSD"; ohlcPair = "DOGEUSD"; assetName = "DOGE"; }
 
   if (!assetKey) return null;
 
@@ -2347,7 +2513,10 @@ export async function getCryptoSpotContext(question, daysLeft) {
 
     const maxVolCap = assetName === "BTC" ? 0.040 : (assetName === "ETH" ? 0.050 : 0.065);
     const minVolFloor = 0.015;
-    const blendedVol = (0.50 * rawParkinson) + (0.50 * assetBaselineVol);
+    const realized1hDailyVol = await fetchKrakenHourlyRealizedVol(ohlcPair);
+    const blendedVol = Number.isFinite(realized1hDailyVol) && realized1hDailyVol > 0
+      ? (0.50 * realized1hDailyVol) + (0.30 * rawParkinson) + (0.20 * assetBaselineVol)
+      : (0.50 * rawParkinson) + (0.50 * assetBaselineVol);
     const dailyVol = Math.max(minVolFloor, Math.min(maxVolCap, blendedVol));
 
     // Detectar precio objetivo ($78,000 o $85k) en la pregunta
@@ -2630,11 +2799,11 @@ async function fetchGoogleNewsRss(question) {
 }
 
 function computeQuantPositionSize(maxAllowedAmount, analysis, sideBook) {
-  // Ticket mínimo eficiente ($1.50 USDC) para diluir los $0.008 de gas fijo + truncamiento ERC-1155
-  const minUsdc = Math.max(1.25, asNumber(botState.config.minTradeUsdc, 1.50));
+  // Fase 3A: Tamaño fijo de $1.00 USDC en paper (respeta estrictamente MIN_TRADE_USDC / MAX_TRADE_USDC de .env)
+  const minUsdc = Math.max(0.50, asNumber(botState.config.minTradeUsdc, 1.00));
   const maxUsdc = Math.max(
     minUsdc,
-    Math.min(asNumber(maxAllowedAmount, minUsdc), asNumber(botState.config.maxTradeUsdc, 2.50))
+    Math.min(asNumber(maxAllowedAmount, minUsdc), asNumber(botState.config.maxTradeUsdc, 1.00))
   );
   if (maxUsdc <= minUsdc) return roundMoney(maxUsdc);
 
@@ -2727,9 +2896,15 @@ export async function deepAnalyze(m, prelim) {
         if (tRes.ok) {
           const tData = await tRes.json();
           if (tData.results && tData.results.length > 0) {
-            hasFreshNews = true;
-            if (bestAge > 4.0) bestAge = 3.5;
             for (const r of tData.results) {
+              if (r.published_date) {
+                const pubMs = new Date(r.published_date).getTime();
+                if (Number.isFinite(pubMs) && pubMs > 0) {
+                  const ageH = Math.max(0.1, (Date.now() - pubMs) / 3600000);
+                  if (ageH < bestAge) bestAge = ageH;
+                  if (ageH <= 12) hasFreshNews = true;
+                }
+              }
               combinedLines.push(`[WEB ${r.url}] ${(r.content || '').replace(/\s+/g, ' ').slice(0, 240)}`);
             }
             topSource = tData.results[0].url || topSource;
@@ -2761,14 +2936,14 @@ export async function deepAnalyze(m, prelim) {
   const fmtDelta = (v) => `${v >= 0 ? "+" : ""}${(asNumber(v, 0) * 100).toFixed(1)}%`;
   const priceActionStr = `1h=${fmtDelta(change1h)} | 24h=${fmtDelta(change24h)} | 7d=${fmtDelta(change7d)}`;
 
-  // PROTOCOLO ANTI-ANCLAJE DE TETLOCK:
-  // Ocultamos el nivel de precio actual (Bid/Ask/MicroPrice) al LLM para evitar que sume +10% por inercia al precio actual.
-  // Le entregamos únicamente la microestructura de presión (SpreadPct, WOBI, Profundidad y Flujo ETI).
+  // ARQUITECTURA v3.0.0-crypto-oracle (Fase 2 y Fase 3A):
+  // Entregamos al LLM los precios reales ejecutables del CLOB (Bid/Ask) junto con el Oráculo Cuantitativo Cripto en vivo.
+  // Se elimina el modo ciego y la inversión automática de lado (que causaba comprar NO cuando las noticias y LR favorecían YES).
   const yesBookStructureStr = yesBook?.isValid
-    ? `Spread=${asNumber(yesBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (asNumber(yesBook.bidDepthUsd, 0) + asNumber(yesBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(yesBook.obi, 0) >= 0 ? "+" : ""}${asNumber(yesBook.obi, 0).toFixed(2)} Tradable=${yesTradable ? "YES" : "NO"}`
+    ? `BestBid=${(asNumber(yesBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(yesBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(yesBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (asNumber(yesBook.bidDepthUsd, 0) + asNumber(yesBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(yesBook.obi, 0) >= 0 ? "+" : ""}${asNumber(yesBook.obi, 0).toFixed(2)} FeeBps=${asNumber(yesBook.feeRateBps, 0)} Tradable=${yesTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
   const noBookStructureStr = noBook?.isValid
-    ? `Spread=${asNumber(noBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (asNumber(noBook.bidDepthUsd, 0) + asNumber(noBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(noBook.obi, 0) >= 0 ? "+" : ""}${asNumber(noBook.obi, 0).toFixed(2)} Tradable=${noTradable ? "YES" : "NO"}`
+    ? `BestBid=${(asNumber(noBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(noBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(noBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (asNumber(noBook.bidDepthUsd, 0) + asNumber(noBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(noBook.obi, 0) >= 0 ? "+" : ""}${asNumber(noBook.obi, 0).toFixed(2)} FeeBps=${asNumber(noBook.feeRateBps, 0)} Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
   const tapeFlowStr = tradeFlow
@@ -2782,16 +2957,16 @@ export async function deepAnalyze(m, prelim) {
     messages: [
       {
         role: "system",
-        content: `You are a senior quantitative superforecaster (Tetlock protocol) managing real capital on Polymarket CLOB.
-You are intentionally BLIND to the current market price so you cannot anchor to it.
-Your job is to estimate from first principles:
-1. base_rate_prob (0.01 to 0.99): The historical outside-view base rate probability of YES ignoring today's news.
-2. evidence_likelihood_ratio (0.50 to 2.00): The diagnostic strength of RECENT_NEWS & orderflow (1.00 = no fresh catalyst or noise; >1.00 = confirms YES; <1.00 = contradicts YES / confirms NO).
-3. estimated_yes_prob (0.01 to 0.99): Your final fundamental probability of the YES outcome.
+        content: `You are a quantitative risk & catalyst auditor for a Crypto-Oracle trading desk on Polymarket CLOB (${STRATEGY_VERSION}).
+Your job is to validate whether a genuine statistical mispricing exists between the LIVE_CRYPTO_ORACLE barrier probability and the executable CLOB BestAsk price:
+1. base_rate_prob (0.01 to 0.99): The quantitative barrier probability of YES from LIVE_CRYPTO_ORACLE (or outside-view base rate if unavailable).
+2. evidence_likelihood_ratio (0.50 to 2.00): The diagnostic direction of RECENT_NEWS & CLOB orderflow (1.00 = neutral/no fresh catalyst; >1.00 = favors YES; <1.00 = favors NO).
+3. estimated_yes_prob (0.01 to 0.99): Your final calibrated probability of the YES outcome.
 CRITICAL RULES:
 1. Never recommend a side marked Tradable=NO.
-2. Check PRICE_MOMENTUM (1h/24h/7d) vs news age: if a market already moved >15% in 24h because of news older than 2 hours, that catalyst is ALREADY PRICED IN — return action="SKIP".
-3. SPORTS & ESPORTS WARNING: Any final score in RECENT_NEWS is from a PAST game earlier in the season — NEVER treat a past game score as the result of the upcoming match. If there is no fresh injury/lineup catalyst ("no recent catalyst"), return action="SKIP".
+2. DIRECTIONAL CONSISTENCY: Never recommend BUY_NO if evidence_likelihood_ratio > 1.00 or if estimated_yes_prob > YES BestAsk. Never recommend BUY_YES if evidence_likelihood_ratio < 1.00 or if estimated_yes_prob < YES BestAsk.
+3. ORACLE DISCIPLINE: Only recommend BUY_YES if LIVE_CRYPTO_ORACLE Math_YES_Prob exceeds YES BestAsk by at least +4c, or BUY_NO if (1 - Math_YES_Prob) exceeds NO BestAsk by at least +4c. Otherwise return action="SKIP".
+4. If a market already moved >15% in 24h on old news (>2h ago) or has no quantitative edge after spread/fees, return action="SKIP".
 Return ONLY raw valid JSON.`
       },
       {
@@ -2809,7 +2984,7 @@ RECENT_NEWS ${usedCache ? "(cached)" : "(live RSS + Web)"}:
 ${newsContext.slice(0, 1200)}
 
 Return JSON with this exact schema:
-{"action":"BUY_YES"|"BUY_NO"|"SKIP","base_rate_prob":0.01-0.99,"evidence_likelihood_ratio":0.50-2.00,"estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing base rate, news age, and orderflow","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
+{"action":"BUY_YES"|"BUY_NO"|"SKIP","base_rate_prob":0.01-0.99,"evidence_likelihood_ratio":0.50-2.00,"estimated_yes_prob":0.01-0.99,"confidence":0-100,"edge_pct":number,"signal_types":["NEWS"|"MOMENTUM"|"MISPRICING"|"ORDERFLOW"],"news_found":"short summary of key catalyst","news_source":"url or none","reasoning":"concise quantitative rationale citing oracle math prob vs CLOB ask and orderflow","risk":"LOW"|"MEDIUM"|"HIGH","score":0-100}`
       }
     ],
     temperature: 0.1,
@@ -2824,65 +2999,56 @@ Return JSON with this exact schema:
   if (!jsonMatch) throw new Error("No JSON in response");
   const result = JSON.parse(jsonMatch[0]);
 
-  // Capturar la intención cruda del LLM y el lado bajo consideración
+  // Capturar la intención cruda del LLM como auditor/veto (Fase 2.2: el LLM solo puede vetar, NUNCA proponer un trade sin el Oráculo)
   const rawLlmAction = String(result.action || "SKIP").toUpperCase();
   result.raw_action = rawLlmAction;
-  let consideredSide = rawLlmAction === "BUY_YES" ? "YES" : (rawLlmAction === "BUY_NO" ? "NO" : null);
 
-  // ── VERIFICACIÓN MATEMÁTICA DURA Y CALIBRACIÓN BAYESIANA POST-IA (v2.5.1) ──
+  // ── SEÑAL GENERADA 100% POR EL ORÁCULO CUANTITATIVO CRIPTO (Fase 2.2 y Fase 3A) ──
   const normalizeProb = (v) => {
     const n = parseFloat(v);
     if (!Number.isFinite(n)) return null;
     return n > 1 && n <= 100 ? n / 100 : n;
   };
 
-  let estYesProb = normalizeProb(result.estimated_yes_prob);
-  const baseRateYes = normalizeProb(result.base_rate_prob) ?? estYesProb;
+  const llmEstYesProb = normalizeProb(result.estimated_yes_prob);
   const rawLikelihoodRatio = Math.max(0.25, Math.min(4.0, asNumber(result.evidence_likelihood_ratio, 1.0)));
 
-  // ── INTEGRACIÓN CALIBRADA DEL ORÁCULO CRIPTO DUAL (v2.7.0) ──
-  // El oráculo estocástico continuo (Brownian Motion / Black-Scholes) modela difusión ideal sin fricción.
-  // Para evitar que shocks transitorios de volatilidad inyecten "alpha sintético" o trampas de volatilidad:
-  // 1) Si el modelo cuantitativo demuestra que el lado que la IA desea comprar está sobrevaluado
-  //    (MathProb < Ask), el oráculo actúa como TECHO DEFENSIVO / VETO.
-  // 2) Si no hay noticias frescas y el oráculo diverge fuertemente del Ask (>12¢), se acota su contribución
-  //    para no crear un edge fantasma que el mercado ya descontó o rechaza por soporte/resistencia.
-  // 3) En lugar de sobreescribir el 55% de la decisión, aporta una ponderación moderada (20%) anclada.
-  if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb) && Number.isFinite(estYesProb)) {
+  let oracleAction = "SKIP";
+  let consideredSide = null;
+  let estYesProb = (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) ? cryptoQuant.mathYesProb : null;
+  const baseRateYes = estYesProb ?? normalizeProb(result.base_rate_prob) ?? llmEstYesProb;
+
+  if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
     const mathYes = cryptoQuant.mathYesProb;
-    const askYes = (yesTradable && yesBook?.isValid) ? yesBook.bestAsk : 0.50;
-    const askNo = (noTradable && noBook?.isValid) ? noBook.bestAsk : 0.50;
+    const yesOracleEdge = (yesTradable && yesBook?.isValid) ? (mathYes - yesBook.bestAsk) : -1;
+    const noOracleEdge  = (noTradable && noBook?.isValid) ? ((1 - mathYes) - noBook.bestAsk) : -1;
 
-    if (estYesProb > mathYes && mathYes < askYes) {
-      // Veto/techo defensivo: el modelo cuantitativo demuestra que YES está sobrevaluado
-      estYesProb = Math.min(estYesProb, mathYes);
-    } else if ((1 - estYesProb) > (1 - mathYes) && (1 - mathYes) < askNo) {
-      // Veto/techo defensivo: el modelo demuestra que NO está sobrevaluado
-      estYesProb = Math.max(estYesProb, mathYes);
+    if (yesOracleEdge >= 0.04 && yesOracleEdge >= noOracleEdge) {
+      oracleAction = "BUY_YES";
+      consideredSide = "YES";
+    } else if (noOracleEdge >= 0.04 && noOracleEdge > yesOracleEdge) {
+      oracleAction = "BUY_NO";
+      consideredSide = "NO";
     } else {
-      // Contribución moderada (80% estimación calibrada / 20% oráculo continuo acotado a Ask + 10¢)
-      const boundedMathYes = !hasFreshNews
-        ? Math.min(mathYes, Math.max(1 - (askNo + 0.10), askYes + 0.10))
-        : mathYes;
-      estYesProb = (0.80 * estYesProb) + (0.20 * boundedMathYes);
+      consideredSide = mathYes >= 0.5 ? "YES" : "NO";
     }
   }
 
-  // Como el LLM estimó a ciegas sin ver el Ask del CLOB, seleccionamos/validamos el lado donde estYesProb supera al Ask real
-  if (Number.isFinite(estYesProb) && result.action !== "SKIP") {
-    const yesEdgeBlind = (yesTradable && yesBook?.isValid) ? (estYesProb - yesBook.bestAsk) : -1;
-    const noEdgeBlind  = (noTradable && noBook?.isValid) ? ((1 - estYesProb) - noBook.bestAsk) : -1;
-    if (result.action === "BUY_YES" && yesEdgeBlind <= 0.01 && noEdgeBlind >= 0.05) {
-      result.action = "BUY_NO";
-    } else if (result.action === "BUY_NO" && noEdgeBlind <= 0.01 && yesEdgeBlind >= 0.05) {
-      result.action = "BUY_YES";
-    }
-  }
-
-  if (result.action === "BUY_YES") consideredSide = "YES";
-  else if (result.action === "BUY_NO") consideredSide = "NO";
-  else if (!consideredSide && Number.isFinite(estYesProb)) {
-    consideredSide = estYesProb >= 0.5 ? "YES" : "NO";
+  // El LLM actúa únicamente como VETO (no puede crear compras donde oracleAction === "SKIP" ni invertir el lado del oráculo)
+  let llmVetoReason = null;
+  if (oracleAction === "SKIP") {
+    result.action = "SKIP";
+    result.skip_reason = "Oráculo Cripto sin ventaja bruta mínima (>= 4.0¢ sobre BestAsk)";
+  } else if (rawLlmAction === "SKIP") {
+    result.action = "SKIP";
+    llmVetoReason = "VETO_LLM_AUDITOR_SKIP";
+    result.skip_reason = `VETO_LLM_AUDITOR_SKIP (${result.reasoning ? result.reasoning.slice(0, 90) : "Catalizador/regla adversa"})`;
+  } else if (rawLlmAction !== oracleAction) {
+    result.action = "SKIP";
+    llmVetoReason = `VETO_LLM_CONTRADICTS_ORACLE (Oráculo=${oracleAction} vs IA=${rawLlmAction})`;
+    result.skip_reason = llmVetoReason;
+  } else {
+    result.action = oracleAction;
   }
   result.considered_side = consideredSide;
 
@@ -2898,7 +3064,7 @@ Return JSON with this exact schema:
       result.reasoning = `${result.skip_reason}. ${result.reasoning || ""}`;
     } else {
       selectedBook = yesBook;
-      rawSideProb = Number.isFinite(estYesProb) ? estYesProb : (yesBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+      rawSideProb = estYesProb;
     }
   } else if (result.action === "BUY_NO") {
     isYesSide = false;
@@ -2908,16 +3074,16 @@ Return JSON with this exact schema:
       result.reasoning = `${result.skip_reason}. ${result.reasoning || ""}`;
     } else {
       selectedBook = noBook;
-      rawSideProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : (noBook.bestAsk + (parseFloat(result.edge_pct || 0) / 100));
+      rawSideProb = Number.isFinite(estYesProb) ? (1 - estYesProb) : null;
     }
   }
 
-  if (selectedBook && (result.action === "BUY_YES" || result.action === "BUY_NO")) {
+  if (selectedBook && Number.isFinite(rawSideProb) && (result.action === "BUY_YES" || result.action === "BUY_NO")) {
     rawSideProb = Math.max(0.01, Math.min(0.99, rawSideProb));
     const executableAsk = selectedBook.bestAsk;
     const selectedSide  = isYesSide ? "YES" : "NO";
 
-    // 1. Microestructura de 2ª Generación: WOBI (Anti-Spoofing) y ETI (Tape con Decaimiento Temporal + Impacto de Kyle)
+    // 1. Microestructura del Order Book (WOBI y ETI)
     const wBook = (Array.isArray(selectedBook.bids) && selectedBook.bids.length > 0 && Array.isArray(selectedBook.asks) && selectedBook.asks.length > 0)
       ? computeWeightedBookMetrics(selectedBook.bids, selectedBook.asks)
       : {
@@ -2935,97 +3101,26 @@ Return JSON with this exact schema:
       ? eTape.etiImbalance
       : (tradeFlow ? (isYesSide ? tradeFlow.tapeImbalance : -tradeFlow.tapeImbalance) : 0);
 
-    // 1b. Consistencia Combinatoria Segura entre hermanos (filtra polvo <2.5¢, excluye escaleras acumulativas y verifica negRisk)
-    const eventKey = String(m?.events?.[0]?.slug || m?.events?.[0]?.id || "");
-    const siblingMarkets = (eventKey && Array.isArray(botState.allMarkets))
-      ? botState.allMarkets.filter(cand => String(cand?.events?.[0]?.slug || cand?.events?.[0]?.id || "") === eventKey)
-      : [];
-    const marketMicro = computeSiblingNormalizedMicro({
-      market: m,
-      selectedSide,
-      rawMarketMicro: wBook.pMicroWeighted,
-      siblingMarkets,
-    });
+    const marketMicro = wBook.pMicroWeighted;
 
-    // 2. Reconciliador Bayesiano Tetlock + Escudo Anti-Cuchillo Cayendo + PAR Simétrico (v2.5.1)
-    const fallbackYesProb = isYesSide ? rawSideProb : (1.0 - rawSideProb);
-    const tetlockGuard = evaluateTetlockAndCatalystGuard({
-      selectedSide,
-      baseRateYesProb: Number.isFinite(baseRateYes) ? baseRateYes : fallbackYesProb,
-      estimatedYesProb: Number.isFinite(estYesProb) ? estYesProb : fallbackYesProb,
-      declaredLikelihoodRatio: rawLikelihoodRatio,
-      hasFreshNews,
-      newsAgeHours: minNewsAgeHours,
-      marketMicro,
-      gammaChange1h: asNumber(change1h, 0),
-      gammaChange24h: asNumber(change24h, 0),
-      tapeVelocity6h: eTape.priceVelocity6h,
-      wObi: effectiveObi,
-      etiImbalance: sideTapeImbalance,
-    });
-
-    rawSideProb = tetlockGuard.blindSideProb;
-
-    // Protección dura contra mercados deportivos donde la IA confunde marcadores pasados o no tiene catalizador nuevo
-    const isSportsMatch = m._cat === "SPORTS" || /\b(vs\.?|handicap|esports|nba|nfl|mlb|nhl|ufc|match|game|atp|premier league|champions)\b/i.test(m.question || "");
-    const lacksCatalyst = /no recent catalyst|no new info|older news|no recent news|sin noticias recientes/i.test(
+    const isSportsMatch = false;
+    const lacksCatalyst = /no recent catalyst|no fresh catalyst|no new info|older news|no recent news|no fresh news|without fresh|oldest \d+|sin noticias recientes|sin catalizador/i.test(
       `${result.news_found || ""} ${result.reasoning || ""}`
     );
 
-    if (lacksCatalyst && (effectiveObi < 0.45 || sideTapeImbalance < 0.25)) {
-      result.action = "SKIP";
-      result.considered_side = selectedSide;
-      result.skip_reason = `Sin noticia fresca ni flujo institucional fuerte`;
-      result.reasoning = `[FILTRO CATALIZADOR] Sin noticia nueva ni flujo institucional fuerte (WOBI=${effectiveObi.toFixed(2)}, ETI=${sideTapeImbalance.toFixed(2)}). ${result.reasoning || ""}`;
-    }
+    // 2. Fase 2.2: Sin distorsión de Tetlock, sin Platt y sin Theta de Poisson.
+    // La probabilidad justa proviene directamente del Oráculo Cripto con un ajuste microestructural acotado (±1.5¢ máx).
+    const orderflowMicroAdj = Math.max(-0.015, Math.min(0.015, 0.01 * ((0.5 * effectiveObi) + (0.5 * sideTapeImbalance))));
+    const calibratedFairProb = Math.max(0.02, Math.min(0.98, rawSideProb + orderflowMicroAdj));
+    const reachableFairProb24h = calibratedFairProb;
 
-    if (isSportsMatch && executableAsk >= 0.20 && executableAsk <= 0.80) {
-      // Un partido entre 20c y 80c aún no se ha resuelto; bloquear alucinaciones de "marcador final ya jugado"
-      rawSideProb = Math.min(rawSideProb, marketMicro + 0.14);
-    }
-
-    // 3. Peso adaptativo de la IA SIN doble conteo de hasFreshNews (la noticia ya fue ponderada en blindSideProb)
-    let aiWeight = 0.50;
-    if (effectiveObi >= 0.18)          aiWeight += 0.06;
-    else if (effectiveObi <= -0.15)    aiWeight -= 0.10;
-    if (sideTapeImbalance >= 0.18)     aiWeight += 0.06;
-    else if (sideTapeImbalance <= -0.20) aiWeight -= 0.10;
-    if (liq > 50000)                   aiWeight -= 0.08;
-    aiWeight = Math.max(0.35, Math.min(0.68, aiWeight));
-
-    // 4. Pooling en espacio Log-Odds (corrige sobreconfianza del LLM en extremos)
-    const clampP  = (p) => Math.max(0.01, Math.min(0.99, Number(p)));
-    const logit   = (p) => Math.log(clampP(p) / (1 - clampP(p)));
-    const sigmoid = (z) => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, z))));
-
-    // Contracción de Platt AUTOCALIBRADA (ψ_emp ∈ [0.68, 0.92], base 0.82) según la tasa de acierto real vs la probabilidad predicha
-    const calibFeedback      = computeEmpiricalCalibrationFeedback(botState.trades, selectedSide);
-    const rawLogitShrunk     = calibFeedback.psi * logit(rawSideProb);
-    const microLogit         = logit(marketMicro);
-    const combinedLogit      = (aiWeight * rawLogitShrunk) + ((1 - aiWeight) * microLogit);
-    const calibratedFairProb = clampP(sigmoid(combinedLogit));
-
-    // 5. Factor de Convergencia Finita a 24h (Kappa_24h) coherente con MAX_HOLD = 24h
     const endDateRaw = m?.endDate || m?.endDateIso;
     const endDateMs  = endDateRaw ? new Date(endDateRaw).getTime() : (Date.now() + 7 * 86400_000);
     const hoursToResolution = Math.max(1, (endDateMs - Date.now()) / 3600_000);
     const daysToResolution  = hoursToResolution / 24;
-
-    const timeConvergenceBase = Math.pow(24 / Math.max(24, hoursToResolution), 0.45);
-    const catalystBoost       = (hasFreshNews && !lacksCatalyst && !tetlockGuard.vetoD_PricedIn) ? 0.35 : 0.0;
-    const orderflowBoost      = (effectiveObi >= 0.25 && sideTapeImbalance >= 0.20) ? 0.20 : 0.0;
-    const kappa24h            = Math.max(0.25, Math.min(1.0, timeConvergenceBase + catalystBoost + orderflowBoost));
-
-    // Valor justo alcanzable dentro de la ventana operativa de 24h incluyendo la deriva asimétrica de Theta (v2.6.0)
-    const reachableFairProb24h = computeThetaAdjustedFairProb24h({
-      questionText: m.question,
-      selectedSide,
-      marketMicro,
-      calibratedFairProb,
-      kappa24h,
-      hoursToResolution,
-      hasFreshNews,
-    });
+    const kappa24h          = 1.0;
+    const tetlockGuard      = { par: 0, vetoD_PricedIn: false, vetoF_FallingKnife: (effectiveObi <= -0.35 && sideTapeImbalance <= -0.25), vetoG_BlindHallucination: false, directionalMoveDown: 0, directionalMoveUp: 0, blindDivergenceAbs: 0 };
+    const calibFeedback     = { psi: 1.0, scope: "ORACLE_DIRECT" };
 
     // 6. Descuento de Fricción Exacto + Barrido Real del Libro L2 (VWAP Book-Walk v2.6.0)
     const bestBidPx      = asNumber(selectedBook.bestBid, executableAsk - selectedBook.spreadAbs);
@@ -3034,11 +3129,12 @@ Return JSON with this exact schema:
     // Probabilidad de cerrar en el CLOB antes de la resolución del oráculo
     const exitProbInClob = hoursToResolution > 24 ? 0.88 : 0.35;
 
-    // Costo real de comisión (usa el mayor entre el fee de API y el 0.35% del motor económico)
-    const takerBaseFeeBps  = asNumber(m.takerBaseFee, 0);
-    const apiQuadraticFee  = takerBaseFeeBps > 0 ? (executableAsk * (1 - executableAsk) * 0.015) : 0;
+    // Costo real de comisión CLOB (usa el mayor entre el fee cuadrático oficial /fee-rate y el piso 0.35% del motor económico)
+    const takerBaseFeeBps  = Math.max(asNumber(m.takerBaseFee, 0), asNumber(selectedBook.feeRateBps, 0));
+    const apiQuadraticFee  = takerBaseFeeBps > 0 ? (executableAsk * (1 - executableAsk) * (takerBaseFeeBps / 10000)) : 0;
     const entryFeePerShare = Math.max(executableAsk * 0.0035, apiQuadraticFee);
-    const exitFeePerShare  = reachableFairProb24h * 0.0035;
+    const exitQuadraticFee = takerBaseFeeBps > 0 ? (reachableFairProb24h * (1 - reachableFairProb24h) * (takerBaseFeeBps / 10000)) : 0;
+    const exitFeePerShare  = Math.max(reachableFairProb24h * 0.0035, exitQuadraticFee);
 
     // Impacto de gas ($0.004 entrada + $0.004 salida) + slippage medido por Book-Walk real en L2
     const refTradeUsdc = Math.max(1.50, (asNumber(botState.config.minTradeUsdc, 1.50) + asNumber(botState.config.maxTradeUsdc, 2.50)) / 2);
@@ -3090,9 +3186,22 @@ Return JSON with this exact schema:
 
     const hardVetoes = [];
 
-    // Veto Estratégico 1: Banda Operativa Taker [20¢ - 82¢]
-    if (executableAsk < 0.20 || executableAsk > 0.82) {
-      hardVetoes.push(`Precio fuera de banda operativa [20¢-82¢] (Ask=${(executableAsk * 100).toFixed(1)}¢)`);
+    // Veto Estratégico 0 (v3.0.0-crypto-oracle): Restricción estricta a contratos Cripto con Precio Objetivo ($)
+    const marketCategory = m._cat || detectCategory(m.question || "");
+    if (!ALLOWED_TRADING_CATEGORIES.includes(marketCategory) || !isCryptoTargetPriceMarket(m.question || "")) {
+      hardVetoes.push(`VETO_CATEGORY_NOT_CRYPTO_TARGET (Categoría=${marketCategory}, se requiere Cripto con precio objetivo $)`);
+    }
+
+    // Veto Estratégico 0b (v3.0.0-crypto-oracle): Prohibido operar contra la dirección de la evidencia (Likelihood Ratio)
+    if (isYesSide && rawLikelihoodRatio < 0.98) {
+      hardVetoes.push(`VETO_LR_CONTRADICTS_SIDE (LR=${rawLikelihoodRatio.toFixed(2)} < 1.00 contradice BUY_YES)`);
+    } else if (!isYesSide && rawLikelihoodRatio > 1.02) {
+      hardVetoes.push(`VETO_LR_CONTRADICTS_SIDE (LR=${rawLikelihoodRatio.toFixed(2)} > 1.00 contradice BUY_NO)`);
+    }
+
+    // Veto Estratégico 1: Banda Operativa Taker [20¢ - 80¢]
+    if (executableAsk < 0.20 || executableAsk > 0.80) {
+      hardVetoes.push(`Precio fuera de banda operativa [20¢-80¢] (Ask=${(executableAsk * 100).toFixed(1)}¢)`);
     }
 
     // Veto Estratégico 2: Filtro de Decaimiento Temporal (>14 días sin catalizador fresco del día)
@@ -3189,6 +3298,11 @@ Return JSON with this exact schema:
     result.confluence_pillars = pillars;
     result.raw_edge_pct = Number(rawEdgePct.toFixed(2));
     result.edge_pct = Number(netEdgePct.toFixed(2));
+    result.fee_rate_bps = takerBaseFeeBps;
+    result.spot_price = cryptoQuant?.spot ?? null;
+    result.target_price = cryptoQuant?.targetPrice ?? null;
+    result.math_yes_prob = cryptoQuant?.mathYesProb ?? null;
+    result.strategy_version = STRATEGY_VERSION;
     if (!Array.isArray(result.signal_types) || result.signal_types.length === 0) {
       result.signal_types = inferSignalTypesFromText(result.news_found, result.reasoning, netEdgePct);
     }
@@ -3316,6 +3430,7 @@ export async function runFullScan() {
 
           try {
             const analysis = await deepAnalyze(m, pre);
+            await insertDecisionLogSafe(m, pre, analysis);
 
             const isValidAction = analysis.action === "BUY_YES" || analysis.action === "BUY_NO";
             const scoreNum = asNumber(analysis.score, 0);
@@ -3350,13 +3465,9 @@ export async function runFullScan() {
           await new Promise(res => setTimeout(res, 200));
         }
 
-        // ── FASE 2 (v2.7.0): TORNEO DE CAPITAL ──
-        // Las señales aprobadas compiten por los slots por Utilidad Binaria U = NetEdge¢ / sqrt(P(1-P)) × Conf/100,
-        // en lugar de abrirse por orden de iteración.
-        approvedQueue.sort((a, b) => computeSignalUtility(b.analysis) - computeSignalUtility(a.analysis));
-        if (approvedQueue.length > 1) {
-          addLog(`🏆 [TORNEO] Ranking de señales por U: ${approvedQueue.map(q => `${q.m.question.slice(0, 22)}…(${computeSignalUtility(q.analysis).toFixed(2)})`).join(" > ")}`, "AI");
-        }
+        // ── FASE 2.2 y 3A (v3.0.0-crypto-oracle): ORDENAMIENTO SIMPLE POR EDGE DEL ORÁCULO ──
+        // Se eliminan el Torneo complejo y el Zombie Trade Swap (que cerraba posiciones pagando doble spread).
+        approvedQueue.sort((a, b) => asNumber(b.analysis?.edge_pct, 0) - asNumber(a.analysis?.edge_pct, 0));
 
         for (const { m, pre, analysis, sig } of approvedQueue) {
           try {
@@ -3421,24 +3532,6 @@ export async function runFullScan() {
 
             let tradePlan = await buildTradePlan();
 
-            // ── v2.7.0: Rotación por Costo de Oportunidad (Zombie Trade Swap) ──
-            // Con los slots llenos, liquida una posición estancada si la nueva señal supera su NetEdge en >= +4.5¢.
-            const slotsFull = getOpenTrades().length >= Math.max(1, asNumber(botState.config.maxOpenTrades, 3));
-            if (!tradePlan.allowed && slotsFull) {
-              const zombie = findZombieTradeForSwap(getOpenTrades(), asNumber(analysis.edge_pct, 0));
-              if (zombie) {
-                addLog(`♻️ [OPPORTUNITY SWAP] Rotando ${zombie.id} (estancado, edge ${asNumber(zombie.edge_pct, 0).toFixed(1)}¢) → ${m.question.slice(0, 50)} (edge ${asNumber(analysis.edge_pct, 0).toFixed(1)}¢)`, "TRADE");
-                const zIdx = botState.trades.findIndex(x => x.id === zombie.id);
-                if (zIdx >= 0) botState.trades[zIdx].forceCloseReason = "OPPORTUNITY_COST_SWAP";
-                await fastSyncTrades();
-                if (zIdx >= 0 && botState.trades[zIdx].status !== "CLOSED") {
-                  botState.trades[zIdx].forceCloseReason = null; // la salida no se completó: no dejar la marca pendiente
-                } else {
-                  tradePlan = await buildTradePlan();
-                }
-              }
-            }
-
             if (!tradePlan.allowed) {
               addLog(`⛔ [TRADE BLOQUEADO] ${tradePlan.reason}`, "WARN");
               continue;
@@ -3465,8 +3558,15 @@ export async function runFullScan() {
                 ? Math.min(0.012, (amt / askDepthUsd) * asNumber(sideBook?.spreadAbs, 0.01))
                 : 0.001);
             const effectiveSimEntry = parseFloat(Math.min(0.98, rawAsk + depthImpact).toFixed(4));
-            const takerFeeRate = Math.max(0.0035, asNumber(m.takerBaseFee, 0) > 0 ? (rawAsk * (1 - rawAsk) * 0.015) : 0.0035);
-            const entryFeeUsd = parseFloat(((amt * takerFeeRate) + 0.004).toFixed(4));
+            const feeRateBps = Math.max(asNumber(m.takerBaseFee, 0), asNumber(sideBook?.feeRateBps, 0));
+            const approxGrossShares = amt / effectiveSimEntry;
+            const entryFeeUsd = computePolymarketTakerFeeUsd({
+              shares: approxGrossShares,
+              price: effectiveSimEntry,
+              feeRateBps,
+              minSimRate: 0.0035,
+              gasUsd: 0.004,
+            });
             const netEntryCapital = Math.max(0.05, amt - entryFeeUsd);
             // CTFExchange trunca shares hacia abajo a 6 decimales
             const simulatedShares = Math.floor((netEntryCapital / effectiveSimEntry) * 1e6) / 1e6;
@@ -3517,6 +3617,10 @@ export async function runFullScan() {
               shares: executedShares,
               cost: executedAmount,
               entryFeeUsd,
+              feeRateBps,
+              strategyVersion: STRATEGY_VERSION,
+              mfePrice: initialMarkPrice,
+              maePrice: initialMarkPrice,
               frictionDeducted: true,
               confidence: analysis.confidence,
               edge_pct: analysis.edge_pct,
@@ -3629,11 +3733,23 @@ export async function fastSyncTrades() {
 
           const prevPx = asNumber(botState.trades[tradeIdx].currentPrice, 0);
           botState.trades[tradeIdx].currentPrice = livePx;
+          const prevMfe = asNumber(botState.trades[tradeIdx].mfePrice, livePx);
+          const prevMae = asNumber(botState.trades[tradeIdx].maePrice, livePx);
+          botState.trades[tradeIdx].mfePrice = Math.max(prevMfe, livePx);
+          botState.trades[tradeIdx].maePrice = Math.min(prevMae > 0 ? prevMae : livePx, livePx);
           Object.assign(botState.trades[tradeIdx], computeTradeEconomics(botState.trades[tradeIdx]));
 
-          // Persist mark-to-market price updates when price moves by >= 0.3 cents
+          // Persist mark-to-market price updates + MFE/MAE excursions when price moves by >= 0.3 cents
           if (Math.abs(livePx - prevPx) >= 0.003) {
-            await updateTradeSafe(trade.id, { current_price: livePx });
+            await updateTradeSafe(
+              trade.id,
+              {
+                current_price: livePx,
+                mfe_price: botState.trades[tradeIdx].mfePrice,
+                mae_price: botState.trades[tradeIdx].maePrice,
+              },
+              { current_price: livePx }
+            );
           }
 
           const openTrade = botState.trades[tradeIdx];
@@ -3659,10 +3775,11 @@ export async function fastSyncTrades() {
 
           // Si el trade supera las 12h (lifeRatio >= 0.50), reducir el colchón exigido para armar el Break-Even hasta en un 35%
           const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
-          const beNoiseCushion    = Math.max(0.016, 0.065 * binarySigma * timeDecayBeFactor);
+          // Calibración v3.0.0: colchón realista (+0.8¢ a +1.5¢ sobre exactBreakEvenPx) para proteger ganancias antes de reversión
+          const beNoiseCushion    = Math.max(0.008, 0.032 * binarySigma * timeDecayBeFactor);
           const triggerPrice      = Math.max(
             exactBreakEvenPx + beNoiseCushion,
-            entryPrice + Math.max(0.022, 0.070 * binarySigma * timeDecayBeFactor)
+            entryPrice + Math.max(0.018, 0.045 * binarySigma * timeDecayBeFactor)
           );
 
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0 && livePx >= triggerPrice) {
@@ -3892,7 +4009,13 @@ export async function fastSyncTrades() {
             closePrice = parseFloat(Math.max(0.005, executableExitPx).toFixed(4));
             const grossProceeds = asNumber(openTrade.shares, 0) * closePrice;
             const exitFeeRate = closeReason === "STOP_LOSS" ? 0.0050 : 0.0035;
-            const exitFeeUsd = parseFloat(((grossProceeds * exitFeeRate) + 0.004).toFixed(4));
+            const exitFeeUsd = computePolymarketTakerFeeUsd({
+              shares: asNumber(openTrade.shares, 0),
+              price: closePrice,
+              feeRateBps: asNumber(openTrade.feeRateBps, 0),
+              minSimRate: exitFeeRate,
+              gasUsd: 0.004,
+            });
             returned = roundMoney(Math.max(0, grossProceeds - exitFeeUsd));
             pnl = roundMoney(returned - asNumber(openTrade.cost, 0));
             botState.trades[tradeIdx].exitFeeUsd = exitFeeUsd;
@@ -3934,6 +4057,10 @@ export async function fastSyncTrades() {
               stop_loss: botState.trades[tradeIdx].stopLoss,
               take_profit: botState.trades[tradeIdx].takeProfit,
               break_even_armed: Boolean(botState.trades[tradeIdx].breakEvenArmed),
+              strategy_version: botState.trades[tradeIdx].strategyVersion || STRATEGY_VERSION,
+              mfe_price: botState.trades[tradeIdx].mfePrice ?? closePrice,
+              mae_price: botState.trades[tradeIdx].maePrice ?? closePrice,
+              exit_fee_usd: botState.trades[tradeIdx].exitFeeUsd ?? null,
             },
             { status: "CLOSED", closed_at: closeTs, pnl: cumulativeClosedPnl, current_price: closePrice }
           );
@@ -3946,6 +4073,7 @@ export async function fastSyncTrades() {
       } catch (error) {
         console.error("Fast Sync Error:", error.message);
       } finally {
+        await updateCounterfactualDecisions().catch(() => {});
         await runWithdrawalAutopilot("FAST_SYNC");
       }
     }
@@ -3954,6 +4082,66 @@ export async function fastSyncTrades() {
   if (!acquired) {
     addLog("⏭️ [LOCK] Fast sync omitido porque otra instancia ya lo está ejecutando.", "WARN");
   }
+}
+
+async function updateCounterfactualDecisions() {
+  if (!Array.isArray(botState.decisionLog) || botState.decisionLog.length === 0) return;
+  const nowMs = Date.now();
+  let probes = 0;
+
+  for (const dec of botState.decisionLog) {
+    if (probes >= 3) break;
+    const evalMs = dec.evaluated_at ? new Date(dec.evaluated_at).getTime() : NaN;
+    if (!Number.isFinite(evalMs)) continue;
+    const ageMin = (nowMs - evalMs) / 60000;
+    if (ageMin < 30 || dec.counterfactual_checked_at) continue;
+
+    const m = botState.allMarkets.find(
+      cand => String(cand.id || cand.conditionId) === String(dec.market_id || dec.condition_id)
+    );
+    if (!m) continue;
+    const side = dec.considered_side || "YES";
+    const tokenId = side === "YES" ? m._yesTokenId : m._noTokenId;
+    const entryRefAsk = side === "YES" ? asNumber(dec.yes_ask, 0) : asNumber(dec.no_ask, 0);
+    if (!tokenId || entryRefAsk <= 0) continue;
+
+    probes++;
+    const quote = await getTokenExitQuote(tokenId, 2);
+    if (quote && Number.isFinite(quote.bestBid) && quote.bestBid > 0) {
+      dec.counterfactual_bid = quote.bestBid;
+      dec.counterfactual_edge_cents = Number(((quote.bestBid - entryRefAsk) * 100).toFixed(2));
+      dec.counterfactual_checked_at = new Date().toISOString();
+    }
+  }
+}
+
+function computeBootstrapExpectancyCi95(pnlValues = []) {
+  const n = pnlValues.length;
+  if (n < 5) return { lower: null, upper: null, iterations: 0 };
+
+  const ITERS = 1000;
+  const means = new Array(ITERS);
+  // Generador determinístico LCG para reproducibilidad exacta en auditorías
+  let seed = 1337 + n;
+  const nextRand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+
+  for (let b = 0; b < ITERS; b++) {
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      const idx = Math.floor(nextRand() * n);
+      sum += pnlValues[idx];
+    }
+    means[b] = sum / n;
+  }
+  means.sort((a, b) => a - b);
+  return {
+    lower: Number(means[Math.floor(ITERS * 0.025)].toFixed(4)),
+    upper: Number(means[Math.floor(ITERS * 0.975)].toFixed(4)),
+    iterations: ITERS,
+  };
 }
 
 // â”€â”€ CHEQUEO DE MEDIANOCHE Y JORNADA â”€â”€
@@ -4002,6 +4190,7 @@ export function computeQuantMetrics() {
     : 0;
 
   const byCategory = {};
+  const byStrategyVersion = {};
   for (const t of validClosed) {
     const cat = t.category || detectCategory(t.question || "");
     if (!byCategory[cat]) {
@@ -4012,6 +4201,15 @@ export function computeQuantMetrics() {
     if (p > 0) byCategory[cat].wins++;
     else if (p < 0) byCategory[cat].losses++;
     byCategory[cat].pnl = roundMoney(byCategory[cat].pnl + p);
+
+    const ver = t.strategyVersion || "legacy-pre-v3";
+    if (!byStrategyVersion[ver]) {
+      byStrategyVersion[ver] = { count: 0, wins: 0, losses: 0, pnl: 0 };
+    }
+    byStrategyVersion[ver].count++;
+    if (p > 0) byStrategyVersion[ver].wins++;
+    else if (p < 0) byStrategyVersion[ver].losses++;
+    byStrategyVersion[ver].pnl = roundMoney(byStrategyVersion[ver].pnl + p);
   }
 
   const byExitReason = {
@@ -4056,6 +4254,59 @@ export function computeQuantMetrics() {
     validClosed.reduce((s, t) => s + asNumber(t.netPnlAfterFriction ?? computeTradeEconomics(t).netPnlAfterFriction, asNumber(t.pnl, 0)), 0)
   );
 
+  // ── GATE ESTADÍSTICO PRE-REGISTRADO FASE 3 -> FASE 4 (Exclusivo para versión activa v3.0.0-crypto-oracle) ──
+  const v3Closed = validClosed
+    .filter(t => (t.strategyVersion || "legacy-pre-v3") === STRATEGY_VERSION)
+    .sort((a, b) => new Date(a.closedAt || a.ts || 0).getTime() - new Date(b.closedAt || b.ts || 0).getTime());
+  const v3Pnls = v3Closed.map(t => asNumber(t.pnl, 0));
+  const v3Wins = v3Closed.filter(t => asNumber(t.pnl, 0) > 0);
+  const v3Losses = v3Closed.filter(t => asNumber(t.pnl, 0) < 0);
+  const v3GrossWin = v3Wins.reduce((s, t) => s + asNumber(t.pnl, 0), 0);
+  const v3GrossLoss = v3Losses.reduce((s, t) => s + Math.abs(asNumber(t.pnl, 0)), 0);
+  const v3Pf = v3GrossLoss > 0 ? roundMoney(v3GrossWin / v3GrossLoss) : (v3GrossWin > 0 ? 9.99 : 0);
+  const v3Expectancy = v3Pnls.length > 0
+    ? Number((v3Pnls.reduce((s, x) => s + x, 0) / v3Pnls.length).toFixed(4))
+    : 0;
+  const v3BootstrapCi95 = computeBootstrapExpectancyCi95(v3Pnls);
+
+  // Cálculo de Drawdown Máximo en Paper sobre BASE_CAPITAL para v3
+  let peakEquity = BASE_CAPITAL;
+  let runningEquity = BASE_CAPITAL;
+  let maxDrawdownPct = 0;
+  for (const p of v3Pnls) {
+    runningEquity += p;
+    if (runningEquity > peakEquity) peakEquity = runningEquity;
+    const ddPct = peakEquity > 0 ? ((peakEquity - runningEquity) / peakEquity) * 100 : 0;
+    if (ddPct > maxDrawdownPct) maxDrawdownPct = ddPct;
+  }
+  maxDrawdownPct = roundMoney(maxDrawdownPct);
+
+  const gatePassed =
+    v3Closed.length >= 100 &&
+    v3Pf >= 1.30 &&
+    v3Expectancy > 0 &&
+    v3BootstrapCi95.lower !== null &&
+    v3BootstrapCi95.lower > 0 &&
+    maxDrawdownPct <= 20;
+
+  const gateFailedAbandon = v3Closed.length >= 100 && v3Pf < 1.0;
+
+  const v3Gate = {
+    strategyVersion: STRATEGY_VERSION,
+    tradesClosed: v3Closed.length,
+    targetTrades: 100,
+    profitFactor: v3Pf,
+    minProfitFactor: 1.30,
+    expectancyPerTrade: v3Expectancy,
+    expectancyCi95Lower: v3BootstrapCi95.lower,
+    expectancyCi95Upper: v3BootstrapCi95.upper,
+    maxDrawdownPct,
+    maxAllowedDrawdownPct: 20.0,
+    status: gatePassed
+      ? "PASSED_READY_FOR_PHASE_4"
+      : (gateFailedAbandon ? "FAILED_ABANDON_STRATEGY" : "COLLECTING_PAPER_SAMPLE"),
+  };
+
   return {
     totalClosed: validClosed.length,
     decidedCount,
@@ -4076,7 +4327,10 @@ export function computeQuantMetrics() {
     safetyMarginPct,
     expectancyPerTrade,
     healthScore,
+    strategyVersion: STRATEGY_VERSION,
+    v3Gate,
     byCategory,
+    byStrategyVersion,
     byExitReason,
   };
 }

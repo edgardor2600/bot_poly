@@ -304,15 +304,65 @@ export async function getLiveWalletSnapshot({ force = false } = {}) {
   }
 }
 
+const feeRateBpsCache = new Map();
+const FEE_RATE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+export async function getTokenFeeRateBps(tokenId) {
+  if (!tokenId) return 0;
+  const key = String(tokenId);
+  const now = Date.now();
+  const cached = feeRateBpsCache.get(key);
+  if (cached && (now - cached.ts) < FEE_RATE_CACHE_TTL_MS) {
+    return cached.feeRateBps;
+  }
+
+  const host = getEnv("POLYMARKET_HOST", DEFAULT_HOST).replace(/\/+$/, "");
+  try {
+    const res = await fetch(`${host}/fee-rate?token_id=${encodeURIComponent(key)}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return cached ? cached.feeRateBps : 0;
+    const data = await res.json();
+    const feeRateBps = Math.max(0, asNumber(data?.base_fee, 0));
+    feeRateBpsCache.set(key, { ts: now, feeRateBps });
+    return feeRateBps;
+  } catch {
+    return cached ? cached.feeRateBps : 0;
+  }
+}
+
+export function computePolymarketTakerFeeUsd({
+  shares = 0,
+  price = 0.5,
+  feeRateBps = 0,
+  minSimRate = 0.0035,
+  gasUsd = 0.004,
+} = {}) {
+  const sh = Math.max(0, asNumber(shares, 0));
+  const px = Math.max(0.01, Math.min(0.99, asNumber(price, 0.5)));
+  const notional = sh * px;
+  const bps = Math.max(0, asNumber(feeRateBps, 0));
+  // Official Polymarket CLOB Taker Fee formula: shares * (base_fee_bps / 10000) * p * (1 - p)
+  const clobQuadraticFeeUsd = bps > 0
+    ? sh * (bps / 10000) * px * (1 - px)
+    : 0;
+  const simFloorFeeUsd = notional * Math.max(0, asNumber(minSimRate, 0.0035));
+  return Number((Math.max(clobQuadraticFeeUsd, simFloorFeeUsd) + Math.max(0, asNumber(gasUsd, 0.004))).toFixed(4));
+}
+
 export async function getOrderBookSnapshot(tokenId) {
   if (!tokenId) return null;
   const host = getEnv("POLYMARKET_HOST", DEFAULT_HOST).replace(/\/+$/, "");
 
   try {
-    const res = await fetch(`${host}/book?token_id=${encodeURIComponent(tokenId)}`, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    });
+    const [res, feeRateBps] = await Promise.all([
+      fetch(`${host}/book?token_id=${encodeURIComponent(tokenId)}`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      }),
+      getTokenFeeRateBps(tokenId),
+    ]);
     if (!res.ok) return null;
     const book = await res.json();
 
@@ -428,6 +478,7 @@ export async function getOrderBookSnapshot(tokenId) {
       tickSize: asNumber(book?.minimum_tick_size) || 0.01,
       minOrderSize: asNumber(book?.min_order_size) || 1,
       negRisk: Boolean(book?.neg_risk),
+      feeRateBps: asNumber(feeRateBps, 0),
     };
   } catch {
     return null;
