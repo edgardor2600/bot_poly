@@ -35,8 +35,8 @@ const MAX_SPREAD_PCT = getNumberEnv("MAX_SPREAD_PCT", 4.0);
 const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
 const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
 const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 70);
-const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 5.5);
-export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.0.0-crypto-oracle");
+const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 4.5);
+export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.1.0-crypto-oracle");
 export const ALLOWED_TRADING_CATEGORIES = ["CRYPTO"];
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
@@ -446,13 +446,16 @@ function calcStopLoss(entryPrice, entryBid = null) {
 }
 
 function calcTakeProfit(entryPrice, fairProb = null) {
-  const pctTarget = entryPrice * (1 + botState.config.takeProfit / 100);
-  // Guarantee at least 3.5c above entryPrice to comfortably beat spread and fees
-  let target = Math.max(pctTarget, entryPrice + 0.035);
-  if (Number.isFinite(fairProb) && fairProb > entryPrice + 0.04) {
-    target = Math.max(target, Math.min(fairProb - 0.01, entryPrice * 1.18));
+  // Volatilidad binaria simétrica sigma_bin = sqrt(p*(1-p))
+  // Evita que en precios altos (ej. 0.77) entryPrice * 1.12 pida +9.9¢ imposibles (caso T-MW921A3ZA6DH que llegó a +4.9¢ y se devolvió).
+  const p = Math.max(0.05, Math.min(0.95, Number(entryPrice) || 0.5));
+  const binarySigma = Math.sqrt(Math.max(0.04, p * (1 - p)));
+  const sigmaTargetStep = Math.max(0.036, Math.min(0.052, 0.105 * binarySigma));
+  let target = p + sigmaTargetStep;
+  if (Number.isFinite(fairProb) && fairProb > p + 0.038) {
+    target = Math.max(p + 0.036, Math.min(fairProb - 0.006, p + 0.058));
   }
-  return parseFloat(Math.min(0.97, target).toFixed(4));
+  return parseFloat(Math.min(0.96, target).toFixed(4));
 }
 
 function calcMaxHoldAt(openTs) {
@@ -1049,39 +1052,40 @@ function computeTradeEconomics(trade) {
   const isClosed     = trade.status === "CLOSED";
   const feeRateBps   = Math.max(0, asNumber(trade.feeRateBps, 0));
 
-  // 1. Entry Fee: usa la fórmula cuadrática oficial de Polymarket CLOB si feeRateBps > 0, con piso conservador de 0.35% + $0.004 gas
-  const entryFeeUsd = asNumber(trade.entryFeeUsd, 0) > 0
+  // 1. Entry Fee (v3.1.0 Maker-First): entradas Limit pasivas pagan 0% fee CLOB ($0.004 gas); si el trade persistió entryFeeUsd explícito, se respeta
+  const isMakerEntry = trade.executionStyle === "MAKER_LIMIT" || (!isRealTradingEnabled() && asNumber(trade.entryFeeUsd, -1) === 0.004);
+  const entryFeeUsd = asNumber(trade.entryFeeUsd, -1) >= 0
     ? asNumber(trade.entryFeeUsd, 0)
-    : computePolymarketTakerFeeUsd({
-        shares: shares > 0 ? shares : (cost / entryPrice),
-        price: entryPrice,
-        feeRateBps,
-        minSimRate: 0.0035,
-        gasUsd: 0.004,
-      });
+    : (isMakerEntry
+        ? 0.004
+        : computePolymarketTakerFeeUsd({
+            shares: shares > 0 ? shares : (cost / entryPrice),
+            price: entryPrice,
+            feeRateBps,
+            minSimRate: 0.0035,
+            gasUsd: 0.004,
+          }));
 
-  // 2. Exit Fee: distingue entre STOP_LOSS (0.50% piso) y salidas controladas (0.35% piso) + fórmula cuadrática CLOB
+  // 2. Exit Fee: En TAKE_PROFIT / TIME_DECAY_PROFIT_HARVEST (orden Limit Maker pasiva) el fee CLOB es 0% ($0.004 gas).
+  // En STOP_LOSS / THESIS_INVALIDATED / cierres Taker al bid se aplica la fórmula cuadrática oficial de Polymarket CLOB.
   const exitPx          = isClosed ? asNumber(trade.closePrice ?? trade.currentPrice, currentPrice) : currentPrice;
-  const isEmergencyStop = trade.closeReason === "STOP_LOSS";
+  const isPassiveMakerExit = trade.closeReason === "TAKE_PROFIT" || trade.closeReason === "TIME_DECAY_PROFIT_HARVEST";
+  const isEmergencyStop = trade.closeReason === "STOP_LOSS" || trade.closeReason === "THESIS_INVALIDATED";
   const exitFeeRate     = isEmergencyStop ? 0.0050 : 0.0035;
 
   const exitFeeUsd = isClosed
-    ? (asNumber(trade.exitFeeUsd, 0) > 0
+    ? (asNumber(trade.exitFeeUsd, -1) >= 0
         ? asNumber(trade.exitFeeUsd, 0)
-        : computePolymarketTakerFeeUsd({
-            shares,
-            price: exitPx,
-            feeRateBps,
-            minSimRate: exitFeeRate,
-            gasUsd: 0.004,
-          }))
-    : computePolymarketTakerFeeUsd({
-        shares,
-        price: exitPx,
-        feeRateBps,
-        minSimRate: 0.0035,
-        gasUsd: 0.004,
-      });
+        : (isPassiveMakerExit
+            ? 0.004
+            : computePolymarketTakerFeeUsd({
+                shares,
+                price: exitPx,
+                feeRateBps,
+                minSimRate: exitFeeRate,
+                gasUsd: 0.004,
+              })))
+    : 0.004;
 
   const totalFrictionUsd = Number((entryFeeUsd + (isClosed ? exitFeeUsd : 0)).toFixed(3));
 
@@ -2511,12 +2515,13 @@ export async function getCryptoSpotContext(question, daysLeft) {
       ? Math.log(high24h / low24h) / (2 * Math.sqrt(Math.LN2))
       : assetBaselineVol;
 
-    const maxVolCap = assetName === "BTC" ? 0.040 : (assetName === "ETH" ? 0.050 : 0.065);
-    const minVolFloor = 0.015;
+    const maxVolCap = assetName === "BTC" ? 0.045 : (assetName === "ETH" ? 0.055 : 0.070);
+    const minVolFloor = 0.018;
     const realized1hDailyVol = await fetchKrakenHourlyRealizedVol(ohlcPair);
-    const blendedVol = Number.isFinite(realized1hDailyVol) && realized1hDailyVol > 0
-      ? (0.50 * realized1hDailyVol) + (0.30 * rawParkinson) + (0.20 * assetBaselineVol)
-      : (0.50 * rawParkinson) + (0.50 * assetBaselineVol);
+    const observedActiveVol = Number.isFinite(realized1hDailyVol) && realized1hDailyVol > 0
+      ? Math.max(realized1hDailyVol, rawParkinson * 0.85)
+      : rawParkinson;
+    const blendedVol = (0.65 * observedActiveVol) + (0.35 * assetBaselineVol);
     const dailyVol = Math.max(minVolFloor, Math.min(maxVolCap, blendedVol));
 
     // Detectar precio objetivo ($78,000 o $85k) en la pregunta
@@ -2532,15 +2537,19 @@ export async function getCryptoSpotContext(question, daysLeft) {
 
     let mathYesProb = null;
     let modelType = "SPOT_ONLY";
-    const tDays = Math.max(0.15, Number.isFinite(daysLeft) ? daysLeft : 3);
+    const tDays = Math.max(0.25, Number.isFinite(daysLeft) ? daysLeft : 3);
     const itoDriftDaily = -0.5 * (dailyVol ** 2);
 
     if (targetPrice && targetPrice > spot * 0.2 && targetPrice < spot * 3.0) {
+      // En barreras americanas de toque ("reach", "dip") aplicamos factor 1.12x por colas pesadas intradía (kurtosis cripto)
+      const isTouchQuestion = /\b(reach|hit|touch|dip|drop|fall|cross|before)\b/i.test(q) &&
+                              !/\b(be above|be below|close above|close below|price on|be over|be under)\b/i.test(q);
+      const effectiveSigmaDaily = isTouchQuestion ? Math.min(maxVolCap, dailyVol * 1.12) : dailyVol;
       const dualOracle = computeDualCryptoOracleProb({
         questionText: q,
         spotPrice: spot,
         barrierPrice: targetPrice,
-        sigmaDaily: dailyVol,
+        sigmaDaily: effectiveSigmaDaily,
         daysToExpiry: tDays,
         itoDriftDaily,
         normalCDFFn: normCdf,
@@ -2551,10 +2560,13 @@ export async function getCryptoSpotContext(question, daysLeft) {
       }
     }
 
-    const distPct = targetPrice ? (((targetPrice - spot) / spot) * 100).toFixed(2) : null;
+    const signedDistPct = targetPrice ? (((targetPrice - spot) / spot) * 100) : null;
+    const absDistPct = signedDistPct !== null ? Math.abs(signedDistPct) : null;
+    const distPct = signedDistPct !== null ? signedDistPct.toFixed(2) : null;
+    const mathNoProb = mathYesProb !== null ? Number((1 - mathYesProb).toFixed(4)) : null;
     const summary = targetPrice
-      ? `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | ParkinsonDailyVol=${(dailyVol * 100).toFixed(2)}% | Target=$${targetPrice.toLocaleString("en-US")} (${distPct}% from spot) | Math_${modelType}_YES_Prob=${mathYesProb !== null ? (mathYesProb * 100).toFixed(1) + "%" : "N/A"}`
-      : `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | ParkinsonDailyVol=${(dailyVol * 100).toFixed(2)}%`;
+      ? `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | DailyVol=${(dailyVol * 100).toFixed(2)}% | Target=$${targetPrice.toLocaleString("en-US")} (${distPct}% from spot) | Math_${modelType}_YES_Prob=${mathYesProb !== null ? (mathYesProb * 100).toFixed(1) + "%" : "N/A"} | Math_${modelType}_NO_Prob=${mathNoProb !== null ? (mathNoProb * 100).toFixed(1) + "%" : "N/A"}`
+      : `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | DailyVol=${(dailyVol * 100).toFixed(2)}%`;
 
     return {
       assetName,
@@ -2563,8 +2575,10 @@ export async function getCryptoSpotContext(question, daysLeft) {
       low24h,
       dailyVol,
       targetPrice,
+      absDistPct,
       modelType,
       mathYesProb,
+      mathNoProb,
       summary,
     };
   } catch {
@@ -2936,21 +2950,61 @@ export async function deepAnalyze(m, prelim) {
   const fmtDelta = (v) => `${v >= 0 ? "+" : ""}${(asNumber(v, 0) * 100).toFixed(1)}%`;
   const priceActionStr = `1h=${fmtDelta(change1h)} | 24h=${fmtDelta(change24h)} | 7d=${fmtDelta(change7d)}`;
 
-  // ARQUITECTURA v3.0.0-crypto-oracle (Fase 2 y Fase 3A):
-  // Entregamos al LLM los precios reales ejecutables del CLOB (Bid/Ask) junto con el Oráculo Cuantitativo Cripto en vivo.
-  // Se elimina el modo ciego y la inversión automática de lado (que causaba comprar NO cuando las noticias y LR favorecían YES).
+  // ARQUITECTURA v3.1.0-crypto-oracle (Maker-First 0% Fee + Barrera Segura >= 3.0% + Prompt Simétrico YES/NO):
+  // 1. Pre-evaluamos la dirección y ventaja del Oráculo Cripto ANTES de llamar al LLM para informarle explícitamente qué lado auditar
+  //    y evitar que el LLM descarte BUY_NO mirando solo YES o alucine una comisión plana del 10% por ver FeeBps=1000.
+  let oracleAction = "SKIP";
+  let consideredSide = null;
+  let oracleSkipReason = null;
+  let oracleGrossEdge = 0;
+  let estYesProb = (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) ? cryptoQuant.mathYesProb : null;
+
+  if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
+    const mathYes = cryptoQuant.mathYesProb;
+    const yesOracleEdge = (yesTradable && yesBook?.isValid) ? (mathYes - yesBook.bestAsk) : -1;
+    const noOracleEdge  = (noTradable && noBook?.isValid) ? ((1 - mathYes) - noBook.bestAsk) : -1;
+
+    if (yesOracleEdge >= 0.04 && yesOracleEdge >= noOracleEdge) {
+      oracleAction = "BUY_YES";
+      consideredSide = "YES";
+      oracleGrossEdge = yesOracleEdge;
+    } else if (noOracleEdge >= 0.04 && noOracleEdge > yesOracleEdge) {
+      consideredSide = "NO";
+      oracleGrossEdge = noOracleEdge;
+      // Veto Cuantitativo de Barrera Cercana (v3.1.0): Prohibido vender volatilidad (BUY_NO) en barreras de toque ("reach"/"dip")
+      // cuando el Spot está a menos de 3.0% de la barrera (evita los casos T-MW73AZ4VI5AU a 1.59% y T-MW958Z3H2FXP a 1.29%).
+      if (
+        cryptoQuant.modelType === "AMERICAN_BARRIER_TOUCH" &&
+        Number.isFinite(cryptoQuant.absDistPct) &&
+        cryptoQuant.absDistPct < 3.0
+      ) {
+        oracleAction = "SKIP";
+        oracleSkipReason = `VETO_BARRIER_TOO_CLOSE_FOR_NO (Barrera de toque a solo ${cryptoQuant.absDistPct.toFixed(2)}% del Spot < 3.00% mínimo para comprar NO)`;
+      } else {
+        oracleAction = "BUY_NO";
+      }
+    } else {
+      consideredSide = mathYes >= 0.5 ? "YES" : "NO";
+      oracleSkipReason = "Oráculo Cripto sin ventaja bruta mínima (>= 4.0¢ sobre BestAsk)";
+    }
+  } else {
+    oracleSkipReason = "Oráculo Cripto sin precio objetivo válido o sin datos Spot en Kraken";
+  }
+
   const yesBookStructureStr = yesBook?.isValid
-    ? `BestBid=${(asNumber(yesBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(yesBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(yesBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (asNumber(yesBook.bidDepthUsd, 0) + asNumber(yesBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(yesBook.obi, 0) >= 0 ? "+" : ""}${asNumber(yesBook.obi, 0).toFixed(2)} FeeBps=${asNumber(yesBook.feeRateBps, 0)} Tradable=${yesTradable ? "YES" : "NO"}`
+    ? `BestBid=${(asNumber(yesBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(yesBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(yesBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(yesBook.topLiquidityUsd ?? (asNumber(yesBook.bidDepthUsd, 0) + asNumber(yesBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(yesBook.obi, 0) >= 0 ? "+" : ""}${asNumber(yesBook.obi, 0).toFixed(2)} ExecutionMode=MAKER_LIMIT_0_FEE Tradable=${yesTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
   const noBookStructureStr = noBook?.isValid
-    ? `BestBid=${(asNumber(noBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(noBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(noBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (asNumber(noBook.bidDepthUsd, 0) + asNumber(noBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(noBook.obi, 0) >= 0 ? "+" : ""}${asNumber(noBook.obi, 0).toFixed(2)} FeeBps=${asNumber(noBook.feeRateBps, 0)} Tradable=${noTradable ? "YES" : "NO"}`
+    ? `BestBid=${(asNumber(noBook.bestBid, 0) * 100).toFixed(1)}c BestAsk=${(asNumber(noBook.bestAsk, 0) * 100).toFixed(1)}c Spread=${asNumber(noBook.spreadPct, 0).toFixed(2)}% TopDepth=$${(noBook.topLiquidityUsd ?? (asNumber(noBook.bidDepthUsd, 0) + asNumber(noBook.askDepthUsd, 0))).toFixed(0)} WOBI=${asNumber(noBook.obi, 0) >= 0 ? "+" : ""}${asNumber(noBook.obi, 0).toFixed(2)} ExecutionMode=MAKER_LIMIT_0_FEE Tradable=${noTradable ? "YES" : "NO"}`
     : "UNAVAILABLE";
 
   const tapeFlowStr = tradeFlow
     ? `Last_${tradeFlow.sampleCount}_Trades: BullishYES=$${tradeFlow.yesBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleYesCount}) | BullishNO=$${tradeFlow.noBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleNoCount}) | ETI_TapeImbalance=${tradeFlow.tapeImbalance >= 0 ? "+" : ""}${tradeFlow.tapeImbalance.toFixed(2)}`
     : "UNAVAILABLE";
 
-  const cryptoLine = cryptoQuant ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary}` : "";
+  const cryptoLine = cryptoQuant
+    ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary} | ORACLE_CANDIDATE_ACTION=${oracleAction}${oracleAction !== "SKIP" ? ` (CandidateSide=${consideredSide}, GrossOracleEdge=+${(oracleGrossEdge * 100).toFixed(1)}c)` : ""}`
+    : "";
 
   const body = {
     model: GROQ_MODEL,
@@ -2958,15 +3012,14 @@ export async function deepAnalyze(m, prelim) {
       {
         role: "system",
         content: `You are a quantitative risk & catalyst auditor for a Crypto-Oracle trading desk on Polymarket CLOB (${STRATEGY_VERSION}).
-Your job is to validate whether a genuine statistical mispricing exists between the LIVE_CRYPTO_ORACLE barrier probability and the executable CLOB BestAsk price:
-1. base_rate_prob (0.01 to 0.99): The quantitative barrier probability of YES from LIVE_CRYPTO_ORACLE (or outside-view base rate if unavailable).
+Orders are executed passively as Maker Limit orders (0% CLOB fee). The deterministic math engine has already computed LIVE_CRYPTO_ORACLE probabilities for both YES and NO and selected ORACLE_CANDIDATE_ACTION:
+1. base_rate_prob (0.01 to 0.99): The quantitative barrier probability of YES from LIVE_CRYPTO_ORACLE.
 2. evidence_likelihood_ratio (0.50 to 2.00): The diagnostic direction of RECENT_NEWS & CLOB orderflow (1.00 = neutral/no fresh catalyst; >1.00 = favors YES; <1.00 = favors NO).
 3. estimated_yes_prob (0.01 to 0.99): Your final calibrated probability of the YES outcome.
 CRITICAL RULES:
 1. Never recommend a side marked Tradable=NO.
-2. DIRECTIONAL CONSISTENCY: Never recommend BUY_NO if evidence_likelihood_ratio > 1.00 or if estimated_yes_prob > YES BestAsk. Never recommend BUY_YES if evidence_likelihood_ratio < 1.00 or if estimated_yes_prob < YES BestAsk.
-3. ORACLE DISCIPLINE: Only recommend BUY_YES if LIVE_CRYPTO_ORACLE Math_YES_Prob exceeds YES BestAsk by at least +4c, or BUY_NO if (1 - Math_YES_Prob) exceeds NO BestAsk by at least +4c. Otherwise return action="SKIP".
-4. If a market already moved >15% in 24h on old news (>2h ago) or has no quantitative edge after spread/fees, return action="SKIP".
+2. SYMMETRIC ORACLE AUDIT: Look at ORACLE_CANDIDATE_ACTION in LIVE_CRYPTO_ORACLE. If ORACLE_CANDIDATE_ACTION="BUY_NO", evaluate whether Math_NO_Prob exceeds NO BestAsk (do NOT reject BUY_NO just because Math_YES_Prob < YES BestAsk!). If ORACLE_CANDIDATE_ACTION="BUY_YES", evaluate whether Math_YES_Prob exceeds YES BestAsk.
+3. Confirm action=ORACLE_CANDIDATE_ACTION unless RECENT_NEWS or strong orderflow directly contradicts that side (e.g., bullish breakout news contradicting BUY_NO, or bearish crash news contradicting BUY_YES), in which case return action="SKIP". If ORACLE_CANDIDATE_ACTION="SKIP", return action="SKIP".
 Return ONLY raw valid JSON.`
       },
       {
@@ -3003,7 +3056,18 @@ Return JSON with this exact schema:
   const rawLlmAction = String(result.action || "SKIP").toUpperCase();
   result.raw_action = rawLlmAction;
 
-  // ── SEÑAL GENERADA 100% POR EL ORÁCULO CUANTITATIVO CRIPTO (Fase 2.2 y Fase 3A) ──
+  // Poblar siempre telemetría del Oráculo Cripto antes de cualquier SKIP para que decision_log nunca tenga nulls
+  const defaultFeeRateBps = Math.max(
+    asNumber(m.takerBaseFee, 0),
+    asNumber(yesBook?.feeRateBps, 0),
+    asNumber(noBook?.feeRateBps, 0)
+  );
+  result.spot_price = cryptoQuant?.spot ?? null;
+  result.target_price = cryptoQuant?.targetPrice ?? null;
+  result.math_yes_prob = cryptoQuant?.mathYesProb ?? null;
+  result.fee_rate_bps = defaultFeeRateBps;
+  result.strategy_version = STRATEGY_VERSION;
+
   const normalizeProb = (v) => {
     const n = parseFloat(v);
     if (!Number.isFinite(n)) return null;
@@ -3012,33 +3076,13 @@ Return JSON with this exact schema:
 
   const llmEstYesProb = normalizeProb(result.estimated_yes_prob);
   const rawLikelihoodRatio = Math.max(0.25, Math.min(4.0, asNumber(result.evidence_likelihood_ratio, 1.0)));
-
-  let oracleAction = "SKIP";
-  let consideredSide = null;
-  let estYesProb = (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) ? cryptoQuant.mathYesProb : null;
   const baseRateYes = estYesProb ?? normalizeProb(result.base_rate_prob) ?? llmEstYesProb;
-
-  if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
-    const mathYes = cryptoQuant.mathYesProb;
-    const yesOracleEdge = (yesTradable && yesBook?.isValid) ? (mathYes - yesBook.bestAsk) : -1;
-    const noOracleEdge  = (noTradable && noBook?.isValid) ? ((1 - mathYes) - noBook.bestAsk) : -1;
-
-    if (yesOracleEdge >= 0.04 && yesOracleEdge >= noOracleEdge) {
-      oracleAction = "BUY_YES";
-      consideredSide = "YES";
-    } else if (noOracleEdge >= 0.04 && noOracleEdge > yesOracleEdge) {
-      oracleAction = "BUY_NO";
-      consideredSide = "NO";
-    } else {
-      consideredSide = mathYes >= 0.5 ? "YES" : "NO";
-    }
-  }
 
   // El LLM actúa únicamente como VETO (no puede crear compras donde oracleAction === "SKIP" ni invertir el lado del oráculo)
   let llmVetoReason = null;
   if (oracleAction === "SKIP") {
     result.action = "SKIP";
-    result.skip_reason = "Oráculo Cripto sin ventaja bruta mínima (>= 4.0¢ sobre BestAsk)";
+    result.skip_reason = oracleSkipReason || "Oráculo Cripto sin ventaja bruta mínima (>= 4.0¢ sobre BestAsk)";
   } else if (rawLlmAction === "SKIP") {
     result.action = "SKIP";
     llmVetoReason = "VETO_LLM_AUDITOR_SKIP";
@@ -3122,22 +3166,18 @@ Return JSON with this exact schema:
     const tetlockGuard      = { par: 0, vetoD_PricedIn: false, vetoF_FallingKnife: (effectiveObi <= -0.35 && sideTapeImbalance <= -0.25), vetoG_BlindHallucination: false, directionalMoveDown: 0, directionalMoveUp: 0, blindDivergenceAbs: 0 };
     const calibFeedback     = { psi: 1.0, scope: "ORACLE_DIRECT" };
 
-    // 6. Descuento de Fricción Exacto + Barrido Real del Libro L2 (VWAP Book-Walk v2.6.0)
+    // 6. Descuento de Fricción Exacto Maker-First (v3.1.0 — Cumplimiento Gate 0):
+    // En Polymarket CLOB, las órdenes Limit pasivas (Maker) de entrada y de Take-Profit pagan 0% fee ($0.004 gas).
+    // Solo cuando salta el Stop-Loss de emergencia se cruza el spread como Taker pagando el fee cuadrático (feeRateBps).
     const bestBidPx      = asNumber(selectedBook.bestBid, executableAsk - selectedBook.spreadAbs);
     const exitHalfSpread = Math.max(0.002, marketMicro - bestBidPx);
 
-    // Probabilidad de cerrar en el CLOB antes de la resolución del oráculo
-    const exitProbInClob = hoursToResolution > 24 ? 0.88 : 0.35;
-
-    // Costo real de comisión CLOB (usa el mayor entre el fee cuadrático oficial /fee-rate y el piso 0.35% del motor económico)
     const takerBaseFeeBps  = Math.max(asNumber(m.takerBaseFee, 0), asNumber(selectedBook.feeRateBps, 0));
-    const apiQuadraticFee  = takerBaseFeeBps > 0 ? (executableAsk * (1 - executableAsk) * (takerBaseFeeBps / 10000)) : 0;
-    const entryFeePerShare = Math.max(executableAsk * 0.0035, apiQuadraticFee);
     const exitQuadraticFee = takerBaseFeeBps > 0 ? (reachableFairProb24h * (1 - reachableFairProb24h) * (takerBaseFeeBps / 10000)) : 0;
-    const exitFeePerShare  = Math.max(reachableFairProb24h * 0.0035, exitQuadraticFee);
+    const emergencyTakerExitFeePerShare = Math.max(reachableFairProb24h * 0.0035, exitQuadraticFee);
 
-    // Impacto de gas ($0.004 entrada + $0.004 salida) + slippage medido por Book-Walk real en L2
-    const refTradeUsdc = Math.max(1.50, (asNumber(botState.config.minTradeUsdc, 1.50) + asNumber(botState.config.maxTradeUsdc, 2.50)) / 2);
+    // Impacto de gas ($0.004 entrada + $0.004 salida) + slippage esperado en caso de Stop-Loss (probabilidad de cola ~28%)
+    const refTradeUsdc = Math.max(1.00, (asNumber(botState.config.minTradeUsdc, 1.00) + asNumber(botState.config.maxTradeUsdc, 1.00)) / 2);
     const gasPerShare  = (0.004 * executableAsk) / refTradeUsdc;
     const hasL2Asks    = Array.isArray(selectedBook.asks) && selectedBook.asks.length > 0;
     const hasL2Bids    = Array.isArray(selectedBook.bids) && selectedBook.bids.length > 0;
@@ -3148,15 +3188,15 @@ Return JSON with this exact schema:
       targetSellShares: refTradeUsdc / Math.max(0.15, executableAsk),
     });
 
-    const entryDepthSlippage = hasL2Asks
-      ? Math.max(0.001, bookWalk.realBuySlippage)
-      : Math.max(0.001, Math.min(0.004, (refTradeUsdc / Math.max(500, liq)) * 0.15));
     const exitSlippageExpected = hasL2Bids
       ? Math.max(0.0015, bookWalk.realSellSlippage)
       : 0.0015;
 
-    const totalEntryFriction = entryFeePerShare + gasPerShare + entryDepthSlippage;
-    const totalExitFriction  = exitProbInClob * (exitHalfSpread + exitFeePerShare + gasPerShare + exitSlippageExpected);
+    // Entrada Maker Limit pasiva (0% fee CLOB, solo gas) + salida ponderada (72% Maker TP/Expiry 0% fee vs 28% Taker SL)
+    const probTakerEmergencyExit = 0.28;
+    const totalEntryFriction = gasPerShare;
+    const totalExitFriction  = ((1 - probTakerEmergencyExit) * gasPerShare) +
+      (probTakerEmergencyExit * (exitHalfSpread + emergencyTakerExitFeePerShare + gasPerShare + exitSlippageExpected));
 
     // Penalización exponencial continua para longshots (< 22¢)
     const longshotPenalty = executableAsk < 0.22 ? (0.022 * Math.exp(-10 * executableAsk)) : 0;
@@ -3542,31 +3582,11 @@ export async function runFullScan() {
             const rawAsk = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
             const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, rawAsk - 0.01).toFixed(4));
 
-            // Modelo de Ejecución Realista v2.6.0 (Barrido Exacto VWAP L2 + Comisión Taker + Gas Polygon + Redondeo CTF)
-            const askDepthUsd = Math.max(10, asNumber(sideBook?.askDepthUsd, 25));
-            const simBookWalk = (Array.isArray(sideBook?.asks) && sideBook.asks.length > 0)
-              ? computeExecutableBookWalk({
-                  bids: sideBook.bids || [],
-                  asks: sideBook.asks,
-                  targetBuyUsdc: amt,
-                  targetSellShares: amt / Math.max(0.15, rawAsk),
-                })
-              : null;
-            const depthImpact = simBookWalk
-              ? Math.max(0.001, simBookWalk.realBuySlippage)
-              : ((amt / askDepthUsd) > 0.12
-                ? Math.min(0.012, (amt / askDepthUsd) * asNumber(sideBook?.spreadAbs, 0.01))
-                : 0.001);
-            const effectiveSimEntry = parseFloat(Math.min(0.98, rawAsk + depthImpact).toFixed(4));
+            // Modelo de Ejecución Maker-First v3.1.0 (Cumplimiento Gate 0: Orden Limit Pasiva con 0% Maker Fee en CLOB + $0.004 Gas Polygon)
+            // En lugar de cruzar el libro como Taker pagando 1000 bps (~5.9% de entrada), entramos con orden Limit al precio límite sin slippage de barrido.
+            const effectiveSimEntry = parseFloat(Math.min(0.98, rawAsk).toFixed(4));
             const feeRateBps = Math.max(asNumber(m.takerBaseFee, 0), asNumber(sideBook?.feeRateBps, 0));
-            const approxGrossShares = amt / effectiveSimEntry;
-            const entryFeeUsd = computePolymarketTakerFeeUsd({
-              shares: approxGrossShares,
-              price: effectiveSimEntry,
-              feeRateBps,
-              minSimRate: 0.0035,
-              gasUsd: 0.004,
-            });
+            const entryFeeUsd = 0.004; // 0% Maker fee en Polymarket CLOB + $0.004 gas Polygon
             const netEntryCapital = Math.max(0.05, amt - entryFeeUsd);
             // CTFExchange trunca shares hacia abajo a 6 decimales
             const simulatedShares = Math.floor((netEntryCapital / effectiveSimEntry) * 1e6) / 1e6;
@@ -3767,19 +3787,26 @@ export async function fastSyncTrades() {
           const maxHoldHrs  = Math.max(6, asNumber(botState.config.maxHoldHours, 24));
           const lifeRatio   = Math.min(1.0, hoursHeld / maxHoldHrs); // tau en [0, 1]
 
-          // ─── 1. Break-Even Exacto Libre de Pérdidas (con Compresión Temporal >= 12h) ─
-          // Cubre entryFee (0.35%), exitFee (0.35%), gas ida/vuelta ($0.008), slippage (0.2¢) + $0.005 de ganancia neta mínima
-          const exactBreakEvenPx =
-            ((entryPrice * 1.0035) + ((0.008 + 0.005) / shares)) / (1 - 0.0035) + 0.002;
-          const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.009).toFixed(4));
+          // ─── 1. Break-Even Exacto Real Libre de Pérdidas (v3.1.0 — Usa Costo Base Real cost/shares + Fee Real de Salida) ─
+          // Corrige el bug donde exactBreakEvenPx usaba 0.35% fijo ignorando entryFeeUsd ya descontado de shares y feeRateBps=1000.
+          const trueCostBasisPerShare = asNumber(openTrade.cost, entryPrice * shares) / shares;
+          const tradeFeeBps = Math.max(0, asNumber(openTrade.feeRateBps, 0));
+          // Estimamos la comisión de salida sobre el precio actual si saliéramos por stop de protección
+          const estExitQuadraticFeePerShare = tradeFeeBps > 0
+            ? (tradeFeeBps / 10000) * entryPrice * (1 - entryPrice)
+            : (entryPrice * 0.0035);
+          // En modo Maker-First (v3.1.0), el cierre en BREAK_EVEN o TRAILING_STOP usa orden Limit Maker agresiva al tope del libro (0% fee CLOB + $0.004 gas + 0.15¢ latencia)
+          const beExitFrictionPerShare = (0.004 / shares) + 0.0015 + (0.005 / shares);
+          const exactBreakEvenPx = trueCostBasisPerShare + beExitFrictionPerShare;
+          const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.010).toFixed(4));
 
           // Si el trade supera las 12h (lifeRatio >= 0.50), reducir el colchón exigido para armar el Break-Even hasta en un 35%
           const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
-          // Calibración v3.0.0: colchón realista (+0.8¢ a +1.5¢ sobre exactBreakEvenPx) para proteger ganancias antes de reversión
-          const beNoiseCushion    = Math.max(0.008, 0.032 * binarySigma * timeDecayBeFactor);
+          // Calibración v3.1.0: se arma cuando avanza >= +1.8¢ a +2.2¢ por encima de la entrada (protegiendo avances como el +2.9¢ de T-MW958Z3H2FXP)
+          const beNoiseCushion    = Math.max(0.007, 0.025 * binarySigma * timeDecayBeFactor);
           const triggerPrice      = Math.max(
-            exactBreakEvenPx + beNoiseCushion,
-            entryPrice + Math.max(0.018, 0.045 * binarySigma * timeDecayBeFactor)
+            exactBreakEvenFloor + beNoiseCushion,
+            entryPrice + Math.max(0.018, 0.040 * binarySigma * timeDecayBeFactor)
           );
 
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0 && livePx >= triggerPrice) {
@@ -3791,14 +3818,14 @@ export async function fastSyncTrades() {
             }
           }
 
-          // ─── 2. Trailing Stop Adaptativo por Volatilidad Binaria ──────────────
-          // Se activa cuando el avance supera max(4.2¢, 0.095 * σ_bin)
-          const trailActivationPx = entryPrice + Math.max(0.042, 0.095 * binarySigma);
-          const dynamicTrailDist  = Math.max(0.026, 0.068 * binarySigma);
+          // ─── 2. Trailing Stop Adaptativo por Volatilidad Binaria (v3.1.0: Captura excursiones de +2.8¢ a +5.0¢) ──
+          // Se activa desde +2.8¢ sobre la entrada con distancia estrecha de ~1.2¢-1.5¢ para amarrar ganancias reales
+          const trailActivationPx = entryPrice + Math.max(0.026, 0.058 * binarySigma);
+          const dynamicTrailDist  = Math.max(0.012, 0.032 * binarySigma);
 
           if (openTrade.breakEvenArmed && entryPrice > 0 && livePx >= trailActivationPx) {
-            const trailedStop = parseFloat((livePx - dynamicTrailDist).toFixed(4));
-            if (trailedStop > asNumber(openTrade.stopLoss, 0) + 0.004) {
+            const trailedStop = parseFloat(Math.max(exactBreakEvenFloor, livePx - dynamicTrailDist).toFixed(4));
+            if (trailedStop > asNumber(openTrade.stopLoss, 0) + 0.003) {
               openTrade.stopLoss = trailedStop;
               openTrade.trailingActive = true;
               await updateTradeSafe(trade.id, { stop_loss: trailedStop, current_price: livePx });
@@ -3996,26 +4023,38 @@ export async function fastSyncTrades() {
               continue;
             }
           } else {
-            // Simulación Realista: Deslizamiento diferenciado por tipo de salida + Comisión Pool/Taker + Gas Polygon
+            // Simulación Realista v3.1.0 (Maker-First):
+            // - TAKE_PROFIT / TIME_DECAY_PROFIT_HARVEST / BREAK_EVEN / TRAILING_STOP se ejecutan como órdenes Limit Maker (0% fee CLOB + $0.004 gas).
+            // - STOP_LOSS / THESIS_INVALIDATED / MAX_HOLD cruzan el spread como Taker (FAK) pagando el fee cuadrático oficial (feeRateBps) + slippage L2.
+            const isMakerLimitClose =
+              closeReason === "TAKE_PROFIT" ||
+              closeReason === "TIME_DECAY_PROFIT_HARVEST" ||
+              closeReason === "BREAK_EVEN" ||
+              closeReason === "TRAILING_STOP";
             const exitSlippage = closeReason === "STOP_LOSS"
               ? 0.0020
-              : (closeReason === "TRAILING_STOP" || closeReason === "BREAK_EVEN" ? 0.0015 : 0.0010);
-            // v2.6.1: el vwapBid ya incorpora el slippage REAL de barrer bids[] → no se descuenta dos veces.
-            // El deslizamiento fijo actúa solo como piso de latencia: se cobra el MAYOR de ambos, nunca la suma.
+              : (closeReason === "TRAILING_STOP" || closeReason === "BREAK_EVEN" ? 0.0010 : 0.0000);
             const latencyFloorPx = livePx - exitSlippage;
-            const executableExitPx = Number.isFinite(exitVwapBid) && exitVwapBid > 0.001
+            const executableExitPx = (!isMakerLimitClose && Number.isFinite(exitVwapBid) && exitVwapBid > 0.001)
               ? Math.min(exitVwapBid, latencyFloorPx)
               : latencyFloorPx;
-            closePrice = parseFloat(Math.max(0.005, executableExitPx).toFixed(4));
+            if (closeReason === "BREAK_EVEN" || closeReason === "TRAILING_STOP") {
+              // Garantizar que el límite de salida de protección nunca liquide por debajo del piso libre de pérdidas (exactBreakEvenFloor)
+              closePrice = parseFloat(Math.max(exactBreakEvenFloor, executableExitPx).toFixed(4));
+            } else {
+              closePrice = parseFloat(Math.max(0.005, executableExitPx).toFixed(4));
+            }
             const grossProceeds = asNumber(openTrade.shares, 0) * closePrice;
             const exitFeeRate = closeReason === "STOP_LOSS" ? 0.0050 : 0.0035;
-            const exitFeeUsd = computePolymarketTakerFeeUsd({
-              shares: asNumber(openTrade.shares, 0),
-              price: closePrice,
-              feeRateBps: asNumber(openTrade.feeRateBps, 0),
-              minSimRate: exitFeeRate,
-              gasUsd: 0.004,
-            });
+            const exitFeeUsd = isMakerLimitClose
+              ? 0.004 // 0% Maker fee en Polymarket CLOB + $0.004 gas Polygon
+              : computePolymarketTakerFeeUsd({
+                  shares: asNumber(openTrade.shares, 0),
+                  price: closePrice,
+                  feeRateBps: asNumber(openTrade.feeRateBps, 0),
+                  minSimRate: exitFeeRate,
+                  gasUsd: 0.004,
+                });
             returned = roundMoney(Math.max(0, grossProceeds - exitFeeUsd));
             pnl = roundMoney(returned - asNumber(openTrade.cost, 0));
             botState.trades[tradeIdx].exitFeeUsd = exitFeeUsd;
