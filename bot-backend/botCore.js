@@ -1638,10 +1638,9 @@ function isSideMicrostructureTradable(book) {
 
 async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
   const verified = [];
-  const seenEvents = new Set();
-  const maxProbes = Math.min(scoredMarkets.length, Math.max(targetCount * 4, 24));
-
-  const poolSize = Math.max(targetCount, targetCount * 2);
+  const seenMarkets = new Set();
+  const maxProbes = Math.min(scoredMarkets.length, Math.max(targetCount * 8, 24));
+  const poolSize = Math.max(targetCount * 3, 12);
 
   for (let i = 0; i < maxProbes && verified.length < poolSize; i++) {
     const item = scoredMarkets[i];
@@ -1649,24 +1648,21 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     const pre = item.pre || item.prelim;
     if (!m || !pre) continue;
 
-    // Diversificación de eventos y Cooldown Anti-Overtrading (6h tras cierre / máx 2 trades en 24h)
-    const eventKey = pre.eventSlug || m.id;
-    if (eventKey && seenEvents.has(eventKey)) continue;
+    const marketKey = String(m.id || m.conditionId || m.question || "");
+    if (marketKey && seenMarkets.has(marketKey)) continue;
 
-    // Guardia Anti-Correlación Temática (v2.6.0): no analizar mercados correlacionados con posiciones ya abiertas
+    // Guardia Anti-Correlación Temática por Activo: no abrir otro trade sobre el mismo criptoactivo que ya esté abierto en cartera
     if (hasCorrelatedOpenPosition(m, botState.trades)) continue;
-
-    // v2.7.0: tampoco gastar llamadas a Groq en candidatos correlacionados entre sí dentro del mismo lote
-    if (hasCorrelatedOpenPosition(m, verified.map(v => ({ status: "OPEN", question: v.m.question, eventId: v.m?.events?.[0]?.id })))) continue;
 
     const cooldownCheck = isMarketInCooldown(m.id, m.conditionId, m.question);
     if (cooldownCheck.blocked) continue;
 
     const condId = m.conditionId || m.condition_id || null;
-    const [yesBook, noBook, tradeFlow] = await Promise.all([
+    const [yesBook, noBook, tradeFlow, cryptoQuant] = await Promise.all([
       pre.yesTokenId ? getOrderBookSnapshot(pre.yesTokenId) : Promise.resolve({ isValid: false, reason: 'NO_YES_TOKEN' }),
       pre.noTokenId ? getOrderBookSnapshot(pre.noTokenId) : Promise.resolve({ isValid: false, reason: 'NO_NO_TOKEN' }),
       condId ? getMarketTradeFlow(condId) : Promise.resolve(null),
+      getCryptoSpotContext(m.question, pre.daysLeft),
     ]);
 
     const yesTradable = isSideMicrostructureTradable(yesBook);
@@ -1682,6 +1678,23 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     pre.tradeFlow = tradeFlow;
     pre.yesTradable = yesTradable;
     pre.noTradable = noTradable;
+    pre.cryptoQuant = cryptoQuant;
+
+    // Pre-evaluar la ventaja matemática real del Oráculo Cripto contra el BestAsk ejecutable del CLOB
+    // para que Groq analice SIEMPRE los mercados con mayor ventaja real (>= +4.0¢), en vez de gastar el cupo en un mercado con edge negativo.
+    let oracleGrossEdge = -1;
+    if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
+      const mathYes = cryptoQuant.mathYesProb;
+      const yesEdge = (yesTradable && yesBook?.isValid) ? (mathYes - yesBook.bestAsk) : -1;
+      const noAllowedByBarrier = !(
+        cryptoQuant.modelType === "AMERICAN_BARRIER_TOUCH" &&
+        Number.isFinite(cryptoQuant.absDistPct) &&
+        cryptoQuant.absDistPct < 3.0
+      );
+      const noEdge = (noTradable && noBook?.isValid && noAllowedByBarrier) ? ((1 - mathYes) - noBook.bestAsk) : -1;
+      oracleGrossEdge = Math.max(yesEdge, noEdge);
+    }
+    pre.oracleGrossEdge = Number(oracleGrossEdge.toFixed(4));
 
     const bestSpreadPct = Math.min(
       yesTradable ? yesBook.spreadPct : 999,
@@ -1706,23 +1719,25 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
       }
     }
 
-    if (eventKey) seenEvents.add(eventKey);
+    if (marketKey) seenMarkets.add(marketKey);
 
-    // v2.7.0: puntuación de asimetría microestructural pre-Groq (S_pre) sobre los libros tradables
-    pre.alphaScore = computePreGroqAlphaScore({
+    // v3.1.0: puntuación combinada que prioriza los candidatos que SÍ superan el umbral del Oráculo (>= +4.0¢) + huella microestructural
+    const microAlpha = computePreGroqAlphaScore({
       yesBook: yesTradable ? yesBook : null,
       noBook: noTradable ? noBook : null,
       tradeFlow,
       liquidity: asNumber(m.liquidityNum ?? m.liquidity ?? pre.liq, 0),
     });
+    const oracleBonus = oracleGrossEdge >= 0.04 ? (1.0 + oracleGrossEdge * 4.0) : (oracleGrossEdge * 2.0);
+    pre.alphaScore = Number((microAlpha + oracleBonus).toFixed(4));
     verified.push({ m, pre });
   }
 
-  // v2.7.0: Groq analiza primero los libros con mayor huella de dinero informado (no los más eficientes/líquidos)
+  // v3.1.0: Ordenar para que los mercados con ventaja real del Oráculo Cripto (>= +4.0¢) entren primero a IA Profunda
   verified.sort((a, b) => (b.pre.alphaScore || 0) - (a.pre.alphaScore || 0));
-  const selected = verified.slice(0, targetCount);
+  const selected = verified.slice(0, Math.max(2, targetCount));
   if (selected.length > 0) {
-    addLog(`🎯 [ALPHA PRE-GROQ] Ranking S_pre: ${selected.map(v => `${v.pre.alphaScore.toFixed(2)}`).join(" > ")} (pool ${verified.length})`, "FILTER");
+    addLog(`🎯 [ALPHA PRE-GROQ] Ranking S_pre: ${selected.map(v => `${v.pre.alphaScore.toFixed(2)} (EdgeOráculo:${((v.pre.oracleGrossEdge || 0) * 100).toFixed(1)}¢)`).join(" > ")} (pool ${verified.length})`, "FILTER");
   }
   return selected;
 }
@@ -2209,7 +2224,11 @@ export function computeThetaAdjustedFairProb24h({
  */
 const THEMATIC_CONCEPTS = [
   ["FED_RATES", /\b(fed|federal reserve|fomc|powell|jerome powell|interest rates?|rate (?:cut|cuts|hike|hikes|reduction|decision|increase)|rates? (?:cut|cuts|hike|hikes|reduction)|\d+\s?bps|basis points?)\b/i],
-  ["CRYPTO_MAJOR", /\b(bitcoin|btc|ethereum|eth|ether|solana|sol|xrp|ripple|dogecoin|doge|crypto|cryptocurrency)\b/i],
+  ["CRYPTO_BTC", /\b(bitcoin|btc)\b/i],
+  ["CRYPTO_ETH", /\b(ethereum|eth|ether)\b/i],
+  ["CRYPTO_SOL", /\b(solana|sol)\b/i],
+  ["CRYPTO_XRP", /\b(xrp|ripple)\b/i],
+  ["CRYPTO_DOGE", /\b(dogecoin|doge)\b/i],
   ["TARIFFS_TRADE", /\b(tariffs?|trade war|trade deal|duties|customs)\b/i],
   ["MIDDLE_EAST_CONFLICT", /\b(israel|iran|gaza|hamas|hezbollah|houthis?|lebanon|tehran|netanyahu|ceasefire|cease-fire)\b/i],
   ["RUSSIA_UKRAINE", /\b(russia|ukraine|putin|zelensky|zelenskyy|kyiv|kremlin)\b/i],
