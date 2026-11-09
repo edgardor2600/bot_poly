@@ -1522,14 +1522,15 @@ export function preliminaryScore(m, prevSnapshot) {
   if (liq < botState.config.minLiq) return { score: 0, signals: [], skip: true };
   if (vol24 < 500) return { score: 0, signals: [], skip: true }; // Evitar mercados muertos sin flujo diario
 
-  // 4. Filtro estricto de horizonte temporal Fase 3A (entre 12 horas y 7.5 días):
-  // Evita mercados de 5m/15m (con fee dinámico alto y latencia de oráculo) y mercados >7.5d que inmovilizan capital.
+  // 4. Filtro estricto de horizonte temporal Fase 3A (entre 18 horas y 7.5 días):
+  // Usa primero m.endDate (ISO con hora exacta) antes que m.endDateIso (solo fecha) y bloquea mercados del mismo día (< 0.75d = 18h)
+  // donde la gamma intradía y las mechas cortas barren posiciones.
   let daysLeft = null;
-  if (m.endDateIso || m.endDate) {
-    const closes = new Date(m.endDateIso || m.endDate);
+  if (m.endDate || m.endDateIso) {
+    const closes = new Date(m.endDate || m.endDateIso);
     daysLeft = (closes - Date.now()) / 86400000;
-    if (!Number.isFinite(daysLeft) || daysLeft < 0.50) {
-      // Menos de 12 horas o ya expirado: evitar mercados intradía cortos con Taker fee cuadrático alto y latencia
+    if (!Number.isFinite(daysLeft) || daysLeft < 0.75) {
+      // Menos de 18 horas o ya expirado: evitar mercados del mismo día con gamma extrema y Taker fee cuadrático alto
       return { score: 0, signals: [], skip: true };
     }
     if (daysLeft > Math.min(7.5, MAX_MARKET_DAYS)) {
@@ -3002,9 +3003,14 @@ export async function deepAnalyze(m, prelim) {
     ? `Last_${tradeFlow.sampleCount}_Trades: BullishYES=$${tradeFlow.yesBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleYesCount}) | BullishNO=$${tradeFlow.noBullUsd.toFixed(0)} (Whales=${tradeFlow.whaleNoCount}) | ETI_TapeImbalance=${tradeFlow.tapeImbalance >= 0 ? "+" : ""}${tradeFlow.tapeImbalance.toFixed(2)}`
     : "UNAVAILABLE";
 
+  const isBearishYesQuestion = /\b(dip|drop|fall|below|under|less than|lower than|crash)\b/i.test(m.question || "");
+  const polarityLine = isBearishYesQuestion
+    ? `\nSEMANTIC_POLARITY_ALERT: This is a DOWNWARD/BEARISH target question ("dip/drop/below"). If crypto price is falling or news is bearish, that FAVORS YES (evidence_likelihood_ratio > 1.00) and CONTRADICTS BUY_NO! Never say "bearish momentum supports NO" on a dip/below question.`
+    : `\nSEMANTIC_POLARITY_ALERT: This is an UPWARD/BULLISH target question ("reach/above"). Bullish crypto news/momentum favors YES (evidence_likelihood_ratio > 1.00), while bearish news/momentum favors NO (evidence_likelihood_ratio < 1.00).`;
+
   const cryptoLine = cryptoQuant
-    ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary} | ORACLE_CANDIDATE_ACTION=${oracleAction}${oracleAction !== "SKIP" ? ` (CandidateSide=${consideredSide}, GrossOracleEdge=+${(oracleGrossEdge * 100).toFixed(1)}c)` : ""}`
-    : "";
+    ? `\nLIVE_CRYPTO_ORACLE: ${cryptoQuant.summary} | ORACLE_CANDIDATE_ACTION=${oracleAction}${oracleAction !== "SKIP" ? ` (CandidateSide=${consideredSide}, GrossOracleEdge=+${(oracleGrossEdge * 100).toFixed(1)}c)` : ""}${polarityLine}`
+    : polarityLine;
 
   const body = {
     model: GROQ_MODEL,
@@ -3787,26 +3793,25 @@ export async function fastSyncTrades() {
           const maxHoldHrs  = Math.max(6, asNumber(botState.config.maxHoldHours, 24));
           const lifeRatio   = Math.min(1.0, hoursHeld / maxHoldHrs); // tau en [0, 1]
 
-          // ─── 1. Break-Even Exacto Real Libre de Pérdidas (v3.1.0 — Usa Costo Base Real cost/shares + Fee Real de Salida) ─
-          // Corrige el bug donde exactBreakEvenPx usaba 0.35% fijo ignorando entryFeeUsd ya descontado de shares y feeRateBps=1000.
+          // ─── 1. Break-Even Exacto Real Libre de Pérdidas (v3.1.0 — Usa Costo Base Real cost/shares + Fee Taker Real de Salida) ─
+          // En la vida real, cuando el precio cae hacia un Stop (STOP_LOSS, BREAK_EVEN o TRAILING_STOP), la orden vende contra el bestBid
+          // como Taker (pagando feeRateBps cuadrático + gas + slippage). Sumamos estExitQuadraticFeePerShare a exactBreakEvenPx
+          // para que un cierre en BREAK_EVEN o TRAILING_STOP sea 100% rentable en Neto tanto en Simulación como en Dinero Real.
           const trueCostBasisPerShare = asNumber(openTrade.cost, entryPrice * shares) / shares;
           const tradeFeeBps = Math.max(0, asNumber(openTrade.feeRateBps, 0));
-          // Estimamos la comisión de salida sobre el precio actual si saliéramos por stop de protección
           const estExitQuadraticFeePerShare = tradeFeeBps > 0
             ? (tradeFeeBps / 10000) * entryPrice * (1 - entryPrice)
             : (entryPrice * 0.0035);
-          // En modo Maker-First (v3.1.0), el cierre en BREAK_EVEN o TRAILING_STOP usa orden Limit Maker agresiva al tope del libro (0% fee CLOB + $0.004 gas + 0.15¢ latencia)
-          const beExitFrictionPerShare = (0.004 / shares) + 0.0015 + (0.005 / shares);
+          const beExitFrictionPerShare = estExitQuadraticFeePerShare + (0.004 / shares) + 0.0015 + (0.005 / shares);
           const exactBreakEvenPx = trueCostBasisPerShare + beExitFrictionPerShare;
-          const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.010).toFixed(4));
+          const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.015).toFixed(4));
 
           // Si el trade supera las 12h (lifeRatio >= 0.50), reducir el colchón exigido para armar el Break-Even hasta en un 35%
           const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
-          // Calibración v3.1.0: se arma cuando avanza >= +1.8¢ a +2.2¢ por encima de la entrada (protegiendo avances como el +2.9¢ de T-MW958Z3H2FXP)
-          const beNoiseCushion    = Math.max(0.007, 0.025 * binarySigma * timeDecayBeFactor);
+          const beNoiseCushion    = Math.max(0.006, 0.020 * binarySigma * timeDecayBeFactor);
           const triggerPrice      = Math.max(
             exactBreakEvenFloor + beNoiseCushion,
-            entryPrice + Math.max(0.018, 0.040 * binarySigma * timeDecayBeFactor)
+            entryPrice + Math.max(0.024, 0.050 * binarySigma * timeDecayBeFactor)
           );
 
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0 && livePx >= triggerPrice) {
@@ -4023,14 +4028,14 @@ export async function fastSyncTrades() {
               continue;
             }
           } else {
-            // Simulación Realista v3.1.0 (Maker-First):
-            // - TAKE_PROFIT / TIME_DECAY_PROFIT_HARVEST / BREAK_EVEN / TRAILING_STOP se ejecutan como órdenes Limit Maker (0% fee CLOB + $0.004 gas).
-            // - STOP_LOSS / THESIS_INVALIDATED / MAX_HOLD cruzan el spread como Taker (FAK) pagando el fee cuadrático oficial (feeRateBps) + slippage L2.
+            // Simulación Realista v3.1.0 (Física Exacta de Libro de Órdenes):
+            // - TAKE_PROFIT / TIME_DECAY_PROFIT_HARVEST descansan pasivamente como órdenes Limit Maker arriba del precio (0% fee CLOB + $0.004 gas).
+            // - STOP_LOSS / BREAK_EVEN / TRAILING_STOP / THESIS_INVALIDATED / MAX_HOLD venden contra el bestBid existente como Taker (FAK),
+            //   pagando el fee cuadrático oficial (feeRateBps) + slippage L2 (y como exactBreakEvenFloor ya incluye estExitQuadraticFeePerShare,
+            //   cualquier cierre en BREAK_EVEN o TRAILING_STOP queda en ganancia neta real después de comisión).
             const isMakerLimitClose =
               closeReason === "TAKE_PROFIT" ||
-              closeReason === "TIME_DECAY_PROFIT_HARVEST" ||
-              closeReason === "BREAK_EVEN" ||
-              closeReason === "TRAILING_STOP";
+              closeReason === "TIME_DECAY_PROFIT_HARVEST";
             const exitSlippage = closeReason === "STOP_LOSS"
               ? 0.0020
               : (closeReason === "TRAILING_STOP" || closeReason === "BREAK_EVEN" ? 0.0010 : 0.0000);
@@ -4039,7 +4044,6 @@ export async function fastSyncTrades() {
               ? Math.min(exitVwapBid, latencyFloorPx)
               : latencyFloorPx;
             if (closeReason === "BREAK_EVEN" || closeReason === "TRAILING_STOP") {
-              // Garantizar que el límite de salida de protección nunca liquide por debajo del piso libre de pérdidas (exactBreakEvenFloor)
               closePrice = parseFloat(Math.max(exactBreakEvenFloor, executableExitPx).toFixed(4));
             } else {
               closePrice = parseFloat(Math.max(0.005, executableExitPx).toFixed(4));
