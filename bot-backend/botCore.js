@@ -36,7 +36,7 @@ const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
 const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
 const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 70);
 const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 4.5);
-export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.1.0-crypto-oracle");
+export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.2.0-crypto-oracle");
 export const ALLOWED_TRADING_CATEGORIES = ["CRYPTO"];
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
@@ -301,6 +301,8 @@ async function findPersistedOpenTradeForMarket(marketId, conditionId) {
 
 function isMarketInCooldown(marketId, conditionId, question) {
   const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
+  const GLOBAL_SL_COOLDOWN_MS = 45 * 60 * 1000;
   const DAY_MS = 24 * 60 * 60 * 1000;
   const now = Date.now();
   const mKey = String(marketId || "");
@@ -311,6 +313,20 @@ function isMarketInCooldown(marketId, conditionId, question) {
 
   for (const t of botState.trades) {
     if (t.closeReason === "CLEANUP_SIMULATED") continue;
+    const closedMs = t.closedAt ? new Date(t.closedAt).getTime() : (t.ts ? new Date(t.ts).getTime() : 0);
+
+    // Cooldown global de 45 min tras cualquier STOP_LOSS para no perseguir latigazos de volatilidad
+    if (
+      !shouldManageTrade(t) &&
+      t.closeReason === "STOP_LOSS" &&
+      Number.isFinite(closedMs) &&
+      closedMs > 0 &&
+      (now - closedMs) < GLOBAL_SL_COOLDOWN_MS
+    ) {
+      const minsLeft = Math.ceil((GLOBAL_SL_COOLDOWN_MS - (now - closedMs)) / 60000);
+      return { blocked: true, reason: `Enfriamiento global post-StopLoss activo (${minsLeft} min restantes)` };
+    }
+
     const sameMarket =
       (mKey && String(t.marketId) === mKey) ||
       (cKey && String(t.conditionId) === cKey) ||
@@ -321,10 +337,10 @@ function isMarketInCooldown(marketId, conditionId, question) {
       return { blocked: true, reason: "Ya existe posición activa en este mercado" };
     }
 
-    const closedMs = t.closedAt ? new Date(t.closedAt).getTime() : (t.ts ? new Date(t.ts).getTime() : 0);
     if (Number.isFinite(closedMs) && closedMs > 0) {
-      if ((now - closedMs) < SIX_HOURS_MS) {
-        const minsLeft = Math.ceil((SIX_HOURS_MS - (now - closedMs)) / 60000);
+      const requiredCooldownMs = t.closeReason === "STOP_LOSS" ? EIGHT_HOURS_MS : SIX_HOURS_MS;
+      if ((now - closedMs) < requiredCooldownMs) {
+        const minsLeft = Math.ceil((requiredCooldownMs - (now - closedMs)) / 60000);
         return { blocked: true, reason: `Cooldown anti-overtrading activo (${minsLeft} min restantes)` };
       }
       if ((now - closedMs) < DAY_MS) {
@@ -437,23 +453,24 @@ function hydrateCapitalFromLocalState() {
 
 function calcStopLoss(entryPrice, entryBid = null) {
   const pctStop = entryPrice * (1 - botState.config.stopLoss / 100);
-  // Guarantee at least 3.5c below entryBid (or 4.0c below entryPrice) so normal 1c-2c CLOB spread bounce never triggers premature stop-outs
+  // Guarantee at least 4.2c below entryBid (or 4.8c below entryPrice) so normal CLOB spread wicks do not trigger premature Taker stop-outs
   const tickFloor = (Number.isFinite(entryBid) && entryBid > 0)
-    ? (entryBid - 0.035)
-    : (entryPrice - 0.040);
+    ? (entryBid - 0.042)
+    : (entryPrice - 0.048);
   const stop = Math.min(pctStop, tickFloor);
   return parseFloat(Math.max(0.02, stop).toFixed(4));
 }
 
 function calcTakeProfit(entryPrice, fairProb = null) {
   // Volatilidad binaria simétrica sigma_bin = sqrt(p*(1-p))
-  // Evita que en precios altos (ej. 0.77) entryPrice * 1.12 pida +9.9¢ imposibles (caso T-MW921A3ZA6DH que llegó a +4.9¢ y se devolvió).
+  // v3.2.0: Calibrado a +3.8¢ - +4.5¢ (Maker Limit 0% fee) tras auditar que 6 trades en v3.1.0 llegaron a +5.0¢ de MFE,
+  // quedaron a 0.7¢ del TP de +5.8¢ y se devolvieron a TRAILING_STOP pagando 1000 bps de fee Taker.
   const p = Math.max(0.05, Math.min(0.95, Number(entryPrice) || 0.5));
   const binarySigma = Math.sqrt(Math.max(0.04, p * (1 - p)));
-  const sigmaTargetStep = Math.max(0.036, Math.min(0.052, 0.105 * binarySigma));
+  const sigmaTargetStep = Math.max(0.036, Math.min(0.044, 0.090 * binarySigma));
   let target = p + sigmaTargetStep;
-  if (Number.isFinite(fairProb) && fairProb > p + 0.038) {
-    target = Math.max(p + 0.036, Math.min(fairProb - 0.006, p + 0.058));
+  if (Number.isFinite(fairProb) && fairProb > p + 0.036) {
+    target = Math.max(p + 0.036, Math.min(fairProb - 0.005, p + 0.045));
   }
   return parseFloat(Math.min(0.96, target).toFixed(4));
 }
@@ -1680,18 +1697,15 @@ async function selectOrderBookVerifiedCandidates(scoredMarkets, targetCount) {
     pre.noTradable = noTradable;
     pre.cryptoQuant = cryptoQuant;
 
-    // Pre-evaluar la ventaja matemática real del Oráculo Cripto contra el BestAsk ejecutable del CLOB
-    // para que Groq analice SIEMPRE los mercados con mayor ventaja real (>= +4.0¢), en vez de gastar el cupo en un mercado con edge negativo.
+    // Pre-evaluar la ventaja matemática real del Oráculo Cripto contra el BestAsk ejecutable del CLOB (y guardián de régimen v3.2.0)
+    // para que Groq analice SIEMPRE los mercados con mayor ventaja real (>= +4.0¢) y sin violación de barrera/régimen.
     let oracleGrossEdge = -1;
     if (cryptoQuant && Number.isFinite(cryptoQuant.mathYesProb)) {
       const mathYes = cryptoQuant.mathYesProb;
-      const yesEdge = (yesTradable && yesBook?.isValid) ? (mathYes - yesBook.bestAsk) : -1;
-      const noAllowedByBarrier = !(
-        cryptoQuant.modelType === "AMERICAN_BARRIER_TOUCH" &&
-        Number.isFinite(cryptoQuant.absDistPct) &&
-        cryptoQuant.absDistPct < 3.0
-      );
-      const noEdge = (noTradable && noBook?.isValid && noAllowedByBarrier) ? ((1 - mathYes) - noBook.bestAsk) : -1;
+      const yesAllowed = !evaluateCryptoBarrierRegimeVeto(cryptoQuant, "YES").vetoed;
+      const noAllowed = !evaluateCryptoBarrierRegimeVeto(cryptoQuant, "NO").vetoed;
+      const yesEdge = (yesTradable && yesBook?.isValid && yesAllowed) ? (mathYes - yesBook.bestAsk) : -1;
+      const noEdge = (noTradable && noBook?.isValid && noAllowed) ? ((1 - mathYes) - noBook.bestAsk) : -1;
       oracleGrossEdge = Math.max(yesEdge, noEdge);
     }
     pre.oracleGrossEdge = Number(oracleGrossEdge.toFixed(4));
@@ -2244,11 +2258,21 @@ export function extractThematicConcepts(text = "") {
 }
 
 /**
- * 6. Bloqueo de Concentración Temática entre las 3 Posiciones Abiertas (v2.6.0 / sinónimos v2.6.1)
- * Impide abrir dos trades del mismo evento, mismo concepto temático (Fed, cripto, aranceles, Medio Oriente...)
- * o alta superposición léxica (Jaccard >= 0.34).
+ * Infiere la beta direccional cripto (+1 = Alcista / Bullish Crypto, -1 = Bajista / Bearish Crypto)
+ * a partir del texto de la pregunta y del lado comprado (YES / NO).
  */
-export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
+export function inferCryptoDirectionalBeta(question = "", side = "YES") {
+  const isDownwardYesQuestion = /\b(dip|drop|fall|below|under|less than|lower than|crash)\b/i.test(String(question || ""));
+  const questionYesBeta = isDownwardYesQuestion ? -1 : 1;
+  return String(side || "YES").toUpperCase() === "YES" ? questionYesBeta : -questionYesBeta;
+}
+
+/**
+ * 6. Bloqueo de Concentración Temática y Coherencia Direccional Cripto (v3.2.0)
+ * Impide abrir dos trades del mismo evento, mismo activo cripto, o abrir posiciones cripto simultáneas
+ * con beta direccional opuesta (ej. Alcista ETH + Bajista BTC en el mismo segundo) o sin Break-Even armado.
+ */
+export function hasCorrelatedOpenPosition(candidateMarket, openTrades = [], candidateSide = null) {
   if (!Array.isArray(openTrades) || openTrades.length === 0) return false;
 
   const tokenize = (str) => {
@@ -2273,6 +2297,10 @@ export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
     candidateMarket?.events?.[0]?.slug;
   const candTokens = tokenize(candidateMarket?.question);
   const candConcepts = extractThematicConcepts(candidateMarket?.question);
+  const isCandCrypto = Array.from(candConcepts).some(c => c.startsWith("CRYPTO_"));
+  const candBeta = (isCandCrypto && candidateSide)
+    ? inferCryptoDirectionalBeta(candidateMarket?.question, candidateSide)
+    : null;
 
   for (const trade of openTrades) {
     if (trade.status !== "OPEN" && trade.status !== "PARTIAL") continue;
@@ -2283,11 +2311,26 @@ export function hasCorrelatedOpenPosition(candidateMarket, openTrades = []) {
       return true;
     }
 
-    // 2. Mismo concepto temático (sinónimos: Fed/Powell/FOMC/rate cut; BTC/ETH/SOL; Israel/Iran...)
+    // 2. Mismo concepto temático (mismo activo cripto BTC/ETH/SOL, etc.)
+    const openConcepts = extractThematicConcepts(trade.question);
     if (candConcepts.size > 0) {
-      const openConcepts = extractThematicConcepts(trade.question);
       for (const c of candConcepts) {
         if (openConcepts.has(c)) return true;
+      }
+    }
+
+    // 2b. Coherencia de Beta Cripto en Cartera (v3.2.0):
+    // Como BTC y ETH tienen correlación > 0.85, cuando vamos a ejecutar una orden (candidateSide presente):
+    // - Bloquear si ya hay otro trade cripto abierto que aún NO tiene Break-Even armado (evita doble stop-out simultáneo).
+    // - Bloquear siempre si el trade cripto abierto apuesta en dirección macro opuesta (ej. Bullish ETH vs Bearish BTC).
+    const isOpenCrypto = Array.from(openConcepts).some(c => c.startsWith("CRYPTO_"));
+    if (isCandCrypto && isOpenCrypto && candidateSide) {
+      if (!trade.breakEvenArmed) {
+        return true;
+      }
+      const openBeta = inferCryptoDirectionalBeta(trade.question, trade.side);
+      if (candBeta !== null && openBeta !== candBeta) {
+        return true;
       }
     }
 
@@ -2535,14 +2578,19 @@ export async function getCryptoSpotContext(question, daysLeft) {
       ? Math.log(high24h / low24h) / (2 * Math.sqrt(Math.LN2))
       : assetBaselineVol;
 
-    const maxVolCap = assetName === "BTC" ? 0.045 : (assetName === "ETH" ? 0.055 : 0.070);
+    const maxVolCap = assetName === "BTC" ? 0.040 : (assetName === "ETH" ? 0.050 : 0.065);
     const minVolFloor = 0.018;
     const realized1hDailyVol = await fetchKrakenHourlyRealizedVol(ohlcPair);
     const observedActiveVol = Number.isFinite(realized1hDailyVol) && realized1hDailyVol > 0
-      ? Math.max(realized1hDailyVol, rawParkinson * 0.85)
-      : rawParkinson;
-    const blendedVol = (0.65 * observedActiveVol) + (0.35 * assetBaselineVol);
+      ? ((0.55 * realized1hDailyVol) + (0.45 * (rawParkinson * 0.82)))
+      : (rawParkinson * 0.85);
+    const blendedVol = (0.55 * observedActiveVol) + (0.45 * assetBaselineVol);
     const dailyVol = Math.max(minVolFloor, Math.min(maxVolCap, blendedVol));
+
+    // Posición relativa del Spot dentro del rango de 24h [0.0 = mínimo 24h, 1.0 = máximo 24h]
+    const rangePos24h = (Number.isFinite(high24h) && Number.isFinite(low24h) && high24h > low24h)
+      ? Number(Math.max(0, Math.min(1, (spot - low24h) / (high24h - low24h))).toFixed(3))
+      : 0.5;
 
     // Detectar precio objetivo ($78,000 o $85k) en la pregunta
     const priceMatch = q.match(/\$([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)\s*(k)?/i);
@@ -2561,10 +2609,12 @@ export async function getCryptoSpotContext(question, daysLeft) {
     const itoDriftDaily = -0.5 * (dailyVol ** 2);
 
     if (targetPrice && targetPrice > spot * 0.2 && targetPrice < spot * 3.0) {
-      // En barreras americanas de toque ("reach", "dip") aplicamos factor 1.12x por colas pesadas intradía (kurtosis cripto)
+      // v3.2.0: En barreras americanas de toque ("reach", "dip") eliminamos la inflación de 1.12x y aplicamos
+      // un factor de contracción de monitoreo discreto (0.90x) porque la reflexión browniana continua sobreestima
+      // la probabilidad de toque en ambos extremos (lo que causaba comprar YES en reach $76k y dip $70k el mismo día).
       const isTouchQuestion = /\b(reach|hit|touch|dip|drop|fall|cross|before)\b/i.test(q) &&
                               !/\b(be above|be below|close above|close below|price on|be over|be under)\b/i.test(q);
-      const effectiveSigmaDaily = isTouchQuestion ? Math.min(maxVolCap, dailyVol * 1.12) : dailyVol;
+      const effectiveSigmaDaily = isTouchQuestion ? Math.max(minVolFloor, dailyVol * 0.90) : dailyVol;
       const dualOracle = computeDualCryptoOracleProb({
         questionText: q,
         spotPrice: spot,
@@ -2585,16 +2635,18 @@ export async function getCryptoSpotContext(question, daysLeft) {
     const distPct = signedDistPct !== null ? signedDistPct.toFixed(2) : null;
     const mathNoProb = mathYesProb !== null ? Number((1 - mathYesProb).toFixed(4)) : null;
     const summary = targetPrice
-      ? `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | DailyVol=${(dailyVol * 100).toFixed(2)}% | Target=$${targetPrice.toLocaleString("en-US")} (${distPct}% from spot) | Math_${modelType}_YES_Prob=${mathYesProb !== null ? (mathYesProb * 100).toFixed(1) + "%" : "N/A"} | Math_${modelType}_NO_Prob=${mathNoProb !== null ? (mathNoProb * 100).toFixed(1) + "%" : "N/A"}`
-      : `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] | DailyVol=${(dailyVol * 100).toFixed(2)}%`;
+      ? `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] (RangePos=${(rangePos24h * 100).toFixed(0)}%) | DailyVol=${(dailyVol * 100).toFixed(2)}% | Target=$${targetPrice.toLocaleString("en-US")} (${distPct}% from spot) | Math_${modelType}_YES_Prob=${mathYesProb !== null ? (mathYesProb * 100).toFixed(1) + "%" : "N/A"} | Math_${modelType}_NO_Prob=${mathNoProb !== null ? (mathNoProb * 100).toFixed(1) + "%" : "N/A"}`
+      : `${assetName} LIVE_SPOT=$${spot.toLocaleString("en-US", { maximumFractionDigits: 2 })} | 24h_Range=[$${low24h.toFixed(0)}-$${high24h.toFixed(0)}] (RangePos=${(rangePos24h * 100).toFixed(0)}%) | DailyVol=${(dailyVol * 100).toFixed(2)}%`;
 
     return {
       assetName,
       spot,
       high24h,
       low24h,
+      rangePos24h,
       dailyVol,
       targetPrice,
+      signedDistPct,
       absDistPct,
       modelType,
       mathYesProb,
@@ -2604,6 +2656,64 @@ export async function getCryptoSpotContext(question, daysLeft) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Guardián Determinístico de Régimen y Geometría de Barrera Cripto (v3.2.0):
+ * 1) Bloquea BUY_NO en barreras de toque cercanas (< 3.0% del Spot).
+ * 2) Bloquea BUY_YES en barreras de toque lejanas (> 3.6% del Spot = loterías OTM que mueren por Theta).
+ * 3) Bloquea BUY_YES contra-tendencia en barreras de toque usando rangePos24h mutuamente excluyente:
+ *    - Para comprar YES en barrera alcista ("reach"), exige Spot en mitad superior del rango 24h (>= 52%).
+ *    - Para comprar YES en barrera bajista ("dip"), exige Spot en mitad inferior del rango 24h (<= 48%).
+ *    Esto hace matemáticamente imposible que el bot alterne entre "BTC dip YES" y "BTC reach YES" en el mismo régimen.
+ * 4) Bloquea contratos Digitales Europeos cuando el Spot está clavado sobre el strike (< 1.2% = Pin Gamma extrema).
+ */
+export function evaluateCryptoBarrierRegimeVeto(cryptoQuant, candidateSide) {
+  if (!cryptoQuant || !Number.isFinite(cryptoQuant.absDistPct)) {
+    return { vetoed: false, reason: null };
+  }
+  const absDist = cryptoQuant.absDistPct;
+  const signedDist = Number(cryptoQuant.signedDistPct ?? 0);
+  const rangePos = Number(cryptoQuant.rangePos24h ?? 0.5);
+  const side = String(candidateSide || "").toUpperCase();
+
+  if (cryptoQuant.modelType === "AMERICAN_BARRIER_TOUCH") {
+    if (side === "NO" && absDist < 3.0) {
+      return {
+        vetoed: true,
+        reason: `VETO_BARRIER_TOO_CLOSE_FOR_NO (Barrera de toque a solo ${absDist.toFixed(2)}% del Spot < 3.00% mínimo para comprar NO)`,
+      };
+    }
+    if (side === "YES") {
+      if (absDist > 3.6) {
+        return {
+          vetoed: true,
+          reason: `VETO_OTM_TOUCH_LOTTERY_YES (Barrera de toque a ${absDist.toFixed(2)}% del Spot > 3.60% máx: evita loterías OTM con erosión Theta)`,
+        };
+      }
+      if (signedDist > 0 && rangePos < 0.52) {
+        return {
+          vetoed: true,
+          reason: `VETO_COUNTER_TREND_TOUCH_YES (Barrera alcista pero Spot débil en rango 24h: PosRango=${(rangePos * 100).toFixed(0)}% < 52%)`,
+        };
+      }
+      if (signedDist < 0 && rangePos > 0.48) {
+        return {
+          vetoed: true,
+          reason: `VETO_COUNTER_TREND_TOUCH_YES (Barrera bajista pero Spot fuerte en rango 24h: PosRango=${(rangePos * 100).toFixed(0)}% > 48%)`,
+        };
+      }
+    }
+  } else if (cryptoQuant.modelType === "EUROPEAN_DIGITAL_EXPIRY") {
+    if (absDist < 1.2) {
+      return {
+        vetoed: true,
+        reason: `VETO_PIN_GAMMA_ZONE (Spot a solo ${absDist.toFixed(2)}% del strike europeo < 1.20% mínimo: zona de Pin Gamma extrema)`,
+      };
+    }
+  }
+
+  return { vetoed: false, reason: null };
 }
 
 // Estado de enfriamiento en memoria para failover automático entre Cerebras y Groq
@@ -2985,21 +3095,22 @@ export async function deepAnalyze(m, prelim) {
     const noOracleEdge  = (noTradable && noBook?.isValid) ? ((1 - mathYes) - noBook.bestAsk) : -1;
 
     if (yesOracleEdge >= 0.04 && yesOracleEdge >= noOracleEdge) {
-      oracleAction = "BUY_YES";
       consideredSide = "YES";
       oracleGrossEdge = yesOracleEdge;
+      const regimeCheck = evaluateCryptoBarrierRegimeVeto(cryptoQuant, "YES");
+      if (regimeCheck.vetoed) {
+        oracleAction = "SKIP";
+        oracleSkipReason = regimeCheck.reason;
+      } else {
+        oracleAction = "BUY_YES";
+      }
     } else if (noOracleEdge >= 0.04 && noOracleEdge > yesOracleEdge) {
       consideredSide = "NO";
       oracleGrossEdge = noOracleEdge;
-      // Veto Cuantitativo de Barrera Cercana (v3.1.0): Prohibido vender volatilidad (BUY_NO) en barreras de toque ("reach"/"dip")
-      // cuando el Spot está a menos de 3.0% de la barrera (evita los casos T-MW73AZ4VI5AU a 1.59% y T-MW958Z3H2FXP a 1.29%).
-      if (
-        cryptoQuant.modelType === "AMERICAN_BARRIER_TOUCH" &&
-        Number.isFinite(cryptoQuant.absDistPct) &&
-        cryptoQuant.absDistPct < 3.0
-      ) {
+      const regimeCheck = evaluateCryptoBarrierRegimeVeto(cryptoQuant, "NO");
+      if (regimeCheck.vetoed) {
         oracleAction = "SKIP";
-        oracleSkipReason = `VETO_BARRIER_TOO_CLOSE_FOR_NO (Barrera de toque a solo ${cryptoQuant.absDistPct.toFixed(2)}% del Spot < 3.00% mínimo para comprar NO)`;
+        oracleSkipReason = regimeCheck.reason;
       } else {
         oracleAction = "BUY_NO";
       }
@@ -3246,7 +3357,7 @@ Return JSON with this exact schema:
       bookQuality: selectedBook.spreadPct <= 3.5 && selectedBook.spreadAbs <= 0.025 && effectiveObi >= -0.05 && (!hasL2Asks || bookWalk.isBuyFullyExecutable),
       orderflowAlignment: (effectiveObi + sideTapeImbalance) >= 0.10 || (whaleSideCount >= 1 && sideTapeImbalance >= 0),
       catalystOrMath: (hasFreshNews && !lacksCatalyst && !tetlockGuard.vetoD_PricedIn) || (effectiveObi >= 0.35 && sideTapeImbalance >= 0.20),
-      positiveExpectancy: netEdgePct >= MIN_NET_EDGE_PCT && conf >= 70 && rewardToRisk >= 1.75,
+      positiveExpectancy: netEdgePct >= MIN_NET_EDGE_PCT && conf >= 70 && rewardToRisk >= 0.85,
     };
 
     const hardVetoes = [];
@@ -3576,8 +3687,14 @@ export async function runFullScan() {
               continue;
             }
 
-            if (hasCorrelatedOpenPosition(m, botState.trades)) {
-              addLog(`🛡 [CORRELATION GUARD] Bloqueado por concentración temática con otra posición abierta: ${m.question.slice(0, 60)}`, "FILTER");
+            if (hasCorrelatedOpenPosition(m, botState.trades, isYes ? "YES" : "NO")) {
+              addLog(`🛡 [CORRELATION GUARD] Bloqueado por concentración temática o beta cripto opuesta/no protegida: ${m.question.slice(0, 60)}`, "FILTER");
+              continue;
+            }
+
+            const runtimeCooldown = isMarketInCooldown(marketId, conditionId, m.question);
+            if (runtimeCooldown.blocked) {
+              addLog(`⏳ [COOLDOWN GUARD] ${runtimeCooldown.reason}: ${m.question.slice(0, 60)}`, "FILTER");
               continue;
             }
 
@@ -3825,27 +3942,43 @@ export async function fastSyncTrades() {
           const exactBreakEvenPx = trueCostBasisPerShare + beExitFrictionPerShare;
           const exactBreakEvenFloor = parseFloat(Math.max(exactBreakEvenPx, entryPrice + 0.015).toFixed(4));
 
-          // Si el trade supera las 12h (lifeRatio >= 0.50), reducir el colchón exigido para armar el Break-Even hasta en un 35%
+          // v3.2.0: Reducir colchón de activación a +0.2¢ sobre exactBreakEvenFloor (o +2.8¢ sobre entrada)
+          // para evitar que trades que suben +3.0¢ a +4.0¢ (casos T-MWD52BUCVB2X, T-MWBUZFFMXL1V, T-MWAJZUJ6LLVC)
+          // se queden a 0.1¢ de armar el Break-Even y se devuelvan hasta STOP_LOSS.
           const timeDecayBeFactor = lifeRatio >= 0.50 ? (1.0 - 0.35 * ((lifeRatio - 0.50) / 0.50)) : 1.0;
-          const beNoiseCushion    = Math.max(0.006, 0.020 * binarySigma * timeDecayBeFactor);
+          const beNoiseCushion    = Math.max(0.002, 0.006 * binarySigma * timeDecayBeFactor);
           const triggerPrice      = Math.max(
             exactBreakEvenFloor + beNoiseCushion,
-            entryPrice + Math.max(0.024, 0.050 * binarySigma * timeDecayBeFactor)
+            entryPrice + Math.max(0.026, 0.052 * binarySigma * timeDecayBeFactor)
           );
 
           if (!openTrade.breakEvenArmed && entryPrice > 0 && botState.config.breakEvenTriggerPct > 0 && livePx >= triggerPrice) {
             if (exactBreakEvenFloor > asNumber(openTrade.stopLoss, 0)) {
               openTrade.stopLoss = exactBreakEvenFloor;
               openTrade.breakEvenArmed = true;
+              openTrade.slBreachCount = 0;
               await updateTradeSafe(trade.id, { stop_loss: exactBreakEvenFloor, break_even_armed: true, current_price: livePx });
               addLog(`🛡 [RISK] Break-even exacto activado en ${trade.id}. Nuevo SL libre de pérdidas: ${fmtPct(exactBreakEvenFloor)}`, "RISK");
             }
+          } else if (
+            !openTrade.breakEvenArmed &&
+            entryPrice > 0 &&
+            asNumber(openTrade.mfePrice, livePx) >= (entryPrice + 0.022)
+          ) {
+            // Protección de Medio-Stop por MFE (+2.2¢): si el trade ya avanzó >= +2.2¢ a favor pero aún no cubre el fee Taker completo,
+            // ceñir el Stop-Loss a (entryPrice - 1.5¢) para recortar el riesgo en un 70% y prohibir una caída completa de -20%.
+            const mfeReducedStop = parseFloat(Math.max(0.02, entryPrice - 0.015).toFixed(4));
+            if (mfeReducedStop > asNumber(openTrade.stopLoss, 0) + 0.003) {
+              openTrade.stopLoss = mfeReducedStop;
+              await updateTradeSafe(trade.id, { stop_loss: mfeReducedStop, current_price: livePx });
+              addLog(`🛡 [MFE SHIELD] Excursión favorable (+${((asNumber(openTrade.mfePrice, livePx) - entryPrice) * 100).toFixed(1)}¢) en ${trade.id}: SL reducido defensivamente a ${fmtPct(mfeReducedStop)}`, "RISK");
+            }
           }
 
-          // ─── 2. Trailing Stop Adaptativo por Volatilidad Binaria (v3.1.0: Captura excursiones de +2.8¢ a +5.0¢) ──
-          // Se activa desde +2.8¢ sobre la entrada con distancia estrecha de ~1.2¢-1.5¢ para amarrar ganancias reales
-          const trailActivationPx = entryPrice + Math.max(0.026, 0.058 * binarySigma);
-          const dynamicTrailDist  = Math.max(0.012, 0.032 * binarySigma);
+          // ─── 2. Trailing Stop Adaptativo por Volatilidad Binaria (v3.2.0: Captura excursiones de +2.8¢ a +4.5¢) ──
+          // Se activa desde +2.8¢ sobre la entrada con distancia estrecha de ~1.0¢-1.4¢ para amarrar ganancias reales
+          const trailActivationPx = entryPrice + Math.max(0.026, 0.055 * binarySigma);
+          const dynamicTrailDist  = Math.max(0.010, 0.028 * binarySigma);
 
           if (openTrade.breakEvenArmed && entryPrice > 0 && livePx >= trailActivationPx) {
             const trailedStop = parseFloat(Math.max(exactBreakEvenFloor, livePx - dynamicTrailDist).toFixed(4));
@@ -3879,7 +4012,12 @@ export async function fastSyncTrades() {
           const maxHoldAtMs = openTrade.maxHoldAt ? new Date(openTrade.maxHoldAt).getTime() : NaN;
           const maxHoldReached = Number.isFinite(maxHoldAtMs) && Date.now() >= maxHoldAtMs;
 
-          // ─── 3. Decisión de Cierre (Con compresión de TP, separación de estados y filtro anti-mecha) ─
+          // Si el bid recuperó por encima del SL, reiniciar contador de mechas tempranas
+          if (stopLoss > 0 && livePx > stopLoss && openTrade.slBreachCount) {
+            openTrade.slBreachCount = 0;
+          }
+
+          // ─── 3. Decisión de Cierre (Con compresión de TP, separación de estados y filtro anti-mecha de 2 ciclos) ─
           let closeReason = null;
           if (effectiveTakeProfit > 0 && livePx >= effectiveTakeProfit) {
             closeReason = (lifeRatio >= 0.55 && livePx < staticTakeProfit)
@@ -3898,13 +4036,28 @@ export async function fastSyncTrades() {
               }
             }
             if (livePx <= stopLoss) {
-              const isTrailingStop = Boolean(
-                openTrade.trailingActive ||
-                (openTrade.breakEvenArmed && stopLoss > (exactBreakEvenFloor + 0.002))
-              );
-              closeReason = isTrailingStop
-                ? "TRAILING_STOP"
-                : (openTrade.breakEvenArmed ? "BREAK_EVEN" : "STOP_LOSS");
+              const minutesHeldNow = Math.max(0, (Date.now() - openedAtMs) / 60000);
+              const isEarlyNoiseWick =
+                !openTrade.breakEvenArmed &&
+                minutesHeldNow < 18 &&
+                livePx > (stopLoss - 0.025) &&
+                (openTrade.slBreachCount || 0) < 1;
+
+              if (isEarlyNoiseWick) {
+                openTrade.slBreachCount = (openTrade.slBreachCount || 0) + 1;
+                addLog(
+                  `🛡 [ANTI-WICK GRACE] Toque temprano de SL en ${trade.id} (${minutesHeldNow.toFixed(1)}m < 18m, Bid=${fmtPct(livePx)} vs SL=${fmtPct(stopLoss)}). Exigiendo 2da confirmación para filtrar mecha de spread.`,
+                  "RISK"
+                );
+              } else {
+                const isTrailingStop = Boolean(
+                  openTrade.trailingActive ||
+                  (openTrade.breakEvenArmed && stopLoss > (exactBreakEvenFloor + 0.002))
+                );
+                closeReason = isTrailingStop
+                  ? "TRAILING_STOP"
+                  : (openTrade.breakEvenArmed ? "BREAK_EVEN" : "STOP_LOSS");
+              }
             }
           } else if (maxHoldReached) {
             closeReason = "MAX_HOLD";
