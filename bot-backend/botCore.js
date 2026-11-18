@@ -36,7 +36,7 @@ const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
 const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
 const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 70);
 const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 4.5);
-export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.2.0-crypto-oracle");
+export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.3.0-crypto-oracle");
 export const ALLOWED_TRADING_CATEGORIES = ["CRYPTO"];
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
@@ -453,10 +453,16 @@ function hydrateCapitalFromLocalState() {
 
 function calcStopLoss(entryPrice, entryBid = null) {
   const pctStop = entryPrice * (1 - botState.config.stopLoss / 100);
-  // Guarantee at least 4.2c below entryBid (or 4.8c below entryPrice) so normal CLOB spread wicks do not trigger premature Taker stop-outs
+  // v3.3.0: SL adaptativo por precio de entrada — a menor precio, mayor holgura absoluta
+  // porque el spread bid-ask proporcional es mayor y el ruido de mercado es relativamente más grande.
+  // entry >= 0.60  → 4.2¢ bajo bid (igual que v3.2.0, zona de precio "seguro")
+  // entry 0.40-0.59 → 5.0¢ bajo bid
+  // entry 0.30-0.39 → 6.0¢ bajo bid  (la banda mínima ya está en 30¢, así que nunca < 30¢)
+  const ep = Number.isFinite(entryPrice) ? entryPrice : 0.5;
+  const slGap = ep >= 0.60 ? 0.042 : ep >= 0.40 ? 0.050 : 0.060;
   const tickFloor = (Number.isFinite(entryBid) && entryBid > 0)
-    ? (entryBid - 0.042)
-    : (entryPrice - 0.048);
+    ? (entryBid - slGap)
+    : (entryPrice - slGap - 0.006); // fallback sin bid: gap + 0.6¢ extra
   const stop = Math.min(pctStop, tickFloor);
   return parseFloat(Math.max(0.02, stop).toFixed(4));
 }
@@ -2659,14 +2665,17 @@ export async function getCryptoSpotContext(question, daysLeft) {
 }
 
 /**
- * Guardián Determinístico de Régimen y Geometría de Barrera Cripto (v3.2.0):
+ * Guardián Determinístico de Régimen y Geometría de Barrera Cripto (v3.3.0):
  * 1) Bloquea BUY_NO en barreras de toque cercanas (< 3.0% del Spot).
  * 2) Bloquea BUY_YES en barreras de toque lejanas (> 3.6% del Spot = loterías OTM que mueren por Theta).
  * 3) Bloquea BUY_YES contra-tendencia en barreras de toque usando rangePos24h mutuamente excluyente:
  *    - Para comprar YES en barrera alcista ("reach"), exige Spot en mitad superior del rango 24h (>= 52%).
  *    - Para comprar YES en barrera bajista ("dip"), exige Spot en mitad inferior del rango 24h (<= 48%).
  *    Esto hace matemáticamente imposible que el bot alterne entre "BTC dip YES" y "BTC reach YES" en el mismo régimen.
- * 4) Bloquea contratos Digitales Europeos cuando el Spot está clavado sobre el strike (< 1.2% = Pin Gamma extrema).
+ * 4) NEW v3.3.0: Bloquea BUY_YES en barrera bajista (dip) cuando el Spot NO está cayendo activamente
+ *    (rangePos >= 40%). Los 5/8 stop-losses con MFE <= 0¢ en v3.2.0 tenían este patrón: BTC estaba
+ *    en zona media/alta del rango 24h y el bot apostaba a que "dip" cuando el mercado no caía.
+ * 5) Bloquea contratos Digitales Europeos cuando el Spot está clavado sobre el strike (< 1.2% = Pin Gamma extrema).
  */
 export function evaluateCryptoBarrierRegimeVeto(cryptoQuant, candidateSide) {
   if (!cryptoQuant || !Number.isFinite(cryptoQuant.absDistPct)) {
@@ -2701,6 +2710,16 @@ export function evaluateCryptoBarrierRegimeVeto(cryptoQuant, candidateSide) {
         return {
           vetoed: true,
           reason: `VETO_COUNTER_TREND_TOUCH_YES (Barrera bajista pero Spot fuerte en rango 24h: PosRango=${(rangePos * 100).toFixed(0)}% > 48%)`,
+        };
+      }
+      // v3.3.0 Fix #1: VETO_DIP_YES_SPOT_TOO_HIGH — Para barrera bajista (dip/drop/fall), exigimos
+      // que el Spot esté en el cuartil inferior del rango 24h (rangePos < 40%). Si el Spot está en
+      // zona media o alta del rango, el mercado ya tiene mejor información de que el dip no es
+      // probable a corto plazo. Los 5 de 8 stop-losses con MFE <= 0.001¢ en v3.2.0 tenían este patrón.
+      if (signedDist < 0 && rangePos >= 0.40) {
+        return {
+          vetoed: true,
+          reason: `VETO_DIP_YES_SPOT_NOT_FALLING (Barrera bajista (dip) pero Spot en zona media/alta: PosRango=${(rangePos * 100).toFixed(0)}% >= 40%: mercado no está cayendo)`,
         };
       }
     }
@@ -3375,9 +3394,11 @@ Return JSON with this exact schema:
       hardVetoes.push(`VETO_LR_CONTRADICTS_SIDE (LR=${rawLikelihoodRatio.toFixed(2)} > 1.00 contradice BUY_NO)`);
     }
 
-    // Veto Estratégico 1: Banda Operativa Taker [20¢ - 80¢]
-    if (executableAsk < 0.20 || executableAsk > 0.80) {
-      hardVetoes.push(`Precio fuera de banda operativa [20¢-80¢] (Ask=${(executableAsk * 100).toFixed(1)}¢)`);
+    // Veto Estratégico 1: Banda Operativa Taker [30¢ - 80¢]
+    // v3.3.0: subimos el piso de 20¢ a 30¢. Con entry < 0.30, el spread bid-ask relativo es > 10%
+    // lo que significa que el trade empieza con una pérdida inmediata mayor que el beneficio esperado.
+    if (executableAsk < 0.30 || executableAsk > 0.80) {
+      hardVetoes.push(`Precio fuera de banda operativa [30¢-80¢] (Ask=${(executableAsk * 100).toFixed(1)}¢): spread relativo demasiado alto bajo 30¢`);
     }
 
     // Veto Estratégico 2: Filtro de Decaimiento Temporal (>14 días sin catalizador fresco del día)
@@ -3723,6 +3744,17 @@ export async function runFullScan() {
             const amt = computeQuantPositionSize(tradePlan.amount, analysis, sideBook);
             const rawAsk = sideBook?.bestAsk ?? (isYes ? pre.yesP : pre.noP);
             const entryBid = sideBook?.bestBid ?? parseFloat(Math.max(0.01, rawAsk - 0.01).toFixed(4));
+
+            // v3.3.0 Fix #3: Filtro de spread adverso — si el spread bid-ask > 3¢ Y el edge neto < 7%,
+            // el mercado está en régimen de baja liquidez o flujo adverso activo. No entrar.
+            // Este filtro bloquea entradas en momentos de alta incertidumbre de precio donde el
+            // "edge" calculado es en realidad ilusorio (capturado por el spread, no por la señal).
+            const spreadAbs = Number.isFinite(rawAsk) && Number.isFinite(entryBid) ? (rawAsk - entryBid) : 0;
+            const netEdgeForSpreadCheck = Number(analysis.edge_pct || 0);
+            if (spreadAbs > 0.030 && netEdgeForSpreadCheck < 7.0) {
+              addLog(`🚫 [v3.3.0 SPREAD GUARD] Bloqueado: spread=${(spreadAbs * 100).toFixed(1)}¢ > 3¢ con edge=${netEdgeForSpreadCheck.toFixed(1)}% < 7%: ${m.question.slice(0, 60)}`, "FILTER");
+              continue;
+            }
 
             // Modelo de Ejecución Maker-First v3.1.0 (Cumplimiento Gate 0: Orden Limit Pasiva con 0% Maker Fee en CLOB + $0.004 Gas Polygon)
             // En lugar de cruzar el libro como Taker pagando 1000 bps (~5.9% de entrada), entramos con orden Limit al precio límite sin slippage de barrido.
