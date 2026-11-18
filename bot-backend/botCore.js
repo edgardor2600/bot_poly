@@ -36,7 +36,7 @@ const MAX_SPREAD_CENTS = getNumberEnv("MAX_SPREAD_CENTS", 0.03);
 const MIN_BOOK_DEPTH_USD = getNumberEnv("MIN_BOOK_DEPTH_USD", 15);
 const MIN_AI_CONFIDENCE = getNumberEnv("MIN_AI_CONFIDENCE", 70);
 const MIN_NET_EDGE_PCT = getNumberEnv("MIN_NET_EDGE_PCT", 4.5);
-export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.3.0-crypto-oracle");
+export const STRATEGY_VERSION = getEnv("STRATEGY_VERSION", "v3.4.0-crypto-oracle");
 export const ALLOWED_TRADING_CATEGORIES = ["CRYPTO"];
 const CRITICAL_LOOP_LOCK_TTL_SECONDS = Math.max(30, Math.floor(getNumberEnv("CRITICAL_LOOP_LOCK_TTL_SECONDS", 180)));
 const DB_READINESS_TTL_MS = Math.max(30_000, Math.floor(getNumberEnv("DB_READINESS_TTL_MS", 300_000)));
@@ -300,14 +300,42 @@ async function findPersistedOpenTradeForMarket(marketId, conditionId) {
 }
 
 function isMarketInCooldown(marketId, conditionId, question) {
-  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
-  const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
-  const GLOBAL_SL_COOLDOWN_MS = 45 * 60 * 1000;
+  const SIX_HOURS_MS    = 6  * 60 * 60 * 1000;
+  const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;  // v3.4.0: 8h → 12h mismo mercado post-SL
+  // v3.4.0: global SL cooldown reducido 45min → 15min para no bloquear señales de alta calidad
+  // en otros mercados. El cooldown largo (12h) es el que protege el mismo mercado.
+  const GLOBAL_SL_COOLDOWN_MS  = 15 * 60 * 1000;
+  const CIRCUIT_BREAKER_WINDOW = 6  * 60 * 60 * 1000; // ventana de 6h para circuit breaker
+  const CIRCUIT_BREAKER_PAUSE  = 2  * 60 * 60 * 1000; // pausa de 2h tras el 3er SL en 6h
   const DAY_MS = 24 * 60 * 60 * 1000;
   const now = Date.now();
   const mKey = String(marketId || "");
   const cKey = String(conditionId || "");
   const qKey = String(question || "").trim().toLowerCase();
+
+  // Fix #5 v3.4.0: Circuit Breaker de sesión — si hay >= 3 STOP_LOSS en las últimas 6h,
+  // pausar completamente durante 2h desde el último SL. Evita el bucle de pérdidas donde
+  // el bot opera en régimen adverso de mercado acumulando pérdidas consecutivas.
+  const recentSLs = botState.trades
+    .filter(t =>
+      t.closeReason === "STOP_LOSS" &&
+      !shouldManageTrade(t) &&
+      t.closedAt &&
+      (now - new Date(t.closedAt).getTime()) < CIRCUIT_BREAKER_WINDOW
+    )
+    .sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
+
+  if (recentSLs.length >= 3) {
+    const lastSLMs = new Date(recentSLs[0].closedAt).getTime();
+    const pauseElapsed = now - lastSLMs;
+    if (pauseElapsed < CIRCUIT_BREAKER_PAUSE) {
+      const minsLeft = Math.ceil((CIRCUIT_BREAKER_PAUSE - pauseElapsed) / 60000);
+      return {
+        blocked: true,
+        reason: `CIRCUIT BREAKER: ${recentSLs.length} STOP_LOSS en < 6h (pausa de 2h, ${minsLeft} min restantes)`,
+      };
+    }
+  }
 
   let tradesLast24h = 0;
 
@@ -315,7 +343,8 @@ function isMarketInCooldown(marketId, conditionId, question) {
     if (t.closeReason === "CLEANUP_SIMULATED") continue;
     const closedMs = t.closedAt ? new Date(t.closedAt).getTime() : (t.ts ? new Date(t.ts).getTime() : 0);
 
-    // Cooldown global de 45 min tras cualquier STOP_LOSS para no perseguir latigazos de volatilidad
+    // Cooldown global de 15 min tras cualquier STOP_LOSS para no perseguir latigazos de volatilidad
+    // (reducido de 45min en v3.4.0 — el cooldown largo está a nivel de mercado específico)
     if (
       !shouldManageTrade(t) &&
       t.closeReason === "STOP_LOSS" &&
@@ -338,7 +367,8 @@ function isMarketInCooldown(marketId, conditionId, question) {
     }
 
     if (Number.isFinite(closedMs) && closedMs > 0) {
-      const requiredCooldownMs = t.closeReason === "STOP_LOSS" ? EIGHT_HOURS_MS : SIX_HOURS_MS;
+      // v3.4.0: 12h de cooldown en el mismo mercado tras STOP_LOSS (antes 8h)
+      const requiredCooldownMs = t.closeReason === "STOP_LOSS" ? TWELVE_HOURS_MS : SIX_HOURS_MS;
       if ((now - closedMs) < requiredCooldownMs) {
         const minsLeft = Math.ceil((requiredCooldownMs - (now - closedMs)) / 60000);
         return { blocked: true, reason: `Cooldown anti-overtrading activo (${minsLeft} min restantes)` };
@@ -453,13 +483,15 @@ function hydrateCapitalFromLocalState() {
 
 function calcStopLoss(entryPrice, entryBid = null) {
   const pctStop = entryPrice * (1 - botState.config.stopLoss / 100);
-  // v3.3.0: SL adaptativo por precio de entrada — a menor precio, mayor holgura absoluta
-  // porque el spread bid-ask proporcional es mayor y el ruido de mercado es relativamente más grande.
-  // entry >= 0.60  → 4.2¢ bajo bid (igual que v3.2.0, zona de precio "seguro")
-  // entry 0.40-0.59 → 5.0¢ bajo bid
-  // entry 0.30-0.39 → 6.0¢ bajo bid  (la banda mínima ya está en 30¢, así que nunca < 30¢)
+  // v3.4.0: SL adaptativo por precio de entrada (tabla completa):
+  //   entry >= 0.65  → 3.5¢ bajo bid  (tokens caros: se mueven despacio, SL estrecho)
+  //   entry 0.40-0.64 → 4.2¢ bajo bid  (zona central, igual que v3.2.0)
+  //   entry 0.30-0.39 → 6.0¢ bajo bid  (tokens baratos: spread proporcional alto)
+  // Lógica: tokens de alto precio (NO de alta certeza) tienen inercia pequeña; un SL
+  // de 4.2¢ era demasiado ancho y dejaba que el mercado se moviera -6% antes de cortar.
+  // Con 3.5¢ cortamos más rápido las pérdidas en contratos "above $X" de alto precio.
   const ep = Number.isFinite(entryPrice) ? entryPrice : 0.5;
-  const slGap = ep >= 0.60 ? 0.042 : ep >= 0.40 ? 0.050 : 0.060;
+  const slGap = ep >= 0.65 ? 0.035 : ep >= 0.40 ? 0.042 : 0.060;
   const tickFloor = (Number.isFinite(entryBid) && entryBid > 0)
     ? (entryBid - slGap)
     : (entryPrice - slGap - 0.006); // fallback sin bid: gap + 0.6¢ extra
@@ -3399,6 +3431,22 @@ Return JSON with this exact schema:
     // lo que significa que el trade empieza con una pérdida inmediata mayor que el beneficio esperado.
     if (executableAsk < 0.30 || executableAsk > 0.80) {
       hardVetoes.push(`Precio fuera de banda operativa [30¢-80¢] (Ask=${(executableAsk * 100).toFixed(1)}¢): spread relativo demasiado alto bajo 30¢`);
+    }
+
+    // Fix #1 v3.4.0: VETO_NO_OVERPRICED — Prohibir BUY_NO con entry > 0.70
+    // Cuando el mercado ya asigna > 70% de probabilidad a NO, el riesgo de tail es extremadamente
+    // asimétrico: si ocurre un evento macro inesperado (crash, regulación), la pérdida es total.
+    // Estos contratos generaron 7/9 pérdidas en v3.2.0 fase Nov 14-18 con MAE de -6 a -11¢.
+    if (!isYesSide && executableAsk > 0.70) {
+      hardVetoes.push(`VETO_NO_OVERPRICED (NO a ${(executableAsk * 100).toFixed(1)}¢ > 70¢: riesgo de tail asimétrico en zona de alta certeza)`);
+    }
+
+    // Fix #4 v3.4.0: Edge mínimo elevado para contratos de precio alto (> 0.60)
+    // Con entry > 0.60, el spread proporcional es menor pero el riesgo de tail es mayor.
+    // Se exige al menos 6% de edge neto para justificar la asimetría (vs 4.5% estándar).
+    const minEdgeForHighPrice = executableAsk > 0.60 ? 6.0 : MIN_NET_EDGE_PCT;
+    if (executableAsk > 0.60 && netEdgePct < 6.0) {
+      hardVetoes.push(`VETO_HIGH_PRICE_LOW_EDGE (entry=${(executableAsk * 100).toFixed(1)}¢ > 60¢ requiere edge >= 6% pero tiene ${netEdgePct.toFixed(1)}%)`);
     }
 
     // Veto Estratégico 2: Filtro de Decaimiento Temporal (>14 días sin catalizador fresco del día)
